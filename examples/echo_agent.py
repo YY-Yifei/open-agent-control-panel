@@ -1,20 +1,39 @@
-"""A minimal A2A agent for local demos of the control panel.
+"""A minimal A2A agent that registers *itself* with a control panel.
 
-It serves an AgentCard at ``/.well-known/agent-card.json`` and answers A2A
-JSON-RPC calls at ``/a2a`` in both wire dialects (A2A 0.3 and 1.x). It echoes the
-text it receives. Nothing here is meant for production: tasks live in memory.
+It serves an AgentCard at ``/.well-known/agent-card.json`` and answers A2A JSON-RPC
+calls at ``/a2a`` in both wire dialects (A2A 0.3 and 1.x). On startup it pushes its
+card URL to a registry, so nobody has to register it by hand:
 
     python examples/echo_agent.py --port 9100
+
+Start the panel afterwards (or before — the agent retries) and the agent shows up
+on its own. Pass ``--no-register`` to keep it a plain, unattached A2A agent.
+
+Registration is the protocol's only write path: an agent says *where its card is*
+and the registry fetches it. This example therefore never sends a card body — a
+registry that believed a self-reported card would have nothing to verify.
+
+Nothing here is meant for production: tasks live in memory.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import threading
+import time
 import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+DEFAULT_REGISTRY = "http://127.0.0.1:8000"
+CARD_PATH = "/.well-known/agent-card.json"
+BACKOFF = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0)
 
 CARD: dict[str, Any] = {
     "name": "Echo Agent",
@@ -34,7 +53,8 @@ CARD: dict[str, Any] = {
     ],
 }
 
-app = FastAPI(title="Echo Agent", docs_url=None, redoc_url=None)
+# Kept at module scope so the lifespan hooks below can start and stop it.
+KEEPER: "SelfRegistration | None" = None
 
 # task id -> {"contextId": str, "messages": list[str], "state": str}
 TASKS: dict[str, dict[str, Any]] = {}
@@ -47,6 +67,191 @@ METHODS = {
     "tasks/cancel": "cancel",
     "CancelTask": "cancel",
 }
+
+
+# --------------------------------------------------------------------- registry
+
+
+@dataclass(frozen=True)
+class Registration:
+    """What the registry told us about ourselves."""
+
+    agent_id: str
+    created: bool
+    manage_token: str | None = None
+    status: int = 0
+
+
+class RegistrationError(Exception):
+    """The registry answered, but not with a registration."""
+
+
+def card_url_of(base_url: str) -> str:
+    """The URL a registry should fetch to find this agent's card."""
+    return base_url.rstrip("/") + CARD_PATH
+
+
+def register(client: httpx.Client, registry: str, url: str) -> Registration:
+    """``POST /v1/agents``: 201 means new, 200 means we were already listed."""
+    response = client.post(f"{registry.rstrip('/')}/v1/agents", json={"url": url})
+    if response.status_code not in (200, 201):
+        raise RegistrationError(_describe(response))
+    body = response.json()
+    return Registration(
+        agent_id=str(body.get("id") or ""),
+        created=response.status_code == 201,
+        manage_token=body.get("manageToken"),
+        status=response.status_code,
+    )
+
+
+def still_registered(client: httpx.Client, registry: str, agent_id: str) -> bool:
+    """``GET /v1/agents/{id}``: a 404 means the registry forgot us."""
+    response = client.get(f"{registry.rstrip('/')}/v1/agents/{agent_id}")
+    if response.status_code == 404:
+        return False
+    if response.status_code >= 500:
+        raise RegistrationError(_describe(response))
+    return response.status_code == 200
+
+
+def deregister(client: httpx.Client, registry: str, agent_id: str, token: str) -> bool:
+    """``DELETE /v1/agents/{id}`` with the manage token handed out at 201."""
+    response = client.delete(
+        f"{registry.rstrip('/')}/v1/agents/{agent_id}",
+        headers={"X-ADP-Token": token},
+    )
+    return response.status_code == 204
+
+
+def _describe(response: httpx.Response) -> str:
+    try:
+        payload: Any = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+        code, message = error.get("code"), error.get("message")
+        if code or message:
+            return f"{response.status_code} {code or ''} {message or ''}".strip()
+    return f"{response.status_code} {response.text[:200]}".strip()
+
+
+def _reason(exc: BaseException) -> str:
+    if isinstance(exc, httpx.RequestError):
+        return f"{type(exc).__name__}: {exc}"[:200]
+    return str(exc) or type(exc).__name__
+
+
+class SelfRegistration:
+    """Keeps this agent listed on a panel, without ever blocking the server.
+
+    The panel may start after the agent, or be restarted mid-run; neither is fatal.
+    Failures back off (1s → 30s) instead of spinning, and the agent keeps serving
+    A2A traffic throughout. With a heartbeat the agent only re-registers when the
+    registry actually returns 404 — a liveness ``GET`` writes nothing.
+    """
+
+    def __init__(
+        self,
+        registry: str,
+        url: str,
+        *,
+        heartbeat: float = 30.0,
+        timeout: float = 5.0,
+        deregister_on_exit: bool = False,
+        log: Any = None,
+    ) -> None:
+        self.registry = registry.rstrip("/")
+        self.url = url
+        self.heartbeat = max(1.0, heartbeat) if heartbeat else 0.0
+        self.timeout = timeout
+        self.deregister_on_exit = deregister_on_exit
+        self.registration: Registration | None = None
+        self._log = log or print
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_note = ""
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def start(self) -> "SelfRegistration":
+        """Begin registering in the background (idempotent)."""
+        if self._thread is not None and self._thread.is_alive():
+            return self
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="self-registration", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        """Stop the loop and, if asked to, unsubscribe using the stored token."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.timeout + 1.0)
+            self._thread = None
+        registration = self.registration
+        if self.deregister_on_exit and registration and registration.manage_token:
+            try:
+                with self._client() as client:
+                    removed = deregister(client, self.registry, registration.agent_id, registration.manage_token)
+                self._note("unregistered (204)" if removed else "unregister refused by the registry")
+            except Exception as exc:  # noqa: BLE001 — never fail on the way out
+                self._note(f"could not unregister: {_reason(exc)}")
+
+    def wait_until_registered(self, timeout: float = 10.0) -> Registration | None:
+        """Block for tests and scripts; returns the registration or None on timeout."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.registration is not None:
+                return self.registration
+            if not self._stop.wait(0.02):
+                continue
+        return self.registration
+
+    # -- internals ---------------------------------------------------------
+
+    def _client(self) -> httpx.Client:
+        # trust_env=False: a proxy variable must not hijack a localhost demo.
+        return httpx.Client(timeout=self.timeout, trust_env=False)
+
+    def _run(self) -> None:
+        failures = 0
+        while not self._stop.is_set():
+            try:
+                self._tick()
+                failures, delay = 0, self.heartbeat
+                if not delay:  # registered once, no heartbeat requested
+                    return
+            except Exception as exc:  # noqa: BLE001 — a demo must never die here
+                failures += 1
+                delay = BACKOFF[min(failures - 1, len(BACKOFF) - 1)]
+                self._note(f"registration pending ({_reason(exc)}); retrying in {delay:g}s")
+            if self._stop.wait(delay):
+                return
+
+    def _tick(self) -> None:
+        with self._client() as client:
+            if self.registration is None:
+                self.registration = register(client, self.registry, self.url)
+                verb = "registered" if self.registration.created else "already registered"
+                self._note(f"{verb} as {self.registration.agent_id} (HTTP {self.registration.status})")
+                return
+            if not self.heartbeat:
+                return
+            if still_registered(client, self.registry, self.registration.agent_id):
+                return
+            self.registration = register(client, self.registry, self.url)
+            self._note(f"re-registered as {self.registration.agent_id} (the registry had dropped us)")
+
+    def _note(self, message: str) -> None:
+        # One line per state change, not one per retry.
+        if message != self._last_note:
+            self._last_note = message
+            self._log(f"[self-registration] {message}")
+
+
+# ------------------------------------------------------------------- A2A server
 
 
 def _text_of(message: dict[str, Any]) -> str:
@@ -103,6 +308,19 @@ def _cancel(params: dict[str, Any]) -> dict[str, Any]:
     return _view(task_id)
 
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """The server is listening when this runs — so registering here cannot race."""
+    if KEEPER is not None:
+        KEEPER.start()
+    yield
+    if KEEPER is not None:
+        KEEPER.stop()
+
+
+app = FastAPI(title="Echo Agent", docs_url=None, redoc_url=None, lifespan=_lifespan)
+
+
 @app.get("/.well-known/agent-card.json")
 def agent_card() -> dict[str, Any]:
     """Serve the card the registry fetches."""
@@ -140,17 +358,58 @@ async def a2a(request: Request) -> JSONResponse:
         return error(-32001, f"unknown task: {exc.args[0]}")
 
 
+def _reachable_host(host: str) -> str:
+    """A wildcard bind is not an address anyone else can dial."""
+    if host in {"0.0.0.0", ""}:
+        return "127.0.0.1"
+    if host in {"::", "[::]"}:
+        return "[::1]"
+    return host
+
+
 def main(argv: list[str] | None = None) -> int:
+    global KEEPER
+
     parser = argparse.ArgumentParser(description="Run the demo A2A echo agent.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9100)
+    parser.add_argument(
+        "--registry",
+        default=os.environ.get("OACP_REGISTRY", DEFAULT_REGISTRY),
+        help=f"control panel base URL (default: {DEFAULT_REGISTRY})",
+    )
+    parser.add_argument("--advertise", default=None, help="base URL the panel should use for this agent")
+    parser.add_argument("--no-register", action="store_true", help="stay a plain agent; never call the panel")
+    parser.add_argument(
+        "--heartbeat",
+        type=float,
+        default=30.0,
+        help="seconds between liveness checks; 0 registers once and stops (default: 30)",
+    )
+    parser.add_argument("--deregister-on-exit", action="store_true", help="DELETE the entry on shutdown")
     args = parser.parse_args(argv)
 
-    CARD["url"] = f"http://{args.host}:{args.port}/a2a"
+    advertise = (args.advertise or f"http://{_reachable_host(args.host)}:{args.port}").rstrip("/")
+    CARD["url"] = f"{advertise}/a2a"
+
+    if args.no_register:
+        KEEPER = None
+        print("not registering: --no-register")
+    else:
+        KEEPER = SelfRegistration(
+            args.registry,
+            card_url_of(advertise),
+            heartbeat=args.heartbeat,
+            deregister_on_exit=args.deregister_on_exit,
+        )
+        print(f"will register with {args.registry} as {card_url_of(advertise)}")
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    except KeyboardInterrupt:  # pragma: no cover — uvicorn normally handles it
+        pass
     return 0
 
 

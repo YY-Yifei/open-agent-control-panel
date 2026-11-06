@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-11-06
+
+### Added
+
+- **The demo agent registers itself.** `examples/echo_agent.py` posts its card URL to the
+  panel on startup, retries with backoff while the panel is absent, and registers again when
+  a heartbeat `GET /v1/agents/{id}` returns `404`. Start order and panel restarts no longer
+  need a manual `curl`. New flags: `--registry`, `--advertise`, `--no-register`,
+  `--heartbeat`, `--deregister-on-exit`.
+- Tests for the example agent against a real registry: `201`/`200` idempotency, the manage
+  token rule, `404` detection, late-panel retry, re-registration and opting out.
+
 ## [0.2.0] — 2026-11-06
 
 ### Changed
@@ -54,5 +66,7 @@ All notable changes to this project are documented here. The format follows
 - Test suite covering URL normalization, card validation, registry behaviour,
   task lifecycle, both A2A dialects and panel security.
 
-[Unreleased]: https://github.com/YY-Yifei/open-agent-control-panel/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/YY-Yifei/open-agent-control-panel/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/YY-Yifei/open-agent-control-panel/releases/tag/v0.2.1
+[0.2.0]: https://github.com/YY-Yifei/open-agent-control-panel/releases/tag/v0.2.0
 [0.1.0]: https://github.com/YY-Yifei/open-agent-control-panel/releases/tag/v0.1.0

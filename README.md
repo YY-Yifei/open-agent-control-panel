@@ -65,14 +65,35 @@ For a laptop demo, the repository ships a tiny echo agent, and the panel relaxes
 on its own once it is bound to loopback:
 
 ```bash
-# terminal 1 — a demo agent on http://127.0.0.1:9100
 pip install -e ".[dev]"
-python examples/echo_agent.py
 
-# terminal 2 — the panel; --host defaults to 127.0.0.1, so local mode is automatic
+# terminal 1 — the panel (--host defaults to 127.0.0.1, so local mode is automatic)
 oacp serve --port 8000
 
-# register the demo agent through the UI, or:
+# terminal 2 — a demo agent that finds the panel by itself
+python examples/echo_agent.py --port 9100
+```
+
+The agent shows up in the UI about a second after it starts — no registration call, no form.
+Under the hood it is the protocol doing the work: the agent posts *where its card is*, and the
+registry fetches and stores what it fetched. The agent never sends a card body, because a
+registry that believed a self-reported card would have nothing to verify.
+
+Order does not matter, and neither does a panel restart. While the panel is away the agent
+retries with backoff (1s → 30s) and keeps serving A2A traffic; when a heartbeat `GET` comes
+back `404` it simply registers again.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--registry` | `http://127.0.0.1:8000` | panel to register with (`OACP_REGISTRY` also works) |
+| `--advertise` | derived from `--host`/`--port` | base URL the panel should use to reach this agent |
+| `--no-register` | off | stay a plain agent: serve cards and A2A, never call the panel |
+| `--heartbeat` | `30` | seconds between liveness checks; `0` registers once and stops |
+| `--deregister-on-exit` | off | `DELETE` the entry on shutdown, with the manage token |
+
+The same registration by hand is one request:
+
+```bash
 curl -X POST http://127.0.0.1:8000/v1/agents \
      -H 'content-type: application/json' \
      -d '{"url":"http://127.0.0.1:9100/.well-known/agent-card.json"}'
