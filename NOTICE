@@ -1,0 +1,13 @@
+Open Agent Control Panel
+Copyright 2026 The Open Agent Control Panel contributors
+
+This product implements the A2A Discover Protocol (ADP) Core v1. The protocol
+specification and its reference implementation are published by their authors
+under the Apache License, Version 2.0.
+
+This product talks to agents over the Agent2Agent (A2A) protocol, published at
+https://a2a-protocol.org. A2A is an independent specification; this project
+neither modifies nor redistributes it.
+
+This product includes software developed by third parties under the terms of
+the Apache License, Version 2.0. See the LICENSE file for the full license text.
