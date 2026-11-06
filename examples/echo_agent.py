@@ -137,6 +137,11 @@ def _describe(response: httpx.Response) -> str:
     return f"{response.status_code} {response.text[:200]}".strip()
 
 
+def _say(message: str) -> None:
+    """Print a status line that survives being piped into a file or a log drain."""
+    print(message, flush=True)
+
+
 def _reason(exc: BaseException) -> str:
     if isinstance(exc, httpx.RequestError):
         return f"{type(exc).__name__}: {exc}"[:200]
@@ -168,7 +173,7 @@ class SelfRegistration:
         self.timeout = timeout
         self.deregister_on_exit = deregister_on_exit
         self.registration: Registration | None = None
-        self._log = log or print
+        self._log = log or _say
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_note = ""
@@ -394,7 +399,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.no_register:
         KEEPER = None
-        print("not registering: --no-register")
+        _say("not registering: --no-register")
     else:
         KEEPER = SelfRegistration(
             args.registry,
@@ -402,7 +407,7 @@ def main(argv: list[str] | None = None) -> int:
             heartbeat=args.heartbeat,
             deregister_on_exit=args.deregister_on_exit,
         )
-        print(f"will register with {args.registry} as {card_url_of(advertise)}")
+        _say(f"will register with {args.registry} as {card_url_of(advertise)}")
 
     import uvicorn
 

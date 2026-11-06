@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The demo agent flushes its status lines, so `[self-registration] …` still shows up when its
+  output is piped into a file instead of a terminal.
+
 ## [0.2.1] — 2026-11-06
 
 ### Added
