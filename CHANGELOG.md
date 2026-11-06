@@ -34,5 +34,5 @@ All notable changes to this project are documented here. The format follows
 - Test suite covering URL normalization, card validation, registry behaviour,
   task lifecycle, both A2A dialects and panel security.
 
-[Unreleased]: https://github.com/open-agent-control-panel/open-agent-control-panel/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/open-agent-control-panel/open-agent-control-panel/releases/tag/v0.1.0
+[Unreleased]: https://github.com/YY-Yifei/open-agent-control-panel/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/YY-Yifei/open-agent-control-panel/releases/tag/v0.1.0

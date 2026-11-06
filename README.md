@@ -7,7 +7,7 @@ from one small FastAPI service with a dependency-free web UI.
 [![PyPI](https://img.shields.io/pypi/v/open-agent-control-panel.svg)](https://pypi.org/project/open-agent-control-panel/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey)](LICENSE)
-[![Protocol](https://img.shields.io/badge/protocol-ADP%20Core%201.0.0-informational)](https://a2a-protocol.org/)
+[![Protocol](https://img.shields.io/badge/protocol-ADP%20Core%201.0.0-informational)](https://github.com/YY-Yifei/open-agent-control-panel)
 
 ---
 
@@ -22,8 +22,7 @@ three roles at once:
 | **Control plane** | `/api/panel/*` + the bundled UI | Every registered agent, its card, its skills, and the tasks you sent it |
 | **A2A client** | `message/send`, `tasks/get`, `tasks/cancel` | Submit a task, watch it move, cancel it, continue the conversation |
 
-The registry half implements the [A2A Discover Protocol (ADP) Core v1](https://github.com/)
-contract: five operations, four invariants, and the SSRF rules in §7. The panel half is
+The registry half implements the **A2A Discover Protocol (ADP) Core v1** contract: five operations, four invariants, and the SSRF rules in §7. The panel half is
 deliberately outside that contract — protocol endpoints stay exactly the protocol.
 
 ## Why a registry at all
@@ -218,6 +217,11 @@ tests inject an `httpx.MockTransport`.
 * Tasks are refreshed when you ask, not continuously.
 * Single process, single SQLite file: this is a control plane, not a cluster service.
 * No push notifications, no authentication schemes beyond A2A's own endpoint requirements.
+
+## Links
+
+* Source: <https://github.com/YY-Yifei/open-agent-control-panel>
+* Package: <https://pypi.org/project/open-agent-control-panel/>
 
 ## License
 
