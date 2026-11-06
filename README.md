@@ -61,15 +61,16 @@ endpoint with `message/send`.
 ## Try it locally
 
 A real registration needs a public HTTPS URL, because the registry fetches the card itself.
-For a laptop demo, the repository ships a tiny echo agent and a development mode:
+For a laptop demo, the repository ships a tiny echo agent, and the panel relaxes the checks
+on its own once it is bound to loopback:
 
 ```bash
 # terminal 1 — a demo agent on http://127.0.0.1:9100
 pip install -e ".[dev]"
 python examples/echo_agent.py
 
-# terminal 2 — the panel, in development mode
-oacp serve --port 8000 --allow-insecure-cards --allow-private-agents
+# terminal 2 — the panel; --host defaults to 127.0.0.1, so local mode is automatic
+oacp serve --port 8000
 
 # register the demo agent through the UI, or:
 curl -X POST http://127.0.0.1:8000/v1/agents \
@@ -77,10 +78,23 @@ curl -X POST http://127.0.0.1:8000/v1/agents \
      -d '{"url":"http://127.0.0.1:9100/.well-known/agent-card.json"}'
 ```
 
-`--allow-insecure-cards` accepts `http://` and private addresses for **card URLs**;
-`--allow-private-agents` lets the A2A client call private endpoints. Both are development
-switches: with either one on, the deployment is no longer ADP-compliant, and the panel says
-so in its own summary.
+**Local mode** is derived from the bind address, not from a flag you have to remember. When
+`--host` is a loopback address, `http://` and private/loopback **card URLs** are accepted and
+the A2A client may call private endpoints. The panel says so at startup, in
+`/api/panel/summary` (`localMode: true`) and in a banner in the UI — because such a
+deployment does not claim ADP Core compliance, which requires `https`.
+
+Bind anything else (`--host 0.0.0.0`, a LAN or public address) and the strict checks apply
+in full. Two knobs override the derivation:
+
+| Knob | Effect |
+|---|---|
+| `--allow-insecure-cards` / `--allow-private-agents` | turn one guard off explicitly, on any bind address |
+| `--strict` | never relax, even on loopback |
+
+> Behind a reverse proxy or a container port map the panel can be bound to loopback and still
+> be reachable from outside, and loopback is no longer evidence of locality. In that case pass
+> `--strict` and protect the panel with `--panel-token`.
 
 ## What the UI gives you
 

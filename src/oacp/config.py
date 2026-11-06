@@ -90,6 +90,16 @@ class Settings:
     # ------------------------------------------------------------------ derived
 
     @property
+    def local_mode(self) -> bool:
+        """True when card fetching was relaxed for a loopback deployment.
+
+        This is the single fact the UI and the startup banner need: with it on,
+        the registry accepts ``http`` card URLs and private/loopback targets, so
+        it is no longer an ADP Core compliant deployment.
+        """
+        return self.allow_insecure_cards
+
+    @property
     def api_base(self) -> str:
         """Base URL advertised in the RegistryCard, always ending in ``/v1``."""
         return self.public_url.rstrip("/") + "/v1"

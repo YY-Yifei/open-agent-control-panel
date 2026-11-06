@@ -6,6 +6,26 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-11-06
+
+### Changed
+
+- **Local mode is derived from the bind address.** When `oacp serve` binds a loopback
+  address (`127.0.0.0/8`, `::1`, `localhost`), `http` and private card URLs are accepted and
+  the A2A client may target private hosts — the same local demo no longer needs
+  `--allow-insecure-cards --allow-private-agents`.
+- The relaxation is visible, not silent: a startup line, `localMode` in
+  `/api/panel/summary` and a banner in the web UI all state that ADP Core compliance is not
+  claimed. Explicit flags and `OACP_ALLOW_*` environment variables still win over the default.
+
+### Added
+
+- `--strict`: keep the https/private-address checks even on loopback. Required when a reverse
+  proxy or port mapping makes a loopback bind externally reachable.
+- `Settings.local_mode` and the `localMode` field in the panel summary.
+- Tests for loopback detection, precedence (flag > environment > derived default), and for
+  `http` registration being accepted in local mode while still rejected when strict.
+
 ## [0.1.0] — 2026-11-06
 
 ### Added

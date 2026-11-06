@@ -221,6 +221,16 @@ function applySummary(summary) {
   $("#endpoint-info").textContent = summary?.apiBase || "—";
   $("#endpoint-info").title = summary?.publicUrl || "";
   $("#app-version").textContent = summary ? `v${summary.version}` : "—";
+
+  // The relaxed checks are a deployment fact, so they belong on screen and not
+  // only in the log: whoever opens the panel should know https is not required.
+  const banner = $("#mode-banner");
+  if (banner) {
+    banner.hidden = !summary?.localMode;
+    if (summary?.localMode) {
+      banner.innerHTML = `<strong>Local mode</strong><span>Bound to a loopback address, so <code>http</code> and private card URLs are accepted and A2A calls may target private hosts. This deployment does not claim ADP Core compliance — start with <code>--strict</code> to restore the https-only checks.</span>`;
+    }
+  }
 }
 
 function summaryCards(summary) {

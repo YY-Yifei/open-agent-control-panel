@@ -118,6 +118,7 @@ def summary(request: Request) -> dict[str, Any]:
         "probe": {"enabled": settings.probe_enabled, "interval": settings.probe_interval},
         "panelTokenRequired": bool(settings.panel_token),
         "allowPrivateAgents": settings.allow_private_agents,
+        "localMode": settings.local_mode,
         "cardValidation": settings.card_validation,
     }
 
