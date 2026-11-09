@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] — 2026-11-09
 
 ### Changed
 
@@ -173,7 +173,8 @@ All notable changes to this project are documented here. The format follows
 - Test suite covering URL normalization, card validation, registry behaviour,
   task lifecycle, both A2A dialects and panel security.
 
-[Unreleased]: https://github.com/YY-Yifei/open-agent-control-panel/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/YY-Yifei/open-agent-control-panel/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/YY-Yifei/open-agent-control-panel/releases/tag/v0.3.0
 [0.2.1]: https://github.com/YY-Yifei/open-agent-control-panel/releases/tag/v0.2.1
 [0.2.0]: https://github.com/YY-Yifei/open-agent-control-panel/releases/tag/v0.2.0
 [0.1.0]: https://github.com/YY-Yifei/open-agent-control-panel/releases/tag/v0.1.0
