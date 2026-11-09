@@ -76,6 +76,28 @@ TEXTS: dict[str, dict[str, str]] = {
         "zh": "manage token 不正确，只有首个注册者持有它",
         "en": "the manage token does not match; only the first registrant holds it",
     },
+    # Conversations. The panel talks about sessions and messages; the words
+    # "task" and "context" belong to the protocol and never reach these.
+    "session_not_found": {
+        "zh": "找不到 id 为 {session_id} 的会话",
+        "en": "no conversation with id {session_id}",
+    },
+    "session_agent_gone": {
+        "zh": "这段会话的智能体 {agent_id} 已不在面板中，无法继续发送",
+        "en": "the agent {agent_id} for this conversation is no longer registered",
+    },
+    "empty_message": {
+        "zh": "消息不能为空",
+        "en": "a message cannot be empty",
+    },
+    "nothing_to_cancel": {
+        "zh": "当前没有正在进行的回合可以停止",
+        "en": "there is no running turn to stop",
+    },
+    "bad_title": {
+        "zh": "会话标题不能为空",
+        "en": "a conversation title cannot be empty",
+    },
 }
 
 

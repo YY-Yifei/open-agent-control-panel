@@ -106,3 +106,82 @@ def test_callback_token_is_indexed(tmp_path) -> None:
     finally:
         connection.close()
     assert "tasks_push_token" in indexes
+
+
+# A 0.3-era ``tasks`` table: the push columns exist, ``session_id`` does not, and
+# neither conversation table has ever been created.
+V2_TASKS = """
+CREATE TABLE tasks (
+    id              TEXT PRIMARY KEY,
+    agent_id        TEXT NOT NULL,
+    agent_name      TEXT NOT NULL,
+    agent_url       TEXT NOT NULL,
+    endpoint        TEXT,
+    remote_task_id  TEXT,
+    context_id      TEXT,
+    state           TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    input_text      TEXT NOT NULL,
+    request_json    TEXT,
+    response_json   TEXT,
+    error           TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    synced_at       TEXT,
+    message_count   INTEGER NOT NULL DEFAULT 0,
+    push_token      TEXT,
+    push_state      TEXT,
+    push_registered_at TEXT,
+    push_count      INTEGER NOT NULL DEFAULT 0,
+    last_push_at    TEXT
+);
+INSERT INTO tasks (id, agent_id, agent_name, agent_url, state, title,
+                   input_text, created_at, updated_at, message_count)
+VALUES ('t_v2', 'a_1', 'Old Agent', 'https://old.example.com/a2a', 'completed',
+        'a 0.3 task', 'an old prompt', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', 1);
+"""
+
+
+def make_v2_database(path: str) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(V2_TASKS)
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_v2_database_gains_the_conversation_tables(tmp_path) -> None:
+    path = str(tmp_path / "v2.db")
+    make_v2_database(path)
+    assert "session_id" not in columns(path)
+
+    Database(path).init()
+
+    assert "session_id" in columns(path)
+    connection = sqlite3.connect(path)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        row = connection.execute("SELECT title, session_id FROM tasks WHERE id = 't_v2'").fetchone()
+    finally:
+        connection.close()
+    assert {"sessions", "session_messages"} <= tables
+    assert row == ("a 0.3 task", None), "old rows widen to NULL, not to a guessed session"
+
+
+def test_the_conversation_tables_survive_repeated_starts(tmp_path) -> None:
+    path = str(tmp_path / "v2.db")
+    make_v2_database(path)
+    for _ in range(3):
+        Database(path).init()
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    finally:
+        connection.close()

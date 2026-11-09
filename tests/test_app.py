@@ -15,7 +15,11 @@ def test_healthz_and_ui_are_served(client) -> None:
 
     index = client.get("/")
     assert index.status_code == 200
-    assert "Open Agent Control Panel" in index.text
+    # The shell is Chinese-first (the language switch lives in the script), so the
+    # served HTML carries the brand as it ships rather than an English literal.
+    assert 'lang="zh-CN"' in index.text
+    assert "智能体面板" in index.text
+    assert "/static/app.js" in index.text
 
     script = client.get("/static/app.js")
     assert script.status_code == 200

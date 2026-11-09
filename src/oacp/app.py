@@ -20,6 +20,7 @@ from .config import Settings
 from .db import Database
 from .errors import PanelError, normalize_lang
 from .push import router as push_router
+from .sessions import SessionService
 from .tasks import TaskService
 
 log = logging.getLogger(__name__)
@@ -30,9 +31,10 @@ WEB_DIR = Path(__file__).parent / "web"
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the ASGI application.
 
-    The panel owns four stateful things: the database, the registry service, the
-    A2A client and the task ledger. They are constructed here and hung off
-    ``app.state`` so tests (and embedders) can reach them without globals.
+    The panel owns five stateful things: the database, the registry service, the
+    A2A client, the task ledger and the conversations built on top of it. They are
+    constructed here and hung off ``app.state`` so tests (and embedders) can reach
+    them without globals.
     """
     settings = settings or Settings.from_env()
 
@@ -45,6 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         user_agent=settings.user_agent,
     )
     tasks = TaskService(database, registry, a2a_client, settings)
+    sessions = SessionService(database, registry, tasks)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -79,6 +82,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.db = database
     app.state.registry = registry
     app.state.tasks = tasks
+    app.state.sessions = sessions
     app.state.a2a = a2a_client
 
     app.include_router(adp_router)

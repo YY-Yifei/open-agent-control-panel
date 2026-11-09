@@ -23,6 +23,7 @@ from . import __version__
 from .adp import card as cardmod
 from .adp.service import RegistryError
 from .errors import PanelError
+from .sessions import SessionService
 from .tasks import TaskService
 
 router = APIRouter(prefix="/api/panel", tags=["panel"])
@@ -109,6 +110,25 @@ class FollowUp(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class NewSession(BaseModel):
+    """A conversation to open, optionally with the message that starts it."""
+
+    text: str | None = Field(default=None, max_length=20000)
+    title: str | None = Field(default=None, max_length=80)
+
+
+class SendMessage(BaseModel):
+    """One line the user says to an agent."""
+
+    text: str = Field(min_length=1, max_length=20000)
+
+
+class RenameSession(BaseModel):
+    """A new title for a conversation."""
+
+    title: str = Field(min_length=1, max_length=80)
+
+
 class DeleteAgent(BaseModel):
     """The manage token returned when the agent was first registered.
 
@@ -129,6 +149,10 @@ def _tasks(request: Request) -> TaskService:
 
 def _registry(request: Request):
     return request.app.state.registry
+
+
+def _sessions(request: Request) -> SessionService:
+    return request.app.state.sessions
 
 
 def _client_ip(request: Request) -> str:
@@ -166,10 +190,14 @@ def _agent_totals(request: Request) -> dict[str, int]:
 
 
 def _with_counts(request: Request, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    counts = _tasks(request).agent_counts([item["id"] for item in items])
+    agent_ids = [item["id"] for item in items]
+    counts = _tasks(request).agent_counts(agent_ids)
     fallback = {"taskCount": 0, "activeTaskCount": 0, "lastTaskAt": None}
+    sessions = _sessions(request).agent_counts(agent_ids)
+    session_fallback: dict[str, Any] = {"sessionCount": 0, "lastSessionAt": None}
     for item in items:
         item.update(counts.get(item["id"], fallback))
+        item.update(sessions.get(item["id"], session_fallback))
     return items
 
 
@@ -188,6 +216,7 @@ def summary(request: Request) -> dict[str, Any]:
         "registryCard": settings.registry_card(),
         "agents": _agent_totals(request),
         "tasks": _tasks(request).stats(),
+        "sessions": _sessions(request).stats(),
         "probe": {"enabled": settings.probe_enabled, "interval": settings.probe_interval},
         "panelTokenRequired": bool(settings.panel_token),
         "pushEnabled": settings.push_enabled,
@@ -345,4 +374,82 @@ def follow_up(request: Request, task_id: str, payload: FollowUp) -> dict[str, An
 def delete_task(request: Request, task_id: str) -> Response:
     """Forget a task locally; the agent keeps its own copy."""
     _tasks(request).delete(task_id)
+    return Response(status_code=204)
+
+
+# --------------------------------------------------------------------- sessions
+#
+# The panel's surface is a conversation, not a task. These endpoints are the
+# whole vocabulary the UI is allowed to know: agents, conversations, messages.
+# A2A's own words (task, contextId, SendMessage, push notification) are an
+# implementation detail of ``oacp.sessions`` and never appear here.
+
+
+@router.get("/sessions")
+def list_sessions(
+    request: Request,
+    agentId: str | None = None,
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    """Conversations, newest activity first; filter by agent when asked."""
+    return _sessions(request).list_sessions(agent_id=agentId, limit=limit)
+
+
+@router.post("/agents/{agent_id}/sessions", status_code=201)
+def create_session(
+    request: Request,
+    agent_id: str,
+    payload: NewSession | None = Body(default=None),
+) -> dict[str, Any]:
+    """Open a conversation with an agent, optionally sending its first message.
+
+    Creating and sending in one call is the normal path, so a user who opens a
+    conversation and then walks away leaves nothing behind.
+    """
+    session = _sessions(request).create(
+        agent_id,
+        text=payload.text if payload else None,
+        title=payload.title if payload else None,
+    )
+    return {"session": session}
+
+
+@router.get("/sessions/{session_id}")
+def get_session(request: Request, session_id: str) -> dict[str, Any]:
+    """One conversation with every message it holds."""
+    return {"session": _sessions(request).get(session_id)}
+
+
+@router.post("/sessions/{session_id}/messages", status_code=201)
+def send_message(request: Request, session_id: str, payload: SendMessage) -> dict[str, Any]:
+    """Say something to the agent and return the conversation as it now stands.
+
+    The answer may be ``working``: the agent accepted the message and will report
+    back later. The UI then polls ``/sync`` (or waits for a push callback).
+    """
+    return {"session": _sessions(request).send(session_id, payload.text)}
+
+
+@router.post("/sessions/{session_id}/sync")
+def sync_session(request: Request, session_id: str) -> dict[str, Any]:
+    """Ask the agent for the current turn's state, right now."""
+    return {"session": _sessions(request).sync(session_id)}
+
+
+@router.post("/sessions/{session_id}/cancel")
+def cancel_session(request: Request, session_id: str) -> dict[str, Any]:
+    """Stop the running turn."""
+    return {"session": _sessions(request).cancel(session_id)}
+
+
+@router.patch("/sessions/{session_id}")
+def rename_session(request: Request, session_id: str, payload: RenameSession) -> dict[str, Any]:
+    """Rename a conversation."""
+    return {"session": _sessions(request).rename(session_id, payload.title)}
+
+
+@router.delete("/sessions/{session_id}", status_code=204)
+def delete_session(request: Request, session_id: str) -> Response:
+    """Forget a conversation; the agent keeps its own copy of what was said."""
+    _sessions(request).delete(session_id)
     return Response(status_code=204)

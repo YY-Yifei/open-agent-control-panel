@@ -1,8 +1,15 @@
-"""SQLite persistence for agents, registration attempts and tasks.
+"""SQLite persistence for agents, registrations, conversations and tasks.
 
 One connection per operation: the panel is a small control plane, so the cost is
 irrelevant next to the simplicity of never sharing a connection across threads.
 Write-ahead logging keeps readers from blocking the probe loop.
+
+Two layers live here on purpose. ``tasks`` is the ledger of what was actually
+exchanged with an agent over A2A; ``sessions``/``session_messages`` is the
+conversation the operator sees. The second is derived from the first — every
+message row points at the task it came from — but it is stored rather than
+computed, because a conversation has to survive the task row being pruned and
+because the UI must not have to know what a task is.
 """
 
 from __future__ import annotations
@@ -11,7 +18,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -66,7 +73,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     push_state      TEXT,
     push_registered_at TEXT,
     push_count      INTEGER NOT NULL DEFAULT 0,
-    last_push_at    TEXT
+    last_push_at    TEXT,
+    session_id      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS tasks_agent ON tasks (agent_id, created_at DESC);
@@ -82,17 +90,48 @@ CREATE TABLE IF NOT EXISTS task_events (
 );
 
 CREATE INDEX IF NOT EXISTS task_events_task ON task_events (task_id, id);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id              TEXT PRIMARY KEY,
+    agent_id        TEXT NOT NULL,
+    agent_name      TEXT NOT NULL,
+    agent_url       TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    context_id      TEXT,
+    task_id         TEXT,
+    state           TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    message_count   INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS sessions_agent ON sessions (agent_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS sessions_updated ON sessions (updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS session_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    at          TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    state       TEXT,
+    task_id     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS session_messages_session ON session_messages (session_id, id);
 """
 
-#: Task columns added after schema v1 (push notifications). ``CREATE TABLE IF NOT
-#: EXISTS`` never touches a table that already exists, so a database written by
-#: 0.2.x has to be widened in place rather than recreated.
+#: Task columns added after schema v1 (push notifications) and v2 (sessions).
+#: ``CREATE TABLE IF NOT EXISTS`` never touches a table that already exists, so a
+#: database written by an older release has to be widened in place rather than
+#: recreated.
 _ADDED_TASK_COLUMNS: tuple[tuple[str, str], ...] = (
     ("push_token", "TEXT"),
     ("push_state", "TEXT"),
     ("push_registered_at", "TEXT"),
     ("push_count", "INTEGER NOT NULL DEFAULT 0"),
     ("last_push_at", "TEXT"),
+    ("session_id", "TEXT"),
 )
 
 
@@ -132,9 +171,9 @@ class Database:
 
 
 def _widen(connection: sqlite3.Connection) -> None:
-    """Add the columns a pre-0.3 database is missing, then index the new one.
+    """Add the columns a pre-0.3 database is missing, then index the new ones.
 
-    The index is created here rather than in ``_SCHEMA`` on purpose: on an old
+    The indexes are created here rather than in ``_SCHEMA`` on purpose: on an old
     file the column does not exist yet when ``executescript`` runs, and
     ``CREATE INDEX`` on a missing column is an error, not a no-op.
     """
@@ -143,3 +182,4 @@ def _widen(connection: sqlite3.Connection) -> None:
         if name not in existing:
             connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {declaration}")
     connection.execute("CREATE INDEX IF NOT EXISTS tasks_push_token ON tasks (push_token)")
+    connection.execute("CREATE INDEX IF NOT EXISTS tasks_session ON tasks (session_id)")

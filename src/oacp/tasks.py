@@ -97,8 +97,15 @@ class TaskService:
         *,
         context_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        """Send a message to an agent and record the resulting task."""
+        """Send a message to an agent and record the resulting task.
+
+        ``session_id`` rides in the same INSERT as everything else on purpose: a
+        push callback can arrive while this call is still in flight, and it finds
+        the row by token. A row that did not yet say which conversation it
+        belongs to would silently drop that first update.
+        """
         agent = self.registry.get(agent_id)
         if agent is None:
             raise PanelError("agent_not_found", status=404, agent_id=agent_id)
@@ -120,8 +127,8 @@ class TaskService:
                 INSERT INTO tasks (
                     id, agent_id, agent_name, agent_url, endpoint, state, title,
                     input_text, request_json, created_at, updated_at, message_count,
-                    push_token, push_state
-                ) VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, 1, ?, ?)
+                    push_token, push_state, session_id
+                ) VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -136,6 +143,7 @@ class TaskService:
                     now,
                     push_token,
                     push_state,
+                    session_id,
                 ),
             )
             self._event(

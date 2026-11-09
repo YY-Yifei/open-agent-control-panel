@@ -76,6 +76,18 @@ async def receive_push(request: Request, token: str) -> JSONResponse:
         log.info("A2A push rejected: %s", exc.reason)
         return _refuse(exc.status, exc.code, exc.reason)
 
+    # A callback is how a conversation learns the answer it was waiting for.
+    # This runs *after* the ledger has accepted the update, and it is deliberately
+    # unable to fail the delivery: the task is already stored, so a display-layer
+    # problem must not make the agent retry forever.
+    if outcome.get("status") == "applied":
+        sessions = getattr(request.app.state, "sessions", None)
+        if sessions is not None:
+            try:
+                sessions.absorb_task(str(outcome.get("taskId") or ""))
+            except Exception:  # noqa: BLE001 — never fail a callback over this
+                log.exception("could not fold push %s into its conversation", outcome.get("taskId"))
+
     log.debug("A2A push %s for %s", outcome.get("status"), outcome.get("taskId"))
     return JSONResponse(outcome, status_code=200)
 
