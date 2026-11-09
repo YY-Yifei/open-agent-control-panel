@@ -12,7 +12,6 @@ operator explicitly opts in (``OACP_ALLOW_PRIVATE_AGENTS``) for local testing.
 
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import re
 import socket
@@ -122,8 +121,9 @@ def normalize_url(url: str, *, allow_http: bool = False) -> str:
     Normalization does exactly three things and nothing else: lower-case the
     scheme and host, drop the default ``:443`` port, and upper-case percent
     escapes. Any semantic rewrite (adding a trailing slash, resolving ``..``,
-    reordering query parameters) is deliberately **not** performed, because
-    ``id`` is derived from this string and every rewrite would move the id.
+    reordering query parameters) is deliberately **not** performed: the stored
+    URL is what the probe re-fetches, so two spellings of one endpoint should not
+    turn into two entries.
     """
     if not isinstance(url, str):
         raise UrlError("url must be a string")
@@ -178,15 +178,6 @@ def host_and_port(url: str) -> tuple[str, int]:
 def host_of(url: str) -> str:
     """The lower-case hostname of an already-normalized URL."""
     return (urlsplit(url).hostname or "").lower()
-
-
-def derive_id(normalized_url: str) -> str:
-    """``a_`` + the first 16 hex characters of ``sha256(url)``.
-
-    Because the id is a deterministic function of the normalized URL, repeated
-    registration is idempotent without any uniqueness bookkeeping.
-    """
-    return "a_" + hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()[:16]
 
 
 def validate_endpoint(url: str, *, allow_private: bool) -> str:

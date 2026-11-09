@@ -14,11 +14,12 @@ because the UI must not have to know what a task is.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -156,8 +157,10 @@ class Database:
         """Create the schema (idempotent), widen an old one, and enable WAL."""
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
+            previous = connection.execute("PRAGMA user_version").fetchone()[0]
             connection.executescript(_SCHEMA)
             _widen(connection)
+            _rekey_agents(connection, previous)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def ping(self) -> bool:
@@ -183,3 +186,53 @@ def _widen(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {declaration}")
     connection.execute("CREATE INDEX IF NOT EXISTS tasks_push_token ON tasks (push_token)")
     connection.execute("CREATE INDEX IF NOT EXISTS tasks_session ON tasks (session_id)")
+
+
+def _rekey_agents(connection: sqlite3.Connection, previous: int) -> None:
+    """Re-derive ids written by schema ≤3 from the stored card name (3 → 4).
+
+    Until schema 4 an entry's id was ``sha256(url)``; it is now ``sha256(name)``,
+    so an old file has to be re-keyed once — otherwise every stored entry would
+    look unregistered, and the URL it holds (unique) unregisterable. Conversations
+    and tasks point at the agent id, so they are re-pointed in the same pass: the
+    whole point of the change is that an agent's conversations follow its name.
+
+    Two old rows can collide only if two different URLs published the same name.
+    The later one is merged into the earlier one rather than dropped, so its
+    conversations survive the migration too.
+
+    Each statement autocommits (``isolation_level=None``), which is why the pass
+    has to be idempotent: an interrupted run leaves ``user_version`` at 3 and the
+    next start finishes the job without moving anything twice.
+    """
+    if previous >= SCHEMA_VERSION:
+        return
+
+    from .adp.card import derive_id  # local: ``card`` must stay ignorant of storage
+    from .util import iso
+
+    rows = connection.execute(
+        "SELECT id, card FROM agents ORDER BY first_seen_at ASC, id ASC"
+    ).fetchall()
+    for row in rows:
+        old_id = row["id"]
+        try:
+            new_id = derive_id(json.loads(row["card"])["name"])
+        except (ValueError, KeyError, TypeError):
+            continue  # a stored card without a usable name keeps its old id
+        if new_id == old_id:
+            continue
+
+        survivor = connection.execute("SELECT 1 FROM agents WHERE id = ?", (new_id,)).fetchone()
+        if survivor is not None:
+            connection.execute("DELETE FROM agents WHERE id = ?", (old_id,))
+        else:
+            connection.execute("UPDATE agents SET id = ? WHERE id = ?", (new_id, old_id))
+        # Repointing before or after the agents row does not matter: neither table
+        # declares a foreign key, and both orders leave the same result.
+        connection.execute("UPDATE sessions SET agent_id = ? WHERE agent_id = ?", (new_id, old_id))
+        connection.execute("UPDATE tasks SET agent_id = ? WHERE agent_id = ?", (new_id, old_id))
+        connection.execute(
+            "INSERT INTO registrations (ip, host, at, outcome) VALUES (?, NULL, ?, ?)",
+            ("migration", iso(), "rekeyed"),
+        )

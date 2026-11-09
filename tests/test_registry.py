@@ -53,8 +53,10 @@ def test_registration_is_idempotent_and_returns_one_token(client, fetcher) -> No
     assert second.status_code == 200
     assert "manageToken" not in second.json()
     assert second.json()["id"] == created["id"]
-    # An existing entry is served from storage; the card is not fetched again.
-    assert fetcher.calls.count(CARD_URL) == 1
+    # The id is the card's name, so a repeat registration has to read the card
+    # again — that is the price of the id surviving a move (see test_identity).
+    assert fetcher.calls.count(CARD_URL) == 2
+    assert second.json()["changedAt"] is None
 
 
 def test_registration_requires_https(client) -> None:

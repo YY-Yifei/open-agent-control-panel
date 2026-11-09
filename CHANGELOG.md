@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **An agent's identity is its name, not its URL.** The id is now
+  `a_` + `sha256(canonical name)[:16]` (whitespace collapsed, case-folded), so an agent that goes
+  offline and comes back on a different host, port or scheme keeps its id — and with it every
+  conversation it holds. Re-registering an existing name at a new URL *moves* the entry:
+  `url`/`card` follow, the id and the conversations stay, and no fresh `manageToken` is handed
+  out. A rename at an already-registered URL answers `409 URL_TAKEN` with `existingId`/`newId`
+  instead of silently overwriting the old entry, because under this rule a rename really is a
+  different agent. Two trade-offs, accepted deliberately: a repeat registration must fetch the
+  card again (the id is not computable before it is read), and a name is a registry-wide unique
+  key. Schema 3 → 4 re-keys an existing database on open and re-points `sessions`/`tasks`.
+
 - **Push notifications are now on by default**, and their base URL is derived from the bind
   address the way local mode is: binding loopback (the default) yields
   `http://localhost:PORT/a2a/push`, so an agent on the same machine can always call back.

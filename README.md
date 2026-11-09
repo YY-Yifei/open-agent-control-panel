@@ -157,9 +157,31 @@ method names and push tokens stay behind `/api/panel`; the page itself only ever
 | `GET` | `/v1/agents/{id}` | One AgentRecord, including the card |
 | `DELETE` | `/v1/agents/{id}` | Unregister; requires `X-ADP-Token` |
 
-Records follow the contract exactly: `id` is derived from the normalized URL, `cardHash` is
-`sha256(JCS(card))`, `checkedAt` moves on every attempt, `lastOkAt` only on success, and
-`changedAt`/`prevHash` are always present (nullable) so clients need one branch, not two.
+Records follow the contract exactly: `cardHash` is `sha256(JCS(card))`, `checkedAt` moves on
+every attempt, `lastOkAt` only on success, and `changedAt`/`prevHash` are always present
+(nullable) so clients need one branch, not two.
+
+### Identity is the name
+
+An entry's `id` is `a_` + the first 16 hex characters of `sha256(name)`, where the name is
+canonicalised — whitespace collapsed, case-folded — while the card itself is stored and shown
+verbatim. The URL is an attribute, not the key; that is what lets an agent survive a move:
+
+| Situation | Result |
+|---|---|
+| Same name, same URL | `200`, nothing written, token not rotated (it is issued once, at creation) |
+| Same name, different URL | `200`, the entry **moves**: `url`/`host`/`card` follow, the id and every conversation stay |
+| Different name, same URL | `409 URL_TAKEN` carrying `existingId`/`newId`; a rename is a different agent, so an operator picks which entry survives |
+
+The costs are stated rather than hidden: the id cannot be computed before the card is read, so a
+repeat registration is no longer free, and names are unique across the registry — two agents
+calling themselves the same thing *are* the same identity, so the newcomer's URL wins and the
+earlier one moves.
+
+A database written by an older release is re-keyed once, on open (schema 3 → 4): stored ids are
+recomputed from each card's name, `sessions.agent_id` and `tasks.agent_id` are re-pointed in the
+same pass, and two old entries that published one name are merged into the survivor instead of
+being dropped.
 
 Panel endpoints (not part of ADP). The conversation surface is what the UI uses; the
 `tasks` rows underneath are kept for automation and debugging:

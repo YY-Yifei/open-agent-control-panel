@@ -43,13 +43,6 @@ def test_normalize_url_keeps_trailing_slash_distinct() -> None:
     assert net.normalize_url("https://a.example/card") != net.normalize_url("https://a.example/card/")
 
 
-def test_derive_id_is_deterministic_and_url_scoped() -> None:
-    first = net.derive_id("https://a.example/card")
-    assert first == net.derive_id("https://a.example/card")
-    assert first.startswith("a_") and len(first) == 18
-    assert first != net.derive_id("https://a.example/other")
-
-
 @pytest.mark.parametrize(
     "address, expected",
     [
