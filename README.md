@@ -124,9 +124,21 @@ in full. Two knobs override the derivation:
 * **Tasks** — every task the panel submitted, filterable by state, with a live view of the
   agent's latest output, the event log, and the raw request/response payloads.
 * **Actions** — register, re-fetch a card, send a task, follow up with another message,
-  refresh from the agent, cancel, unregister, forget.
+  refresh from the agent, cancel, remove an agent, forget a task.
+* **Removing an agent** — the dialog uses the manage token from first registration when this
+  browser holds one. Otherwise the panel removes on *operator authority*: a verified panel
+  token, or a loopback-only deployment with no panel token. A network-exposed panel without a
+  token answers `401 manage_token_required` rather than letting anyone delete entries, and ADP
+  `/v1` keeps its own rule (`X-ADP-Token`) regardless. Tasks the agent already ran stay in the
+  ledger — their rows carry the agent's name and URL.
 * **Zero build step** — the front end is three static files (`index.html`, `styles.css`,
   `app.js`), served by the same process. No Node, no bundler, no CDN.
+* **Chinese by default** — the interface ships in Chinese; the sidebar footer toggles to
+  English and the choice is remembered per browser. Task states, ids and raw payloads stay
+  machine-readable, so nothing outside the labels changes. Error text follows the same
+  switch: `/api/panel` messages come from a bilingual catalog (`src/oacp/errors.py`, picked
+  through `Accept-Language`, Chinese by default) and always carry a stable `code`; ADP `/v1`
+  errors keep their English `code`/`message` contract, which the UI translates for display.
 
 ## Protocol surface
 
@@ -150,7 +162,7 @@ Panel endpoints (not part of ADP):
 | `GET` | `/api/panel/agents` | Agents with local task counts |
 | `GET` | `/api/panel/agents/{id}` | Record + interfaces + recent tasks |
 | `POST` | `/api/panel/agents/{id}/refresh` | Probe this agent now |
-| `DELETE` | `/api/panel/agents/{id}` | Unregister with `{"token": …}` |
+| `DELETE` | `/api/panel/agents/{id}` | Unregister: `{"token": …}` (owner) or empty body (operator) |
 | `POST` | `/api/panel/agents/{id}/tasks` | Submit `{"text": …}` over A2A |
 | `GET` | `/api/panel/tasks` | Local task ledger (`agentId`, `state`, `q`, `limit`, `cursor`) |
 | `GET` | `/api/panel/tasks/{id}` | Task + event log + raw payloads |
@@ -171,6 +183,41 @@ agent answers *method not found* or *invalid params* — retries once with the o
 
 Both responses are normalized to the same internal view, including task states such as
 `TASK_STATE_INPUT_REQUIRED` → `input-required`.
+
+## Push notifications (the agent calls back)
+
+A2A has exactly one way for an *agent* to speak first, and the panel uses it by default:
+while a task is running it offers the agent a URL to report to, and the agent `POST`s the
+whole `Task` there whenever it moves.
+
+* **capability gate** — the card's `capabilities.pushNotifications`. Without it the panel
+  offers nothing and records why (`pushState: "unsupported"` on the task).
+* **registration** — the `{url, token}` config rides inline with the message
+  (`configuration`) and is then confirmed with `tasks/pushNotificationConfig/set`
+  (0.3) or `CreateTaskPushNotificationConfig` (1.x).
+* **delivery** — the agent `POST`s the whole `Task` to `/a2a/push/<token>`; the panel stores
+  it, so the task on screen is current without anyone pressing refresh.
+* **the token is the credential** — 192 bits minted per task. It buys exactly one thing:
+  updating that one task. An unknown or mismatched token is refused, as is a body over
+  256 KB or one that is not a Task.
+* **idempotent and monotonic** — a retry changes nothing, and a late `working` cannot
+  overwrite a `completed` we already hold. A callback that omits artifacts does not erase
+  the answer already stored.
+
+Only running tasks are subscribed to: one that finishes inside the `SendMessage` call is
+recorded as `settled` and never offered a URL. If registration is refused, the inline copy
+may still work, so the panel asks once (`GetTask`) instead of leaving the task stale.
+
+Where that URL points is derived, the same way local mode is: bind loopback (the default)
+and the callback base is `http://localhost:8000/a2a/push`; `--public-url` overrides it, and a
+wildcard bind falls back to `127.0.0.1`. On one machine the whole loop therefore works out of
+the box, demo echo agent included.
+
+Reachability is the one real prerequisite, and it is a network fact rather than a flag: an
+agent on another host can only POST to an address it can route to. `--public-url` is what
+turns a demo into a deployment; the startup banner prints the callback base and says so when
+it is a loopback address on a non-loopback bind. `--no-push` (`OACP_PUSH_ENABLED=0`) turns the
+flow off, and `tasks/get` remains the only way a task is updated.
 
 ## Configuration
 
@@ -196,6 +243,7 @@ default < environment < flag.
 | `--allow-insecure-cards` | `OACP_ALLOW_INSECURE_CARDS` | `false` | **Dev only:** accept http/private card URLs |
 | `--allow-private-agents` | `OACP_ALLOW_PRIVATE_AGENTS` | `false` | **Dev only:** call private A2A endpoints |
 | `--a2a-timeout` | `OACP_A2A_TIMEOUT` | `60` | A2A request timeout in seconds |
+| `--no-push` | `OACP_PUSH_ENABLED` | `true` | Offer agents a callback URL (`--push`, the default; this turns it off) |
 | `--host` / `--port` | — | `127.0.0.1` / `8000` | Bind address |
 
 ## Security model
@@ -234,7 +282,8 @@ Layout:
 src/oacp/
   adp/        spec implementation: jcs, card checks, guarded fetcher, registry, routes, probe loop
   a2a/        JSON-RPC client with the two-dialect fallback
-  tasks.py    local task ledger and A2A interactions
+  tasks.py    local task ledger, A2A interactions, push bookkeeping
+  push.py     inbound A2A push notifications (the agent calling back)
   api.py      panel API
   app.py      application factory, static UI, error mapping
   cli.py      `oacp serve`
@@ -248,10 +297,17 @@ tests inject an `httpx.MockTransport`.
 
 ## Limitations
 
-* No streaming (`message/stream`, `tasks/resubscribe`); tasks are followed by polling.
-* Tasks are refreshed when you ask, not continuously.
+* No streaming (`message/stream`, `tasks/resubscribe`): a long task is followed by a
+  callback or by asking.
+* Callbacks are on by default, and reach exactly as far as the callback base does: a loopback
+  base (`http://localhost:PORT`) is invisible to an agent on another host. `--public-url` is
+  the fix, and the startup banner says when it is missing.
+* The callback endpoint is validated but unthrottled: there is no rate limit and no
+  signature scheme, because the per-task token already scopes what a caller can do.
+* Deleting a task locally does not remove the push config at the agent; later callbacks for
+  it are answered `404`.
 * Single process, single SQLite file: this is a control plane, not a cluster service.
-* No push notifications, no authentication schemes beyond A2A's own endpoint requirements.
+* No authentication schemes beyond A2A's own endpoint requirements.
 
 ## Links
 

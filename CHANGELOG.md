@@ -6,10 +6,76 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Push notifications are now on by default**, and their base URL is derived from the bind
+  address the way local mode is: binding loopback (the default) yields
+  `http://localhost:PORT/a2a/push`, so an agent on the same machine can always call back.
+  `--no-push` (`OACP_PUSH_ENABLED=0`) turns the flow off. The startup banner prints the
+  callback base and flags the one case that cannot work — a loopback base on a non-loopback
+  bind.
+
+  The demo echo agent now implements the other half: it declares `pushNotifications`, accepts
+  the config inline or through `tasks/pushNotificationConfig/set` /
+  `CreateTaskPushNotificationConfig`, accepts a task as `working`, finishes it a moment later,
+  and `POST`s the finished `Task` to the registered URL.
+
+### Added
+
+- **Agents can now report results back, instead of being polled for them.** `--push`
+  (`OACP_PUSH_ENABLED`) makes the panel offer a callback URL when a task is still running;
+  the agent `POST`s the whole `Task` to `/a2a/push/<token>` and the ledger updates itself.
+  This is A2A's own push-notification flow, not an invention: gated on the card's
+  `capabilities.pushNotifications`, registered inline with the message and confirmed with
+  `tasks/pushNotificationConfig/set` (`CreateTaskPushNotificationConfig` on 1.x cards), with
+  the two-dialect fallback the rest of the client already uses. Each task gets its own
+  192-bit token, which is the only credential the endpoint accepts; bodies are capped at
+  256 KB and must be a Task. Deliveries are idempotent and monotonic — retries change
+  nothing, a late `working` cannot overwrite a `completed`, and a callback that omits
+  artifacts does not erase the answer already stored. Task records gain `pushState`,
+  `pushCount` and `lastPushAt`, and `/api/panel/summary` reports `pushEnabled`. A refused
+  registration falls back to the inline copy plus one `GetTask`, so a task never sits on
+  `working` waiting for a callback that will not come.
+
+- **Agents can now be removed without the manage token, by the panel's operator.**
+  `DELETE /api/panel/agents/{id}` accepts an empty body: if the caller is the operator — the
+  panel token was verified, or this is a loopback-only deployment with no panel token — the
+  entry is removed and the removal is written to the registration log
+  (`outcome = removed-by-operator`). A manage token sent in the body is still checked first,
+  exactly as the contract requires, so ownership always wins. A network-exposed panel with no
+  token refuses (`401`, `code: manage_token_required`) instead of letting anyone delete
+  anyone's entry, and `/v1/agents/{id}` keeps demanding `X-ADP-Token` — the operator authority
+  is panel-only. `GET /api/panel/summary` reports the policy as `removal: {operator, reason}`.
+- **A remove button on every agent card**, not only on the detail page. The dialog has three
+  states: this browser holds the manage token (prefilled), the operator may remove directly
+  (with the reason shown), or neither (the token field stays open for pasting, plus an
+  explanation of how to become the operator).
+- Two panel error codes in the bilingual catalog: `manage_token_required` and
+  `manage_token_mismatch` (a wrong token used to surface as the contract's English
+  `UNAUTHORIZED`).
+
+### Changed
+
+- **The web UI defaults to Chinese.** Every piece of panel copy — navigation, stat cards,
+  tables, empty states, modals, toasts and relative timestamps — now goes through a small
+  dictionary in `src/oacp/web/app.js`. Chinese is the default on first visit; the sidebar
+  footer switches to English and remembers the choice in `localStorage`. Machine values
+  (task states, ids, URLs, raw JSON) and every API payload are untouched.
+- **Error messages follow the same switch.** `/api/panel` failures are rendered from a
+  bilingual catalog in `src/oacp/errors.py` (`PanelError` + `{"detail": …, "code": …}`), in
+  Chinese by default and in English when the caller sends `Accept-Language: en`. The UI
+  sends that header for whatever language it is showing, and translates the ADP `/v1`
+  contract's stable error codes (and card-validation problems) for display — the protocol's
+  own `code`/`message` pair stays English on the wire.
+
 ### Fixed
 
 - The demo agent flushes its status lines, so `[self-registration] …` still shows up when its
   output is piped into a file instead of a terminal.
+- The test that watches the demo agent re-register no longer races the log line it asserts on:
+  the keeper publishes its new registration before it writes the note, so the assertion now
+  waits for the note instead of reading once. This was flaky on `main` before any of the above
+  (1 failure in 5 runs, measured).
 
 ## [0.2.1] — 2026-11-06
 
