@@ -22,6 +22,27 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Agent replies are rendered as Markdown.** A dependency-free module
+  (`src/oacp/web/md.js`, no build step, no highlighter) renders headings, lists, fenced and
+  inline code, bold/italic, strikethrough, links, images, quotes, rules and tables, and keeps
+  single newlines as line breaks. Your own messages and error notices stay plain text.
+
+  The reply is escaped before any tag is added back, and link/image URLs pass a whitelist, so
+  a `javascript:` link degrades to its label and a reply containing `<script>` shows up as
+  text. Covered by `tests/test_markdown.py`, which drives the browser module from Node and
+  asserts the tag whitelist rather than a list of forbidden substrings.
+
+- **The panel is a conversation client now.** The page shows agents, conversations and
+  messages; tasks, `contextId` and JSON-RPC method names never reach it. A conversation
+  belongs to one agent, keeps its own history, and maps onto A2A as a `contextId` plus one
+  task per turn (`src/oacp/sessions.py`). New `/api/panel/sessions` endpoints, and
+  `GET /api/panel/agents` also reports `sessionCount` / `lastSessionAt`.
+
+  The raw ledger is unchanged and still served (`/api/panel/tasks*`, with event logs and
+  payloads); the interface simply no longer asks anyone to read it. Schema v3 adds the
+  `sessions` and `session_messages` tables and `tasks.session_id`, all widened in place on
+  first start, so a 0.3 database keeps every row it had.
+
 - **Agents can now report results back, instead of being polled for them.** `--push`
   (`OACP_PUSH_ENABLED`) makes the panel offer a callback URL when a task is still running;
   the agent `POST`s the whole `Task` to `/a2a/push/<token>` and the ledger updates itself.
@@ -55,6 +76,10 @@ All notable changes to this project are documented here. The format follows
   `UNAUTHORIZED`).
 
 ### Changed
+
+- The web UI was rewritten around that model: agents on the left, the selected agent's
+  conversations beneath them, one chat pane. The task list, the agent detail page and the
+  raw-JSON views are gone; three static files, no build step, still.
 
 - **The web UI defaults to Chinese.** Every piece of panel copy — navigation, stat cards,
   tables, empty states, modals, toasts and relative timestamps — now goes through a small

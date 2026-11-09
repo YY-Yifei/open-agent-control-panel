@@ -119,26 +119,33 @@ in full. Two knobs override the derivation:
 
 ## What the UI gives you
 
-* **Agents** — status (`ok` / `down`), failures, last successful probe, skills, tags, task counts;
-  a detail page with endpoints, the full card and a raw-JSON view.
-* **Tasks** — every task the panel submitted, filterable by state, with a live view of the
-  agent's latest output, the event log, and the raw request/response payloads.
-* **Actions** — register, re-fetch a card, send a task, follow up with another message,
-  refresh from the agent, cancel, remove an agent, forget a task.
+The interface is a conversation client, not a protocol console. A2A's tasks, `contextId`,
+method names and push tokens stay behind `/api/panel`; the page itself only ever talks about
+**agents, conversations and messages**.
+
+* **Agents** — the list on the left, each with a live/offline dot and how many conversations
+  it has. Adding one is a single field: the agent card URL (agents that register themselves
+  appear without it).
+* **Conversations** — pick an agent and the panel opens its most recent conversation, or an
+  empty one if there is none. Each conversation keeps its own history and its own context on
+  the agent, so coming back tomorrow continues the same thread.
+* **Messages** — you write, the agent answers. While it works the composer waits and a *stop*
+  button appears; a turn that asks for more input turns the composer back on.
+* **Six states** — 空闲 / 正在处理 / 等待回复 / 已完成 / 出错 / 已停止. Nothing else is shown,
+  and no protocol word reaches the page.
 * **Removing an agent** — the dialog uses the manage token from first registration when this
   browser holds one. Otherwise the panel removes on *operator authority*: a verified panel
   token, or a loopback-only deployment with no panel token. A network-exposed panel without a
   token answers `401 manage_token_required` rather than letting anyone delete entries, and ADP
-  `/v1` keeps its own rule (`X-ADP-Token`) regardless. Tasks the agent already ran stay in the
-  ledger — their rows carry the agent's name and URL.
+  `/v1` keeps its own rule (`X-ADP-Token`) regardless. Conversations and the task ledger stay
+  readable — their rows carry the agent's name and URL.
 * **Zero build step** — the front end is three static files (`index.html`, `styles.css`,
   `app.js`), served by the same process. No Node, no bundler, no CDN.
 * **Chinese by default** — the interface ships in Chinese; the sidebar footer toggles to
-  English and the choice is remembered per browser. Task states, ids and raw payloads stay
-  machine-readable, so nothing outside the labels changes. Error text follows the same
-  switch: `/api/panel` messages come from a bilingual catalog (`src/oacp/errors.py`, picked
-  through `Accept-Language`, Chinese by default) and always carry a stable `code`; ADP `/v1`
-  errors keep their English `code`/`message` contract, which the UI translates for display.
+  English and the choice is remembered per browser. Error text follows the same switch:
+  `/api/panel` messages come from a bilingual catalog (`src/oacp/errors.py`, picked through
+  `Accept-Language`, Chinese by default) and always carry a stable `code`; ADP `/v1` errors
+  keep their English `code`/`message` contract, which the UI shows verbatim.
 
 ## Protocol surface
 
@@ -154,7 +161,8 @@ Records follow the contract exactly: `id` is derived from the normalized URL, `c
 `sha256(JCS(card))`, `checkedAt` moves on every attempt, `lastOkAt` only on success, and
 `changedAt`/`prevHash` are always present (nullable) so clients need one branch, not two.
 
-Panel endpoints (not part of ADP):
+Panel endpoints (not part of ADP). The conversation surface is what the UI uses; the
+`tasks` rows underneath are kept for automation and debugging:
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -163,7 +171,15 @@ Panel endpoints (not part of ADP):
 | `GET` | `/api/panel/agents/{id}` | Record + interfaces + recent tasks |
 | `POST` | `/api/panel/agents/{id}/refresh` | Probe this agent now |
 | `DELETE` | `/api/panel/agents/{id}` | Unregister: `{"token": …}` (owner) or empty body (operator) |
-| `POST` | `/api/panel/agents/{id}/tasks` | Submit `{"text": …}` over A2A |
+| `GET` | `/api/panel/sessions` | Conversations, newest activity first (`agentId`, `limit`) |
+| `POST` | `/api/panel/agents/{id}/sessions` | Open a conversation, optionally with `{"text": …}` |
+| `GET` | `/api/panel/sessions/{id}` | One conversation with its messages |
+| `POST` | `/api/panel/sessions/{id}/messages` | Send `{"text": …}`; answers `working` when the agent will report back |
+| `POST` | `/api/panel/sessions/{id}/sync` | Ask the agent for the current turn (`tasks/get`) |
+| `POST` | `/api/panel/sessions/{id}/cancel` | Stop the running turn (`tasks/cancel`) |
+| `PATCH` | `/api/panel/sessions/{id}` | Rename: `{"title": …}` |
+| `DELETE` | `/api/panel/sessions/{id}` | Forget the conversation; the task rows stay |
+| `POST` | `/api/panel/agents/{id}/tasks` | One message over A2A (what the conversations use) |
 | `GET` | `/api/panel/tasks` | Local task ledger (`agentId`, `state`, `q`, `limit`, `cursor`) |
 | `GET` | `/api/panel/tasks/{id}` | Task + event log + raw payloads |
 | `POST` | `/api/panel/tasks/{id}/refresh` | `tasks/get` against the agent |
@@ -183,6 +199,45 @@ agent answers *method not found* or *invalid params* — retries once with the o
 
 Both responses are normalized to the same internal view, including task states such as
 `TASK_STATE_INPUT_REQUIRED` → `input-required`.
+
+## Conversations on top of A2A
+
+A2A has no conversation object. It has a `contextId` that ties tasks together, and a
+`message/send` that answers with a `Task`. The panel keeps the shape its users need in
+`sessions` / `session_messages` (`src/oacp/sessions.py`) and maps it like this:
+
+| Panel | A2A |
+|---|---|
+| a conversation | `sessions.context_id`, assigned by the agent on the first turn |
+| a message you send | `SendMessage` — a follow-up into the open task while there is one, a fresh send carrying the same `contextId` once the turn is finished |
+| the agent's answer | the task's text, folded into one message |
+| 正在处理 / 等待回复 | `working` / `input-required`, `auth-required` |
+| 已停止 | `canceled` |
+
+Everything that can change a task — the send's own result, a `GetTask` through
+`POST /api/panel/sessions/{id}/sync`, and a push callback — goes through the same `_absorb`
+step, so a conversation cannot show two different truths depending on which way the update
+arrived. A repeated snapshot is stored once, compared per turn (two turns may legitimately
+answer with the same words), and a finished turn is a one-way door: a late `working` never
+overwrites it.
+
+`GET /api/panel/tasks*` still serves the raw ledger, with event logs and payloads, for
+whoever is debugging an agent. The interface does not ask anyone to read it.
+
+### Rendered replies
+
+Agent replies are Markdown, rendered in the browser by a small module with no dependencies
+and no syntax highlighting (`src/oacp/web/md.js`). Headings, lists, fenced and inline code,
+bold/italic, strikethrough, links, images, quotes, rules and tables are supported. A single
+newline stays a line break, because models use them to break lines.
+
+Messages you send stay plain text, and so do error notices: typing `# heading` should not
+silently become a heading, and an error string is already a finished sentence.
+
+The reply is escaped before any tag is added back, and link/image URLs pass a whitelist
+(`http(s)`, `mailto`, same-origin paths). A `javascript:` link degrades to its label instead
+of becoming a link, and a reply containing `<script>` shows it as text — a model's output is
+untrusted input that ends up in `innerHTML`.
 
 ## Push notifications (the agent calls back)
 
