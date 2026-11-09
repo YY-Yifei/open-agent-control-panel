@@ -25,6 +25,13 @@ def test_healthz_and_ui_are_served(client) -> None:
     assert script.status_code == 200
     assert "API" in script.text
 
+    # Agent replies are rendered by a separate, dependency-free module. If it
+    # stops being served the panel silently falls back to unformatted text, so
+    # this is worth an assertion of its own.
+    markdown = client.get("/static/md.js")
+    assert markdown.status_code == 200
+    assert "renderMarkdown" in markdown.text
+
     assert client.get("/favicon.svg").status_code == 200
 
 

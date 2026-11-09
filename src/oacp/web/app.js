@@ -1,8 +1,10 @@
 /* 智能体面板 —— 会话为中心的前端。
  *
  * 界面上只有三样东西：智能体、会话、消息。A2A 的 task / contextId / JSON-RPC
- * 都留在服务端，前端一次也不需要知道。三个静态文件，没有构建步骤。
+ * 都留在服务端，前端一次也不需要知道。四个静态文件，没有构建步骤。
  */
+
+import { renderMarkdown } from "./md.js";
 
 const API = "/api/panel";
 const TOKEN_KEY = "oacp.token";
@@ -455,8 +457,13 @@ function renderChat() {
   }
   const rows = messages.map((message) => {
     const role = message.role === "user" ? "user" : message.role === "error" ? "error" : "agent";
+    // 只有 agent 的回答走 Markdown。用户自己的输入与错误提示留在纯文本 ——
+    // 否则人打一句「# 标题」会莫名其妙变成大标题，而错误文案本来就是服务端
+    // 拼好的整句。
+    const html = role === "agent" ? renderMarkdown(message.text) : esc(message.text);
+    const cls = role === "agent" ? "bubble md" : "bubble";
     return `<div class="msg ${role}">
-      <div class="bubble">${esc(message.text)}</div>
+      <div class="${cls}">${html || esc(message.text)}</div>
       <div class="meta">${esc(fmtTime(message.at))}</div>
     </div>`;
   });
