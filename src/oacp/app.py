@@ -18,6 +18,8 @@ from .adp.service import RegistryError, RegistryService
 from .a2a.client import A2AClient
 from .config import Settings
 from .db import Database
+from .errors import PanelError, normalize_lang
+from .push import router as push_router
 from .tasks import TaskService
 
 log = logging.getLogger(__name__)
@@ -42,7 +44,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         timeout=settings.a2a_timeout,
         user_agent=settings.user_agent,
     )
-    tasks = TaskService(database, registry, a2a_client)
+    tasks = TaskService(database, registry, a2a_client, settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -80,11 +82,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.a2a = a2a_client
 
     app.include_router(adp_router)
+    # Agents call this one, so it carries its own per-task token instead of the
+    # panel token, and it is mounted before the protected surface on purpose.
+    app.include_router(push_router)
     app.include_router(api.router, dependencies=[Depends(api.require_panel_token)])
 
     @app.exception_handler(RegistryError)
     async def _registry_error(_request: Request, exc: RegistryError) -> JSONResponse:
         return JSONResponse(exc.body(), status_code=exc.status, headers=exc.headers)
+
+    @app.exception_handler(PanelError)
+    async def _panel_error(request: Request, exc: PanelError) -> JSONResponse:
+        """Render a panel error in the caller's language (Chinese by default).
+
+        The ADP surface above keeps its contract shape and English messages; the
+        panel's own endpoints answer in the language the UI is showing, which is
+        what ``Accept-Language`` carries. The stable ``code`` rides along so
+        nothing has to match on prose.
+        """
+        lang = normalize_lang(request.headers.get("accept-language"))
+        return JSONResponse(exc.payload(lang), status_code=exc.status, headers=exc.headers)
 
     @app.get("/healthz", tags=["ops"])
     def healthz() -> dict[str, str]:

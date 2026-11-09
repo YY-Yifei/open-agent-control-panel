@@ -31,9 +31,28 @@ from ..adp import card as cardmod
 log = logging.getLogger(__name__)
 
 METHODS: dict[str, dict[str, str]] = {
-    "v03": {"send": "message/send", "get": "tasks/get", "cancel": "tasks/cancel"},
-    "v1": {"send": "SendMessage", "get": "GetTask", "cancel": "CancelTask"},
+    "v03": {
+        "send": "message/send",
+        "get": "tasks/get",
+        "cancel": "tasks/cancel",
+        "pushSet": "tasks/pushNotificationConfig/set",
+        "pushDel": "tasks/pushNotificationConfig/delete",
+    },
+    "v1": {
+        "send": "SendMessage",
+        "get": "GetTask",
+        "cancel": "CancelTask",
+        "pushSet": "CreateTaskPushNotificationConfig",
+        "pushDel": "DeleteTaskPushNotificationConfig",
+    },
 }
+
+#: Where a ``{url, token}`` push config rides in each dialect. Two positions
+#: matter: its own RPC parameter, and the ``configuration`` object of a send.
+#: The 1.0 names follow the proto fields (``TaskPushNotificationConfig`` nested
+#: under ``config``; renamed to ``taskPushNotificationConfig`` once inlined).
+_PUSH_PARAM_KEY: dict[str, str] = {"v03": "pushNotificationConfig", "v1": "config"}
+_PUSH_INLINE_KEY: dict[str, str] = {"v03": "pushNotificationConfig", "v1": "taskPushNotificationConfig"}
 
 _RETRYABLE_CODES = {-32601, -32602, -32700}
 _RETRYABLE_STATUSES = {400, 404, 405, 415}
@@ -98,8 +117,14 @@ class A2AClient:
         context_id: str | None = None,
         task_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        push_config: dict[str, Any] | None = None,
     ) -> CallResult:
-        """Send a user message; the agent may answer with a Task or a Message."""
+        """Send a user message; the agent may answer with a Task or a Message.
+
+        ``push_config`` (``{"url": ..., "token": ...}``) is offered inline in the
+        same call, which is the one position that cannot race: an agent that
+        finishes before our next RPC still knows where to report.
+        """
         endpoint, style = self._target(agent_card)
         message_id = str(uuid.uuid4())
 
@@ -109,6 +134,8 @@ class A2AClient:
             }
             if metadata:
                 params["metadata"] = metadata
+            if push_config:
+                params["configuration"] = {_PUSH_INLINE_KEY[dialect]: dict(push_config)}
             return params
 
         return self._call_with_fallback(endpoint, style, "send", build)
@@ -139,6 +166,43 @@ class A2AClient:
             return {"id": task_id}
 
         return self._call_with_fallback(endpoint, style, "cancel", build)
+
+    def set_push_config(
+        self,
+        agent_card: dict[str, Any],
+        task_id: str,
+        config: dict[str, Any],
+    ) -> CallResult:
+        """Register a push-notification target for an existing task.
+
+        A2A 0.3 calls this ``tasks/pushNotificationConfig/set``; the newer dialect
+        calls it ``CreateTaskPushNotificationConfig``. Both take the task id and
+        the ``{url, token}`` config; only the parameter name differs.
+        """
+        endpoint, style = self._target(agent_card)
+
+        def build(dialect: str) -> dict[str, Any]:
+            return {"taskId": task_id, _PUSH_PARAM_KEY[dialect]: dict(config)}
+
+        return self._call_with_fallback(endpoint, style, "pushSet", build)
+
+    def delete_push_config(
+        self,
+        agent_card: dict[str, Any],
+        task_id: str,
+        *,
+        config_id: str | None = None,
+    ) -> CallResult:
+        """Remove a push-notification target (``.../delete`` / ``DeleteTask...``)."""
+        endpoint, style = self._target(agent_card)
+
+        def build(dialect: str) -> dict[str, Any]:
+            params: dict[str, Any] = {"taskId": task_id}
+            if config_id:
+                params["pushNotificationConfigId"] = config_id
+            return params
+
+        return self._call_with_fallback(endpoint, style, "pushDel", build)
 
     # ------------------------------------------------------------------ internals
 

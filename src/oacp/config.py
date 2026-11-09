@@ -73,6 +73,13 @@ class Settings:
     allow_private_agents: bool = False
     a2a_timeout: float = 60.0
 
+    # Inbound A2A push notifications (task callbacks). On by default: it is the
+    # only protocol-defined way an agent can report a result without being asked,
+    # and the callback base follows the bind address the same way local mode does,
+    # so a loopback deployment already offers an address local agents can reach.
+    # Switch it off (``--no-push``) when the panel cannot offer a reachable one.
+    push_enabled: bool = True
+
     user_agent: str = f"open-agent-control-panel/{__version__}"
 
     def __post_init__(self) -> None:
@@ -103,6 +110,15 @@ class Settings:
     def api_base(self) -> str:
         """Base URL advertised in the RegistryCard, always ending in ``/v1``."""
         return self.public_url.rstrip("/") + "/v1"
+
+    @property
+    def push_callback_base(self) -> str:
+        """Prefix the per-task push URL is built from (``/a2a/push/<token>``).
+
+        It is derived from ``public_url`` because that is the one address the
+        operator has already promised is reachable from the outside.
+        """
+        return self.public_url.rstrip("/") + "/a2a/push"
 
     def registry_card(self) -> dict[str, Any]:
         """The RegistryCard served from ``/.well-known/a2a-registry.json``."""
@@ -153,6 +169,6 @@ def _coerce(name: str, raw: str) -> Any:
         return int(raw)
     if name == "a2a_timeout":
         return float(raw)
-    if name in {"allow_private_agents", "allow_insecure_cards", "probe_enabled"}:
+    if name in {"allow_private_agents", "allow_insecure_cards", "probe_enabled", "push_enabled"}:
         return _as_bool(raw)
     return raw

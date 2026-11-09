@@ -11,7 +11,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -61,7 +61,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
     synced_at       TEXT,
-    message_count   INTEGER NOT NULL DEFAULT 0
+    message_count   INTEGER NOT NULL DEFAULT 0,
+    push_token      TEXT,
+    push_state      TEXT,
+    push_registered_at TEXT,
+    push_count      INTEGER NOT NULL DEFAULT 0,
+    last_push_at    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS tasks_agent ON tasks (agent_id, created_at DESC);
@@ -78,6 +83,17 @@ CREATE TABLE IF NOT EXISTS task_events (
 
 CREATE INDEX IF NOT EXISTS task_events_task ON task_events (task_id, id);
 """
+
+#: Task columns added after schema v1 (push notifications). ``CREATE TABLE IF NOT
+#: EXISTS`` never touches a table that already exists, so a database written by
+#: 0.2.x has to be widened in place rather than recreated.
+_ADDED_TASK_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("push_token", "TEXT"),
+    ("push_state", "TEXT"),
+    ("push_registered_at", "TEXT"),
+    ("push_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_push_at", "TEXT"),
+)
 
 
 class Database:
@@ -98,10 +114,11 @@ class Database:
             connection.close()
 
     def init(self) -> None:
-        """Create the schema (idempotent) and enable WAL when possible."""
+        """Create the schema (idempotent), widen an old one, and enable WAL."""
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(_SCHEMA)
+            _widen(connection)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def ping(self) -> bool:
@@ -112,3 +129,17 @@ class Database:
             return True
         except sqlite3.Error:
             return False
+
+
+def _widen(connection: sqlite3.Connection) -> None:
+    """Add the columns a pre-0.3 database is missing, then index the new one.
+
+    The index is created here rather than in ``_SCHEMA`` on purpose: on an old
+    file the column does not exist yet when ``executescript`` runs, and
+    ``CREATE INDEX`` on a missing column is an error, not a no-op.
+    """
+    existing = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+    for name, declaration in _ADDED_TASK_COLUMNS:
+        if name not in existing:
+            connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {declaration}")
+    connection.execute("CREATE INDEX IF NOT EXISTS tasks_push_token ON tasks (push_token)")

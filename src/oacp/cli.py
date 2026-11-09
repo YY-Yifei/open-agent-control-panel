@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from typing import Sequence
+from urllib.parse import urlsplit
 
 from . import __version__
 from .config import Settings
@@ -64,6 +65,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="never relax https/private-address checks, even when bound to loopback",
     )
     serve.add_argument("--no-probe", action="store_true", default=None, help="disable background probing")
+    serve.add_argument(
+        "--push",
+        action="store_true",
+        default=None,
+        help="offer agents a callback URL for task updates (on by default)",
+    )
+    serve.add_argument(
+        "--no-push",
+        dest="no_push",
+        action="store_true",
+        default=None,
+        help="stop offering callback URLs; tasks are then only updated when asked",
+    )
     serve.add_argument("--probe-interval", type=int, dest="probe_interval", help="probe interval in seconds")
     serve.add_argument("--a2a-timeout", type=float, dest="a2a_timeout", help="A2A request timeout in seconds")
     serve.add_argument("--log-level", default="info", choices=LOG_LEVELS, help="log level (default: info)")
@@ -91,6 +105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "probe_enabled": False if args.no_probe else None,
         "probe_interval": args.probe_interval,
         "a2a_timeout": args.a2a_timeout,
+        "push_enabled": _push_override(args),
     }
 
     # A loopback bind is reachable only from this machine, so the SSRF battery
@@ -110,8 +125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # When neither the flag nor the environment pins the public URL, derive it
     # from the bind address so the RegistryCard points somewhere reachable.
     if args.public_url is None and "OACP_PUBLIC_URL" not in os.environ:
-        visible_host = args.host if args.host not in {"0.0.0.0", "::"} else "127.0.0.1"
-        settings.public_url = f"http://{visible_host}:{args.port}"
+        settings.public_url = _derived_public_url(args)
 
     logging.basicConfig(
         level=_log_level(args.log_level),
@@ -126,6 +140,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Open Agent Control Panel {__version__} — http://{args.host}:{args.port}")
     print(f"  registry API : {settings.api_base}")
     print(f"  database     : {settings.db_path}")
+    for line in _push_banner(settings, args.host):
+        print(line)
     if settings.local_mode:
         print(
             "  local mode   : loopback bind — https and private-address checks are relaxed;"
@@ -139,6 +155,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         access_log=False,
     )
     return 0
+
+
+def _push_override(args: argparse.Namespace) -> bool | None:
+    """Push is on unless switched off; ``--no-push`` wins over a stale ``--push``."""
+    if getattr(args, "no_push", False):
+        return False
+    if getattr(args, "push", False):
+        return True
+    return None
+
+
+def _derived_public_url(args: argparse.Namespace) -> str:
+    """The address this deployment advertises: bind host plus port.
+
+    A wildcard bind is not an address anyone can dial, so it falls back to
+    loopback. Everything derived from this — the RegistryCard, the push callback
+    base — follows the same rule, which is why a loopback deployment gets
+    ``http://localhost:PORT/a2a/push`` for free.
+    """
+    visible_host = args.host if args.host not in {"0.0.0.0", "::"} else "127.0.0.1"
+    return f"http://{visible_host}:{args.port}"
+
+
+def _push_banner(settings: Settings, bind_host: str) -> list[str]:
+    """Lines that say where callbacks point, and when that address cannot work.
+
+    Push notifications are on by default, so the banner has to answer the one
+    question the flag used to answer implicitly: *is this URL reachable by the
+    agents I am calling?* A loopback callback base on a wildcard (or public) bind
+    is not — that is a deployment mistake worth printing, not a crash.
+    """
+    if not settings.push_enabled:
+        return ["  callbacks    : off (--no-push) — tasks update only when asked"]
+    base = settings.push_callback_base
+    host = urlsplit(base).hostname or ""
+    if _is_loopback_host(host) and not _is_loopback_host(bind_host):
+        return [
+            f"  callbacks    : {base}",
+            "                 loopback address — only agents on this machine can call back;"
+            " pass --public-url to offer a reachable one",
+        ]
+    return [f"  callbacks    : {base}"]
 
 
 def _local_mode_overrides(args: argparse.Namespace) -> dict[str, bool]:

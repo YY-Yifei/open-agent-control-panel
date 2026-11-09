@@ -12,7 +12,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from oacp.app import create_app
-from oacp.cli import _is_loopback_host, _local_mode_overrides, build_parser
+from oacp.cli import (
+    _derived_public_url,
+    _is_loopback_host,
+    _local_mode_overrides,
+    _push_banner,
+    _push_override,
+    build_parser,
+)
 from oacp.config import Settings
 
 
@@ -115,3 +122,51 @@ def test_http_card_urls_are_accepted_in_local_mode(tmp_path) -> None:
         denied = client.post("/v1/agents", json={"url": card_url})
         assert denied.status_code == 400
         assert denied.json()["code"] == "BAD_URL"
+
+
+# ---------------------------------------------------------------- push defaults
+
+
+def test_push_is_on_unless_switched_off() -> None:
+    assert Settings(probe_enabled=False).push_enabled is True
+    assert _push_override(_serve_args([])) is None
+    assert _push_override(_serve_args(["--push"])) is True
+    assert _push_override(_serve_args(["--no-push"])) is False
+    # Turning a default off must not be undone by a stale --push in a start script.
+    assert _push_override(_serve_args(["--push", "--no-push"])) is False
+
+
+def test_callback_base_follows_the_bind_address(tmp_path) -> None:
+    """The same derivation local mode uses, applied to the callback URL."""
+    settings = Settings(db_path=str(tmp_path / "a.db"), probe_enabled=False)
+
+    settings.public_url = _derived_public_url(_serve_args(["--host", "localhost", "--port", "9100"]))
+    assert settings.push_callback_base == "http://localhost:9100/a2a/push"
+
+    settings.public_url = _derived_public_url(_serve_args(["--host", "0.0.0.0", "--port", "9100"]))
+    assert settings.push_callback_base == "http://127.0.0.1:9100/a2a/push"
+
+
+def test_push_banner_prints_the_callback_base(tmp_path) -> None:
+    settings = Settings(db_path=str(tmp_path / "a.db"), probe_enabled=False)
+    assert _push_banner(settings, "127.0.0.1") == ["  callbacks    : http://127.0.0.1:8000/a2a/push"]
+
+
+def test_push_banner_warns_when_the_base_cannot_be_reached(tmp_path) -> None:
+    """A loopback base on a wider bind is a deployment mistake worth printing."""
+    settings = Settings(db_path=str(tmp_path / "a.db"), probe_enabled=False)
+    lines = _push_banner(settings, "0.0.0.0")
+    assert lines[0].endswith("/a2a/push")
+    assert any("only agents on this machine" in line for line in lines)
+
+
+def test_push_banner_respects_a_public_url_and_the_off_switch(tmp_path) -> None:
+    public = Settings(
+        db_path=str(tmp_path / "a.db"),
+        probe_enabled=False,
+        public_url="https://panel.example.com",
+    )
+    assert _push_banner(public, "0.0.0.0") == ["  callbacks    : https://panel.example.com/a2a/push"]
+
+    off = Settings(db_path=str(tmp_path / "b.db"), probe_enabled=False, push_enabled=False)
+    assert "off" in _push_banner(off, "127.0.0.1")[0]

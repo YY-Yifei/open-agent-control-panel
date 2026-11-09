@@ -164,6 +164,36 @@ class RegistryService:
                 raise RegistryError(401, "UNAUTHORIZED", "manage token does not match")
             connection.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
 
+    def force_delete(self, agent_id: str, *, client_ip: str = "unknown") -> dict[str, Any]:
+        """Delete an entry without asking for its manage token; return the record.
+
+        The contract's rule (``DELETE /v1/agents/{id}``) is that only the holder
+        of the manage token may remove an entry, and :meth:`delete` keeps exactly
+        that. An operator, however, has to be able to clear out entries nobody
+        can prove ownership of — a self-registered agent, or one registered from
+        somebody else's browser — or the registry becomes append-only by accident.
+
+        So the *authorisation* question is answered one layer up (the panel
+        decides who counts as an operator, see ``api._operator``) and this method
+        only performs the removal. Two things it does keep: the removed record is
+        returned, and the removal is written to the registration log with
+        ``outcome="removed-by-operator"``, so the audit trail has the same shape
+        as registrations instead of being a hole.
+        """
+        removed: dict[str, Any]
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM agents WHERE id = ?", (agent_id,)
+            ).fetchone()
+            if row is None:
+                raise RegistryError(404, "NOT_FOUND", f"no agent with id {agent_id}")
+            removed = self._record(row)
+            connection.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+            self._record_registration(
+                connection, client_ip or "unknown", row["host"], iso(), "removed-by-operator"
+            )
+        return removed
+
     def probe(self, agent_id: str) -> dict[str, Any] | None:
         """Fetch one agent's card now and apply the freshness rules."""
         with self.db.connect() as connection:

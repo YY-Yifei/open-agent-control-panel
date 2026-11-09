@@ -13,6 +13,11 @@ Registration is the protocol's only write path: an agent says *where its card is
 and the registry fetches it. This example therefore never sends a card body — a
 registry that believed a self-reported card would have nothing to verify.
 
+A task is accepted as ``working`` and finishes a moment later; if the caller
+registered a callback URL (`capabilities.pushNotifications`), the agent then
+``POST``s the whole Task back — A2A push notifications, the one part of the
+protocol where the *agent* speaks first.
+
 Nothing here is meant for production: tasks live in memory.
 """
 
@@ -40,7 +45,7 @@ CARD: dict[str, Any] = {
     "description": "Repeats whatever it is told, and can report how many messages it got.",
     "version": "0.1.0",
     "url": "http://127.0.0.1:9100/a2a",
-    "capabilities": {"streaming": False, "pushNotifications": False},
+    "capabilities": {"streaming": False, "pushNotifications": True},
     "defaultInputModes": ["text/plain"],
     "defaultOutputModes": ["text/plain"],
     "skills": [
@@ -56,7 +61,7 @@ CARD: dict[str, Any] = {
 # Kept at module scope so the lifespan hooks below can start and stop it.
 KEEPER: "SelfRegistration | None" = None
 
-# task id -> {"contextId": str, "messages": list[str], "state": str}
+# task id -> {"contextId": str, "messages": list[str], "state": str, "push": dict | None}
 TASKS: dict[str, dict[str, Any]] = {}
 
 METHODS = {
@@ -66,6 +71,9 @@ METHODS = {
     "GetTask": "get",
     "tasks/cancel": "cancel",
     "CancelTask": "cancel",
+    # Where the caller says "report the result to me".
+    "tasks/pushNotificationConfig/set": "set_push",
+    "CreateTaskPushNotificationConfig": "set_push",
 }
 
 
@@ -259,6 +267,16 @@ class SelfRegistration:
 # ------------------------------------------------------------------- A2A server
 
 
+#: How long a task stays ``working`` before it finishes. The delay is the point:
+#: the caller has to have been told where to report *before* the task ends, which
+#: is the same window a real agent has.
+COMPLETION_DELAY = 0.4
+
+#: Module level so tests can swap in a recorder — a callback otherwise needs a
+#: listening socket.
+POST = httpx.post
+
+
 def _text_of(message: dict[str, Any]) -> str:
     chunks: list[str] = []
     for part in message.get("parts") or []:
@@ -267,35 +285,122 @@ def _text_of(message: dict[str, Any]) -> str:
     return "\n".join(chunks)
 
 
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
 def _view(task_id: str) -> dict[str, Any]:
+    """One Task, in the shape both dialects agree on."""
     task = TASKS[task_id]
     reply = task["messages"][-1] if task["messages"] else ""
-    return {
+    done = task["state"] == "completed"
+    if done:
+        status_text = reply
+    elif task["state"] == "canceled":
+        status_text = "canceled"
+    else:
+        status_text = "working on it"
+    view: dict[str, Any] = {
         "kind": "task",
         "id": task_id,
         "contextId": task["contextId"],
         "status": {
             "state": task["state"],
-            "timestamp": "2026-01-01T00:00:00Z",
-            "message": {"role": "agent", "parts": [{"kind": "text", "text": reply}]},
+            "timestamp": _now(),
+            "message": {"role": "agent", "parts": [{"kind": "text", "text": status_text}]},
         },
-        "artifacts": [{"parts": [{"kind": "text", "text": reply}]}],
         "history": [],
     }
+    if done and reply:
+        # A ``working`` task has no answer yet — which is exactly why the panel
+        # cannot just read this view and needs the callback instead.
+        view["artifacts"] = [{"parts": [{"kind": "text", "text": reply}]}]
+    return view
+
+
+def _push_config_of(params: dict[str, Any]) -> dict[str, Any] | None:
+    """Where an inline push config may ride, in either dialect."""
+    configuration = params.get("configuration")
+    if not isinstance(configuration, dict):
+        return None
+    for key in ("pushNotificationConfig", "taskPushNotificationConfig"):
+        value = configuration.get(key)
+        if isinstance(value, dict) and value.get("url"):
+            return value
+    return None
 
 
 def _send(message: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     task_id = message.get("taskId") or params.get("id") or f"echo-{uuid.uuid4().hex[:12]}"
     task = TASKS.setdefault(
         task_id,
-        {"contextId": message.get("contextId") or uuid.uuid4().hex, "messages": [], "state": "working"},
+        {
+            "contextId": message.get("contextId") or uuid.uuid4().hex,
+            "messages": [],
+            "state": "working",
+            "push": None,
+        },
     )
-    if task["state"] == "canceled":
-        task["state"] = "working"
-    text = _text_of(message)
-    task["messages"].append(f"echo: {text}")
+    config = _push_config_of(params)
+    if config is not None:
+        task["push"] = config
+    task["state"] = "working"
+    task["messages"].append(f"echo: {_text_of(message)}")
+    # Snapshot the accepted view *before* the thread starts: the reply must say
+    # "working" even when the delay is zero, and a view built afterwards could
+    # already show the completion it was supposed to precede.
+    accepted = _view(task_id)
+    threading.Thread(target=_finish, args=(task_id,), name=f"echo-{task_id}", daemon=True).start()
+    return accepted
+
+
+def _finish(task_id: str) -> None:
+    """Finish the task after a beat, then report it to whoever asked."""
+    time.sleep(max(0.0, COMPLETION_DELAY))
+    task = TASKS.get(task_id)
+    if task is None or task["state"] != "working":
+        return  # canceled, or finished already: a late finish must not resurrect it
     task["state"] = "completed"
-    return _view(task_id)
+    _notify(task_id)
+
+
+def _notify(task_id: str) -> None:
+    """POST the whole Task to the callback URL — A2A push notifications.
+
+    Fire-and-forget on purpose: the panel answers 2xx once it has stored the task,
+    and a callback that fails is a log line, never a failed task.
+    """
+    config = (TASKS.get(task_id) or {}).get("push") or {}
+    url = config.get("url")
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return
+    headers = {"Content-Type": "application/json", "User-Agent": "echo-agent"}
+    token = config.get("token")
+    if isinstance(token, str) and token:
+        # A2A's own header name; the panel also carries the token in the URL path.
+        headers["X-A2A-Notification-Token"] = token
+    try:
+        response = POST(url, json=_view(task_id), headers=headers, timeout=5.0, trust_env=False)
+    except Exception as exc:  # noqa: BLE001 — a demo must never die on a callback
+        _say(f"[push] could not report {task_id}: {_reason(exc)}")
+        return
+    _say(f"[push] reported {task_id} -> HTTP {getattr(response, 'status_code', '?')}")
+
+
+def _set_push(params: dict[str, Any]) -> dict[str, Any]:
+    """``tasks/pushNotificationConfig/set`` / ``CreateTaskPushNotificationConfig``."""
+    task_id = params.get("taskId") or params.get("id")
+    if task_id not in TASKS:
+        raise KeyError(task_id)
+    config = (
+        params.get("pushNotificationConfig")
+        or params.get("taskPushNotificationConfig")
+        or params.get("config")
+    )
+    if not isinstance(config, dict) or not config.get("url"):
+        raise ValueError("pushNotificationConfig.url is required")
+    TASKS[task_id]["push"] = config
+    return config
 
 
 def _get(params: dict[str, Any]) -> dict[str, Any]:
@@ -358,7 +463,11 @@ async def a2a(request: Request) -> JSONResponse:
             return ok(_send(message, params))
         if handler == "get":
             return ok(_get(params))
+        if handler == "set_push":
+            return ok(_set_push(params))
         return ok(_cancel(params))
+    except ValueError as exc:
+        return error(-32602, str(exc))
     except KeyError as exc:
         return error(-32001, f"unknown task: {exc.args[0]}")
 

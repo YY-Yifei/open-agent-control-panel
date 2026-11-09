@@ -11,6 +11,7 @@ import importlib.util
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -200,7 +201,10 @@ def test_keeper_re_registers_only_after_the_registry_forgets_it(panel, monkeypat
             assert _wait_for(lambda: first.agent_id in _ids_by_client(panel))
         assert keeper.registration is not None
         assert keeper.registration.created is True, "a re-registration is a fresh 201"
-        assert any("re-registered" in note for note in notes), notes
+        # The keeper publishes the new registration *before* it writes the note, so
+        # seeing the entry back in the registry does not yet mean the line exists.
+        # Wait for the line itself: the assertion is the same, the race is gone.
+        assert _wait_for(lambda: any("re-registered" in note for note in notes)), notes
     finally:
         keeper.stop()
 
@@ -225,3 +229,80 @@ def test_keeper_stops_cleanly_and_can_unregister(panel):
 def _ids_by_client(panel_app) -> list[str]:
     with TestClient(panel_app) as client:
         return _ids(client)
+
+
+# ---------------------------------------------------------------- push notifications
+
+
+def test_inline_push_config_is_kept_and_the_task_finishes_later(monkeypatch):
+    """The demo agent's half of A2A push: accept as working, then report back."""
+    posted: dict[str, Any] = {}
+
+    def record(url, **kwargs):
+        posted.update({"url": url}, **kwargs)
+        return httpx.Response(200, json={"status": "applied"})
+
+    monkeypatch.setattr(echo, "COMPLETION_DELAY", 0.0)
+    monkeypatch.setattr(echo, "POST", record)
+    config = {"url": "http://127.0.0.1:8000/a2a/push/tok-1", "token": "tok-1"}
+
+    task = echo._send(
+        {"parts": [{"kind": "text", "text": "hello"}], "contextId": "ctx"},
+        {"configuration": {"pushNotificationConfig": config}},
+    )
+
+    assert task["status"]["state"] == "working"
+    assert "artifacts" not in task, "a working task has no answer to hand over yet"
+
+    assert _wait_for(lambda: posted.get("url")), "the agent never called back"
+    assert posted["url"] == config["url"]
+    assert posted["headers"]["X-A2A-Notification-Token"] == "tok-1"
+    assert posted["json"]["status"]["state"] == "completed"
+    assert posted["json"]["artifacts"][0]["parts"][0]["text"] == "echo: hello"
+
+
+def test_push_registration_by_rpc_is_accepted(monkeypatch):
+    """``tasks/pushNotificationConfig/set``: the 0.3 name, and a refusal without a url."""
+    monkeypatch.setattr(echo, "COMPLETION_DELAY", 0.0)
+    monkeypatch.setattr(echo, "POST", lambda url, **kwargs: httpx.Response(200))
+
+    client = TestClient(echo.app)
+    sent = client.post(
+        "/a2a",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "message/send",
+            "params": {"message": {"parts": [{"kind": "text", "text": "hi"}]}},
+        },
+    )
+    task_id = sent.json()["result"]["id"]
+
+    registered = client.post(
+        "/a2a",
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tasks/pushNotificationConfig/set",
+            "params": {
+                "taskId": task_id,
+                "pushNotificationConfig": {
+                    "url": "http://127.0.0.1:8000/a2a/push/tok-2",
+                    "token": "tok-2",
+                },
+            },
+        },
+    ).json()
+    assert registered["result"]["token"] == "tok-2"
+    assert echo.TASKS[task_id]["push"]["url"].endswith("/tok-2")
+
+    refused = client.post(
+        "/a2a",
+        json={
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tasks/pushNotificationConfig/set",
+            "params": {"taskId": task_id, "pushNotificationConfig": {}},
+        },
+    ).json()
+    assert refused["error"]["code"] == -32602
