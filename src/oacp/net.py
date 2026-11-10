@@ -171,10 +171,17 @@ def _upper_percent(text: str) -> str:
 def derive_id(normalized_url: str) -> str:
     """``a_`` + the first 16 hex characters of ``sha256(normalised url)``.
 
-    ADP §4.1: the id is a deterministic function of the normalised URL, so every
-    spelling of one address converges on one entry without a uniqueness table —
-    and two URLs serving the same card stay two entries. Identity in the ADP
-    sense is the A2A signature, not this id; the id only says "one URL, one row".
+    This is the RECOMMENDED derivation of ADP §4.1, not a rule: §4.1 leaves the
+    algorithm to the implementation and fixes four properties instead (URL-safe,
+    stable within an entry, at most one entry per url, opaque to consumers). We pick
+    this one because it makes "one url, one row" structural — concurrent
+    registrations land on the same id with no uniqueness table — and because any
+    implementation can recompute it. The price is 64 bits, which is why the schema
+    4 → 5 migration refuses to merge two rows that collide (§10).
+
+    Consumers MUST NOT parse it: it is a handle for one entry, not an identity. The
+    A2A signature says who an agent is, and two registries may give one url
+    different ids, so it must never be a cross-registry correlation key.
     """
     digest = hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()
     return "a_" + digest[:16]

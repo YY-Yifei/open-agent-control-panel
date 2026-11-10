@@ -1,9 +1,11 @@
 """Identity is the URL: ADP §4.1, as published.
 
-The registry id is ``a_`` + the first 16 hex characters of ``sha256(normalised
-url)``. Two spellings of one address converge on one entry; two addresses that
-serve the same card are two entries. These tests pin that rule — including the
-case 0.3.0 got wrong, when it keyed entries on the card's name.
+§4.1 leaves the id's algorithm to the implementation and fixes four properties; this
+registry chooses the RECOMMENDED derivation — ``a_`` + the first 16 hex characters of
+``sha256(normalised url)``. Two spellings of one address converge on one entry; two
+addresses that serve the same card are two entries. These tests pin that behaviour —
+including the case 0.3.0 got wrong, when it keyed entries on the card's name — and the
+migration's refusal to merge two rows that happen to derive the same id (§10).
 """
 
 from __future__ import annotations
@@ -13,9 +15,11 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from conftest import make_card
 from oacp import net
-from oacp.db import SCHEMA_VERSION, Database
+from oacp.db import SCHEMA_VERSION, Database, MigrationError
 
 CARD_URL = "https://agent.example.com/.well-known/agent-card.json"
 ELSEWHERE = "https://elsewhere.example/card"
@@ -179,3 +183,27 @@ def test_two_rows_that_shared_a_name_stay_two_entries(tmp_path) -> None:
         survivors = [row[0] for row in connection.execute("SELECT agent_id FROM sessions")]
         assert len(survivors) == 2
         assert set(survivors) <= expected
+
+
+def test_a_derived_id_collision_aborts_instead_of_merging(tmp_path, monkeypatch) -> None:
+    """ADP §10: the merge judgement is the url, never the id — so stop on a collision.
+
+    ``url`` is UNIQUE, so two rows can only reach one derived id by accident (the 64-bit
+    caveat in §4.1). Merging them would delete a real entry, so the pass must refuse and
+    leave the file at schema 4 for the next start to finish.
+    """
+    path = tmp_path / "collision.db"
+    _schema4_database(
+        path,
+        [("a_0000000000000001", CARD_URL, "Geo Agent"), ("a_0000000000000002", ELSEWHERE, "Geo Agent")],
+    )
+
+    monkeypatch.setattr(net, "derive_id", lambda url: "a_0123456789abcdef")
+
+    with pytest.raises(MigrationError):
+        Database(str(path)).init()
+
+    with sqlite3.connect(str(path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        urls = {row[0] for row in connection.execute("SELECT url FROM agents")}
+        assert urls == {CARD_URL, ELSEWHERE}, "a collision must not merge or drop an entry"

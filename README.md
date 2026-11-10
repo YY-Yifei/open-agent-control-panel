@@ -165,13 +165,18 @@ Records follow the contract exactly: `cardHash` is `sha256(JCS(card))`, `checked
 every attempt, `lastOkAt` only on success, and `changedAt`/`prevHash` are always present
 (nullable) so clients need one branch, not two.
 
-### Identity is the URL
+### Identity is the URL; the id is only a handle
 
-An entry's `id` is `a_` + the first 16 hex characters of `sha256(normalised url)`, exactly as
-ADP §4.1 requires. Normalisation is deliberately minimal — lower-case scheme and host, drop a
-default `:443`, upper-case percent escapes — so `HTTPS://Geo.Example.com:443/Card.json` and
-`https://geo.example.com/Card.json` are one entry, while `…/Card.json` and `…/Card.json/` are
-two. Nothing else is rewritten: no trailing slash, no `..` collapsing, no query sorting.
+ADP §4.1 leaves the id's *algorithm* to the implementation and fixes four properties instead:
+URL-safe (`^[A-Za-z0-9_-]{1,64}$`), stable within an entry, at most one entry per url, and
+opaque to consumers. This registry picks the RECOMMENDED derivation — `a_` + the first 16 hex
+characters of `sha256(normalised url)` — because it makes "one url, one row" structural
+(concurrent registrations land on the same id, with no uniqueness table) and any
+implementation can recompute it. Normalisation is deliberately minimal — lower-case scheme and
+host, drop a default `:443`, upper-case percent escapes — so
+`HTTPS://Geo.Example.com:443/Card.json` and `https://geo.example.com/Card.json` are one entry,
+while `…/Card.json` and `…/Card.json/` are two. Nothing else is rewritten: no trailing slash,
+no `..` collapsing, no query sorting.
 
 | Situation | Result |
 |---|---|
@@ -180,14 +185,19 @@ two. Nothing else is rewritten: no trailing slash, no `..` collapsing, no query 
 | Same card on two URLs | `201`, **two** entries — the URL is the key, not the name |
 | Renamed card at the same URL | the next probe follows it: `changedAt`/`prevHash` move, the id does not |
 
-The id says nothing about *who* an agent is. ADP is explicit that identity comes from the A2A
-card's signature, and a registry that cannot prove ownership has no business minting it. The
-corollary: conversations follow the entry, not the name — an agent that comes back on a
-different URL comes back as a new entry, with no sessions attached.
+The id says nothing about *who* an agent is, and nothing may be read out of it — no url, no
+timestamp, no ordering, no length. ADP is explicit that identity comes from the A2A card's
+signature, and a registry that cannot prove ownership has no business minting it. The same url
+gets a different id at another registry, so ids are not a cross-registry correlation key. The
+corollary for this panel: conversations follow the entry, not the name — an agent that comes
+back on a different URL comes back as a new entry, with no sessions attached.
 
 A database written by 0.3.0 is re-keyed once, on open (schema 4 → 5): ids are recomputed from
 each entry's stored URL and `sessions.agent_id` / `tasks.agent_id` are re-pointed. Entries that
 happened to publish one name stay separate, because the URL — not the name — is what they are.
+Should two rows ever derive the same id (§4.1's 64-bit caveat), the pass stops and refuses to
+merge: §10 says the judgement is the url, never the id, and the alternative is losing a real
+entry.
 
 Panel endpoints (not part of ADP). The conversation surface is what the UI uses; the
 `tasks` rows underneath are kept for automation and debugging:

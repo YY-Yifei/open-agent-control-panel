@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] — 2026-11-10
+
+### Changed
+
+- **The spec relaxed `id`; our words follow.** ADP §4.1 (a2a-discover `c0726b6`) no longer
+  prescribes how an id is generated. It fixes four properties — URL-safe
+  (`^[A-Za-z0-9_-]{1,64}$`), stable within an entry, at most one entry per url, opaque to
+  consumers — and demotes the digest derivation to RECOMMENDED. This registry keeps the
+  RECOMMENDED derivation and now says so, instead of claiming §4.1 *requires* it. The same
+  section states the consumer side: nothing may be parsed out of an id, and two registries
+  may give one url different ids, so ids are not a cross-registry correlation key.
+
+### Fixed
+
+- **The schema 4 → 5 migration no longer merges on an id collision** (§10). It treated
+  "another row already holds this derived id" as a duplicate and deleted one of the two; §10
+  says the merge judgement MUST be the url itself and the pass MUST stop on a 64-bit
+  collision. It now raises `MigrationError` and leaves `user_version` at 4, so no entry can be
+  lost.
+
+### Added
+
+- A migration collision aborts without dropping either row, and a legally-shaped non-derived
+  id (ULID / UUIDv7 / `1`) is answered `404 NOT_FOUND` rather than rejected — ids are handles,
+  not a format this registry may dictate.
+
 ## [0.4.0] — 2026-11-10
 
 ### Fixed

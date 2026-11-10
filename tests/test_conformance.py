@@ -117,3 +117,16 @@ def test_timestamps_are_second_precision_utc(live) -> None:
     for key in ("firstSeenAt", "checkedAt", "lastOkAt"):
         stamp = record[key]
         assert len(stamp) == 20 and stamp.endswith("Z"), f"{key} is not §4.2-shaped: {stamp}"
+
+
+def test_an_id_is_opaque_and_need_not_be_derived(live) -> None:
+    """§4.1 lets an implementation choose any URL-safe id, so shape is not ours to police.
+
+    None of these entries exist here; the answer must be "no such entry", not
+    "malformed id" — a consumer that rejected them would break every alternative
+    implementation the relaxed §4.1 now allows.
+    """
+    for other in ("0193b1a0-7c2e-7d3b-9f00-2c1e4a5b6c7d", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "1"):
+        response = live.get(f"/v1/agents/{other}")
+        assert response.status_code == 404, f"{other}: {response.status_code}"
+        assert_conforms(response.json(), "Error")

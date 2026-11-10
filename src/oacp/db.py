@@ -21,6 +21,10 @@ from typing import Iterator
 
 SCHEMA_VERSION = 5
 
+
+class MigrationError(RuntimeError):
+    """An on-open schema upgrade refused to continue rather than lose a row."""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
     id              TEXT PRIMARY KEY,
@@ -202,6 +206,11 @@ def _rekey_agents(connection: sqlite3.Connection, previous: int) -> None:
     a rename is a different agent. Schema 4 existed for one release; this pass
     takes those files back to the rule every other release has used.
 
+    The old ``id`` was a name hash and the new one is a URL hash, so two rows can only
+    collide here by accident (ADP §10's 64-bit warning) — never legitimately: ``url`` is
+    UNIQUE. A collision therefore aborts the pass instead of merging, because merging
+    would delete one of two real entries and §10 says to stop rather than guess.
+
     Each statement autocommits (``isolation_level=None``), which is why the pass
     has to be idempotent: an interrupted run leaves ``user_version`` at 4 and the
     next start finishes the job without moving anything twice.
@@ -221,11 +230,21 @@ def _rekey_agents(connection: sqlite3.Connection, previous: int) -> None:
             continue
         moved = True
 
-        survivor = connection.execute("SELECT 1 FROM agents WHERE id = ?", (new_id,)).fetchone()
+        survivor = connection.execute(
+            "SELECT url FROM agents WHERE id = ?", (new_id,)
+        ).fetchone()
         if survivor is not None:
-            connection.execute("DELETE FROM agents WHERE id = ?", (old_id,))
-        else:
-            connection.execute("UPDATE agents SET id = ? WHERE id = ?", (new_id, old_id))
+            # ADP §10: the merge judgement is the url itself, never the id. ``agents.url``
+            # is UNIQUE and has been stored normalised since 0.2, so a *different* row
+            # already holding ``new_id`` can only be a 64-bit collision of the
+            # RECOMMENDED derivation — merging it would silently drop a real entry.
+            # Stop instead, leaving ``user_version`` at 4 for the next start.
+            raise MigrationError(
+                "cannot re-key agents: two different urls derive the same id "
+                f"({survivor['url']!r} and {row['url']!r} -> {new_id!r}); "
+                "nothing was merged — resolve the collision or start a fresh database"
+            )
+        connection.execute("UPDATE agents SET id = ? WHERE id = ?", (new_id, old_id))
         # Repointing before or after the agents row does not matter: neither table
         # declares a foreign key, and both orders leave the same result.
         connection.execute("UPDATE sessions SET agent_id = ? WHERE agent_id = ?", (new_id, old_id))
