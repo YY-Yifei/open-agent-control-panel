@@ -207,3 +207,26 @@ def test_a_derived_id_collision_aborts_instead_of_merging(tmp_path, monkeypatch)
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         urls = {row[0] for row in connection.execute("SELECT url FROM agents")}
         assert urls == {CARD_URL, ELSEWHERE}, "a collision must not merge or drop an entry"
+
+
+def test_a_colliding_id_never_answers_for_another_url(client, fetcher, monkeypatch) -> None:
+    """§4.1: the id is a handle for one entry, so a collision must not hand back a
+    different agent's record.
+
+    The RECOMMENDED derivation is 64 bit, so two urls can in principle collide; the
+    registry answers this as an error rather than pretending the second url is
+    already registered (§10: stop, never merge).
+    """
+    monkeypatch.setattr(net, "derive_id", lambda url: "a_0123456789abcdef")
+    fetcher.cards[CARD_URL] = make_card()
+    fetcher.cards[ELSEWHERE] = make_card()
+
+    assert client.post("/v1/agents", json={"url": CARD_URL}).status_code == 201
+
+    second = client.post("/v1/agents", json={"url": ELSEWHERE})
+    assert second.status_code == 500
+    assert second.json()["code"] == "ID_COLLISION"
+    listed = client.get("/v1/agents").json()["items"]
+    assert [item["url"] for item in listed] == [CARD_URL], (
+        "a collision must not write a second row or reuse the first"
+    )

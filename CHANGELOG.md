@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.2] — 2026-11-10
+
+### Fixed
+
+- **A colliding id never answers with another url's record.** §4.1 makes the id a
+  handle for one entry, and the RECOMMENDED derivation only has 64 bits, so two urls
+  can in principle mint one id. Registration used to trust the lookup: the row it
+  found was returned as "already registered" even when its `url` was a different
+  address, and the concurrent-insert path did the same. It now asserts that the row
+  is this url and answers `500 ID_COLLISION` otherwise — §10's rule (stop, never
+  merge) applies at runtime as well as in the migration.
+
 ## [0.4.1] — 2026-11-10
 
 ### Changed
@@ -29,6 +41,8 @@ All notable changes to this project are documented here. The format follows
 - A migration collision aborts without dropping either row, and a legally-shaped non-derived
   id (ULID / UUIDv7 / `1`) is answered `404 NOT_FOUND` rather than rejected — ids are handles,
   not a format this registry may dictate.
+- A registration whose derived id is already held by another url is refused instead of being
+  answered with the other agent's record.
 
 ## [0.4.0] — 2026-11-10
 

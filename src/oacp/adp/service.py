@@ -107,6 +107,7 @@ class RegistryService:
 
         existing = self._load(agent_id)
         if existing is not None:
+            self._assert_same_url(existing, normalized)
             with self.db.connect() as connection:
                 self._record_registration(connection, ip, host, iso(), "existing")
             return Registration(record=self._record(existing), manage_token=None, created=False)
@@ -147,6 +148,7 @@ class RegistryService:
             row = self._load(agent_id)
             if row is None:
                 raise
+            self._assert_same_url(row, normalized)
             with self.db.connect() as connection:
                 self._record_registration(connection, ip, host, iso(), "existing")
             return Registration(record=self._record(row), manage_token=None, created=False)
@@ -387,6 +389,23 @@ class RegistryService:
             return connection.execute(
                 "SELECT * FROM agents WHERE id = ?", (agent_id,)
             ).fetchone()
+
+    @staticmethod
+    def _assert_same_url(row: sqlite3.Row, normalized: str) -> None:
+        """Never answer for one url with another url's record (ADP §4.1 / §10).
+
+        The id is a handle for one entry, not an identity. ``url`` is UNIQUE, so a
+        row holding this id under a *different* url can only be a collision of the
+        RECOMMENDED 64-bit derivation. Returning that row would hand one registrant
+        another agent's card, and silently reusing its token would be worse; §10's
+        rule — stop, never merge — applies to the live path too.
+        """
+        if row["url"] != normalized:
+            raise RegistryError(
+                500,
+                "ID_COLLISION",
+                f"the id for this url is already held by {row['url']!r}",
+            )
 
     def _fetch_card(self, url: str) -> Any:
         try:
