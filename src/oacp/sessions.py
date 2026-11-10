@@ -127,7 +127,7 @@ class SessionService:
                 (
                     session_id,
                     agent_id,
-                    agent["name"] or agent["url"],
+                    cardmod.card_summary(agent["card"])["name"] or agent["url"],
                     agent["url"],
                     _clean_title(title),
                     IDLE,

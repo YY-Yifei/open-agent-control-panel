@@ -14,7 +14,6 @@ therefore ships two modes:
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any, Iterable
 
 STRICT = "strict"
@@ -224,39 +223,6 @@ def _wire_style(card: dict[str, Any], endpoint: dict[str, str]) -> str:
     if isinstance(card.get("supportedInterfaces"), list) and card.get("supportedInterfaces"):
         return "v1"
     return "v03"
-
-
-# -------------------------------------------------------------------- identity
-
-
-def name_key(value: Any) -> str:
-    """The canonical form of a card name — the registry's notion of identity.
-
-    An entry's ``id`` is derived from its name, so two cards that a human reads as
-    "the same agent" must produce the same key. Leading and trailing whitespace is
-    dropped, runs of whitespace between words collapse to one space, and the whole
-    string is case-folded (``str.casefold`` also folds ``ß`` to ``ss`` and
-    full-width letters to their narrow forms).
-
-    Only the *key* is canonical: the card's ``name`` is never rewritten, so the
-    panel keeps showing exactly the string the agent published.
-    """
-    if not isinstance(value, str):
-        raise ValueError("an agent name must be a string")
-    key = " ".join(value.split()).casefold()
-    if not key:
-        raise ValueError("an agent name must not be empty")
-    return key
-
-
-def derive_id(name: str) -> str:
-    """``a_`` + the first 16 hex characters of ``sha256(name key)``.
-
-    Identity is the name, not the URL: an agent that goes offline and comes back on
-    a different host, port or scheme is the same agent and keeps its conversations,
-    while one that renames itself is a different agent.
-    """
-    return "a_" + hashlib.sha256(name_key(name).encode("utf-8")).hexdigest()[:16]
 
 
 # ----------------------------------------------------------------------- facets

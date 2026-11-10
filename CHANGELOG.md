@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-11-10
+
+### Fixed
+
+- **The registry id is a hash of the URL again** (ADP Core §4.1). 0.3.0 keyed entries on the
+  card's name, which the published contract does not allow: an id MUST be
+  `a_` + `sha256(normalised url)[:16]`, two spellings of one address MUST converge on one
+  entry, and two addresses serving one card MUST stay two entries. `409 URL_TAKEN` and the
+  "move" semantics came and went with the name rule; a repeat registration is answered from
+  storage again, without a fetch. Schema 4 → 5 re-keys an existing database on open,
+  re-points `sessions`/`tasks`, and keeps same-named rows apart.
+- **`AgentRecord` and `AgentSummary` match the published schemas exactly.** Both are closed
+  objects, and they are disjoint: a full record carries `card` and the probe history but no
+  facets; a summary carries `name`/`description`/`skills`/`tags` and no card. The panel's own
+  endpoints add the facets the UI displays instead of widening the contract shape.
+- **`RegistryCard.spec` points at the published specification** instead of an opaque `urn:`.
+
+### Added
+
+- `tests/test_conformance.py` — validates this registry's responses against the published
+  `spec/adp-core.yaml`, so contract drift fails in CI rather than at a consumer.
+
+### Known deployment deviations (opt-in, stated in the banner)
+
+- `--allow-insecure-cards` accepts `http://` and private addresses for loopback development;
+  §7 forbids that in production.
+- `card_validation = "relaxed"` (the default) also accepts A2A 0.3 cards that advertise a plain
+  `url` instead of `supportedInterfaces`. §6.3 requires the newer shape; strict mode is one flag
+  away, and the relaxed default is what lets the panel talk to the A2A 0.3 agents that exist.
+
 ## [0.3.0] — 2026-11-09
 
 ### Changed

@@ -19,7 +19,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -189,39 +189,37 @@ def _widen(connection: sqlite3.Connection) -> None:
 
 
 def _rekey_agents(connection: sqlite3.Connection, previous: int) -> None:
-    """Re-derive ids written by schema ≤3 from the stored card name (3 → 4).
+    """Re-derive ids from the stored URL (schema 4 → 5).
 
-    Until schema 4 an entry's id was ``sha256(url)``; it is now ``sha256(name)``,
-    so an old file has to be re-keyed once — otherwise every stored entry would
-    look unregistered, and the URL it holds (unique) unregisterable. Conversations
-    and tasks point at the agent id, so they are re-pointed in the same pass: the
-    whole point of the change is that an agent's conversations follow its name.
+    Schema 4 keyed an entry by ``sha256(card name)``; ADP §4.1 keys it by
+    ``sha256(normalised url)``. A file written by 0.3.0 therefore has to be
+    re-keyed once, or every stored entry would look unregistered and its URL —
+    still unique — would be unregisterable. Conversations and tasks point at the
+    agent id, so they are re-pointed in the same pass.
 
-    Two old rows can collide only if two different URLs published the same name.
-    The later one is merged into the earlier one rather than dropped, so its
-    conversations survive the migration too.
+    The name rule was a local invention: the published contract says two URLs
+    serving one card are two entries, and it does not let a registry decide that
+    a rename is a different agent. Schema 4 existed for one release; this pass
+    takes those files back to the rule every other release has used.
 
     Each statement autocommits (``isolation_level=None``), which is why the pass
-    has to be idempotent: an interrupted run leaves ``user_version`` at 3 and the
+    has to be idempotent: an interrupted run leaves ``user_version`` at 4 and the
     next start finishes the job without moving anything twice.
     """
     if previous >= SCHEMA_VERSION:
         return
 
-    from .adp.card import derive_id  # local: ``card`` must stay ignorant of storage
+    from .net import derive_id  # local: ``net`` must stay ignorant of storage
     from .util import iso
 
-    rows = connection.execute(
-        "SELECT id, card FROM agents ORDER BY first_seen_at ASC, id ASC"
-    ).fetchall()
+    rows = connection.execute("SELECT id, url FROM agents").fetchall()
+    moved = False
     for row in rows:
         old_id = row["id"]
-        try:
-            new_id = derive_id(json.loads(row["card"])["name"])
-        except (ValueError, KeyError, TypeError):
-            continue  # a stored card without a usable name keeps its old id
+        new_id = derive_id(row["url"])
         if new_id == old_id:
             continue
+        moved = True
 
         survivor = connection.execute("SELECT 1 FROM agents WHERE id = ?", (new_id,)).fetchone()
         if survivor is not None:
@@ -232,6 +230,8 @@ def _rekey_agents(connection: sqlite3.Connection, previous: int) -> None:
         # declares a foreign key, and both orders leave the same result.
         connection.execute("UPDATE sessions SET agent_id = ? WHERE agent_id = ?", (new_id, old_id))
         connection.execute("UPDATE tasks SET agent_id = ? WHERE agent_id = ?", (new_id, old_id))
+
+    if moved:
         connection.execute(
             "INSERT INTO registrations (ip, host, at, outcome) VALUES (?, NULL, ?, ?)",
             ("migration", iso(), "rekeyed"),

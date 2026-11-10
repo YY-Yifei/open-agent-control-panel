@@ -43,7 +43,7 @@ class Settings:
     # Identity of this registry
     display_name: str = "Open Agent Control Panel"
     public_url: str = "http://127.0.0.1:8000"
-    spec_url: str = "urn:adp:core:1.0.0"
+    spec_url: str = "https://github.com/YY-Yifei/a2a-discover/blob/main/spec/adp-core.md"
     contact: str = ""
 
     # Panel API protection: when set, /api/panel/* requires the X-Panel-Token

@@ -7,7 +7,7 @@ from one small FastAPI service with a dependency-free web UI.
 [![PyPI](https://img.shields.io/pypi/v/open-agent-control-panel.svg)](https://pypi.org/project/open-agent-control-panel/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey)](LICENSE)
-[![Protocol](https://img.shields.io/badge/protocol-ADP%20Core%201.0.0-informational)](https://github.com/YY-Yifei/open-agent-control-panel)
+[![Protocol](https://img.shields.io/badge/protocol-ADP%20Core%201.0.0-informational)](https://github.com/YY-Yifei/a2a-discover/blob/main/spec/adp-core.md)
 
 ---
 
@@ -22,8 +22,12 @@ three roles at once:
 | **Control plane** | `/api/panel/*` + the bundled UI | Every registered agent, its card, its skills, and the tasks you sent it |
 | **A2A client** | `message/send`, `tasks/get`, `tasks/cancel` | Submit a task, watch it move, cancel it, continue the conversation |
 
-The registry half implements the **A2A Discover Protocol (ADP) Core v1** contract: five operations, four invariants, and the SSRF rules in §7. The panel half is
-deliberately outside that contract — protocol endpoints stay exactly the protocol.
+The registry half implements the **[A2A Discover Protocol (ADP) Core v1](https://github.com/YY-Yifei/a2a-discover/blob/main/spec/adp-core.md)**
+contract: five operations, four invariants, and the SSRF rules in §7. The published
+[`spec/adp-core.yaml`](https://github.com/YY-Yifei/a2a-discover/blob/main/spec/adp-core.yaml) is the machine-readable source of truth; responses are
+validated against its schemas (`tests/test_conformance.py`, which needs the spec checked out
+next to this repo or `OACP_ADP_SPEC` pointing at it). The panel half is deliberately outside
+that contract — protocol endpoints stay exactly the protocol.
 
 ## Why a registry at all
 
@@ -161,27 +165,29 @@ Records follow the contract exactly: `cardHash` is `sha256(JCS(card))`, `checked
 every attempt, `lastOkAt` only on success, and `changedAt`/`prevHash` are always present
 (nullable) so clients need one branch, not two.
 
-### Identity is the name
+### Identity is the URL
 
-An entry's `id` is `a_` + the first 16 hex characters of `sha256(name)`, where the name is
-canonicalised — whitespace collapsed, case-folded — while the card itself is stored and shown
-verbatim. The URL is an attribute, not the key; that is what lets an agent survive a move:
+An entry's `id` is `a_` + the first 16 hex characters of `sha256(normalised url)`, exactly as
+ADP §4.1 requires. Normalisation is deliberately minimal — lower-case scheme and host, drop a
+default `:443`, upper-case percent escapes — so `HTTPS://Geo.Example.com:443/Card.json` and
+`https://geo.example.com/Card.json` are one entry, while `…/Card.json` and `…/Card.json/` are
+two. Nothing else is rewritten: no trailing slash, no `..` collapsing, no query sorting.
 
 | Situation | Result |
 |---|---|
-| Same name, same URL | `200`, nothing written, token not rotated (it is issued once, at creation) |
-| Same name, different URL | `200`, the entry **moves**: `url`/`host`/`card` follow, the id and every conversation stay |
-| Different name, same URL | `409 URL_TAKEN` carrying `existingId`/`newId`; a rename is a different agent, so an operator picks which entry survives |
+| Same URL, spelled differently | `200`, one entry |
+| Same URL, same spelling | `200`, the stored record, token never rotated |
+| Same card on two URLs | `201`, **two** entries — the URL is the key, not the name |
+| Renamed card at the same URL | the next probe follows it: `changedAt`/`prevHash` move, the id does not |
 
-The costs are stated rather than hidden: the id cannot be computed before the card is read, so a
-repeat registration is no longer free, and names are unique across the registry — two agents
-calling themselves the same thing *are* the same identity, so the newcomer's URL wins and the
-earlier one moves.
+The id says nothing about *who* an agent is. ADP is explicit that identity comes from the A2A
+card's signature, and a registry that cannot prove ownership has no business minting it. The
+corollary: conversations follow the entry, not the name — an agent that comes back on a
+different URL comes back as a new entry, with no sessions attached.
 
-A database written by an older release is re-keyed once, on open (schema 3 → 4): stored ids are
-recomputed from each card's name, `sessions.agent_id` and `tasks.agent_id` are re-pointed in the
-same pass, and two old entries that published one name are merged into the survivor instead of
-being dropped.
+A database written by 0.3.0 is re-keyed once, on open (schema 4 → 5): ids are recomputed from
+each entry's stored URL and `sessions.agent_id` / `tasks.agent_id` are re-pointed. Entries that
+happened to publish one name stay separate, because the URL — not the name — is what they are.
 
 Panel endpoints (not part of ADP). The conversation surface is what the UI uses; the
 `tasks` rows underneath are kept for automation and debugging:

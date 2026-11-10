@@ -44,18 +44,17 @@ def test_registration_is_idempotent_and_returns_one_token(client, fetcher) -> No
     assert created["status"] == "ok"
     assert created["failures"] == 0
     assert created["firstSeenAt"] == created["lastOkAt"] == created["checkedAt"]
-    # The record carries the summary fields at the top level *and* the full card.
-    assert created["name"] == "Geo Agent"
-    assert created["skills"] == ["geo.lookup"]
+    # AgentRecord is closed: the facets live on the card, not beside it.
+    assert "name" not in created and "skills" not in created
     assert created["card"]["name"] == "Geo Agent"
+    assert created["card"]["skills"][0]["id"] == "geo.lookup"
 
     second = register(client)
     assert second.status_code == 200
     assert "manageToken" not in second.json()
     assert second.json()["id"] == created["id"]
-    # The id is the card's name, so a repeat registration has to read the card
-    # again — that is the price of the id surviving a move (see test_identity).
-    assert fetcher.calls.count(CARD_URL) == 2
+    # The id is derived from the URL, so storage answers a repeat without a fetch.
+    assert fetcher.calls.count(CARD_URL) == 1
     assert second.json()["changedAt"] is None
 
 

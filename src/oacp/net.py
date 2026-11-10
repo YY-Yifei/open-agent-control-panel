@@ -12,6 +12,7 @@ operator explicitly opts in (``OACP_ALLOW_PRIVATE_AGENTS``) for local testing.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import re
 import socket
@@ -165,6 +166,18 @@ def normalize_url(url: str, *, allow_http: bool = False) -> str:
 def _upper_percent(text: str) -> str:
     """Upper-case the hex digits of percent escapes (``%2f`` -> ``%2F``)."""
     return _PERCENT.sub(lambda match: match.group(0).upper(), text)
+
+
+def derive_id(normalized_url: str) -> str:
+    """``a_`` + the first 16 hex characters of ``sha256(normalised url)``.
+
+    ADP §4.1: the id is a deterministic function of the normalised URL, so every
+    spelling of one address converges on one entry without a uniqueness table —
+    and two URLs serving the same card stay two entries. Identity in the ADP
+    sense is the A2A signature, not this id; the id only says "one URL, one row".
+    """
+    digest = hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()
+    return "a_" + digest[:16]
 
 
 def host_and_port(url: str) -> tuple[str, int]:

@@ -91,12 +91,9 @@ class RegistryService:
     def register(self, url: str, *, client_ip: str = "unknown") -> Registration:
         """Fetch, validate and store an agent, idempotently.
 
-        The ``id`` is derived from the card's ``name`` (see ``card.derive_id``), so
-        the card has to be read before the id is known: a repeat registration is no
-        longer answerable from storage alone. That is the price of the property the
-        scheme buys — an agent that goes offline and comes back on a different host,
-        port or scheme is still the same agent, and keeps its conversations. A
-        *renamed* agent is, by the same token, a different agent.
+        The id is derived from the normalised URL (ADP §4.1), so a repeat
+        registration is answerable from storage alone: the stored record comes
+        back untouched and the manage token is never rotated.
         """
         try:
             normalized = net.normalize_url(url, allow_http=self.settings.allow_insecure_cards)
@@ -106,15 +103,16 @@ class RegistryService:
         ip = client_ip or "unknown"
         self._assert_ip_budget(ip)
         host = net.host_of(normalized)
-
-        document = self._fetch_card(normalized)
-        self._assert_card(document.payload)
-        agent_id = cardmod.derive_id(cardmod.card_summary(document.payload)["name"])
+        agent_id = net.derive_id(normalized)
 
         existing = self._load(agent_id)
         if existing is not None:
-            return self._reregister(existing, normalized, host, document, ip)
+            with self.db.connect() as connection:
+                self._record_registration(connection, ip, host, iso(), "existing")
+            return Registration(record=self._record(existing), manage_token=None, created=False)
 
+        document = self._fetch_card(normalized)
+        self._assert_card(document.payload)
         now = iso()
         token = new_token()
         try:
@@ -144,88 +142,16 @@ class RegistryService:
                     "SELECT * FROM agents WHERE id = ?", (agent_id,)
                 ).fetchone()
         except sqlite3.IntegrityError:
-            # Two requests can race here. Losing on the id means the same name
-            # arrived twice (a rerun of this very request); losing on the url means
-            # that URL already belongs to an entry under another name, which is a
-            # rename an operator has to settle by removing one of the two.
+            # A concurrent request registered the same URL first; the id is
+            # derived from the URL, so both callers mean the same entry.
             row = self._load(agent_id)
-            if row is not None:
-                return self._reregister(row, normalized, host, document, ip)
-            raise self._url_taken(normalized, agent_id) from None
-
-        return Registration(record=self._record(row), manage_token=token, created=True)
-
-    def _reregister(
-        self,
-        row: sqlite3.Row,
-        normalized: str,
-        host: str,
-        document: Any,
-        ip: str,
-    ) -> Registration:
-        """Answer a repeat registration for a name the registry already holds.
-
-        Two cases, and they are the whole reason the id follows the name:
-
-        * **same URL** — the entry is idempotent: nothing is written, and the
-          manage token is never rotated (it is issued exactly once, at creation).
-        * **new URL** — the agent moved. The id stays, so every conversation and
-          task attached to it stays too; only the URL and the card follow. A moved
-          entry gets no token either: the token belongs to whoever created the
-          entry, and a caller who merely announces the same name must not inherit
-          control of it.
-        """
-        agent_id = row["id"]
-        checked = iso()
-        if row["url"] == normalized:
+            if row is None:
+                raise
             with self.db.connect() as connection:
-                self._record_registration(connection, ip, host, checked, "existing")
+                self._record_registration(connection, ip, host, iso(), "existing")
             return Registration(record=self._record(row), manage_token=None, created=False)
 
-        digest = card_hash(document.payload)
-        try:
-            with self.db.connect() as connection:
-                self._assert_domain_budget(connection, host, agent_id)
-                connection.execute(
-                    """
-                    UPDATE agents
-                       SET url = ?, host = ?, card = ?, card_hash = ?, prev_hash = ?,
-                           changed_at = ?, checked_at = ?, last_ok_at = ?,
-                           failures = 0, status = 'ok'
-                     WHERE id = ?
-                    """,
-                    (
-                        normalized,
-                        host,
-                        json_dumps(document.payload),
-                        digest,
-                        row["card_hash"],
-                        checked,
-                        checked,
-                        checked,
-                        agent_id,
-                    ),
-                )
-                self._record_registration(connection, ip, host, checked, "relocated")
-                moved = connection.execute(
-                    "SELECT * FROM agents WHERE id = ?", (agent_id,)
-                ).fetchone()
-        except sqlite3.IntegrityError:
-            raise self._url_taken(normalized, agent_id) from None
-
-        return Registration(record=self._record(moved), manage_token=None, created=False)
-
-    def _url_taken(self, url: str, new_id: str) -> RegistryError:
-        """The 409 for "this URL belongs to an entry under a different name"."""
-        with self.db.connect() as connection:
-            row = connection.execute("SELECT * FROM agents WHERE url = ?", (url,)).fetchone()
-        return RegistryError(
-            409,
-            "URL_TAKEN",
-            "this url is already registered under another name; "
-            "remove that entry first if the agent was renamed",
-            {"url": url, "existingId": row["id"] if row is not None else None, "newId": new_id},
-        )
+        return Registration(record=self._record(row), manage_token=token, created=True)
 
     def delete(self, agent_id: str, token: str | None) -> None:
         """Hard-delete an entry; only the first registrant's token is accepted."""
@@ -527,27 +453,40 @@ class RegistryService:
         )
 
     def _record(self, row: sqlite3.Row, *, full: bool = True) -> dict[str, Any]:
+        """One record in exactly the shape the contract publishes.
+
+        The two views are disjoint, not nested. ``AgentRecord`` carries ``card``
+        and the probe history but no facets; ``AgentSummary`` carries the facets
+        and no card. Both are closed objects (``additionalProperties: false``), so
+        a key that only "would be handy" makes the response non-conformant — the
+        panel adds what it needs on its own surface instead.
+        """
         card = json_loads(row["card"], {})
-        summary = cardmod.card_summary(card)
-        record = {
+        base = {
             "id": row["id"],
             "url": row["url"],
-            "name": summary["name"],
-            "description": summary["description"],
-            "skills": summary["skills"],
-            "tags": summary["tags"],
             "status": row["status"],
             "cardHash": row["card_hash"],
-            "firstSeenAt": row["first_seen_at"],
             "checkedAt": row["checked_at"],
             "lastOkAt": row["last_ok_at"],
             "failures": int(row["failures"]),
+        }
+        if not full:
+            summary = cardmod.card_summary(card)
+            return {
+                **base,
+                "name": summary["name"],
+                "description": summary["description"],
+                "skills": summary["skills"],
+                "tags": summary["tags"],
+            }
+        return {
+            **base,
+            "card": card,
+            "firstSeenAt": row["first_seen_at"],
             "changedAt": row["changed_at"],
             "prevHash": row["prev_hash"],
         }
-        if full:
-            record["card"] = card
-        return record
 
     def _summary(self, row: sqlite3.Row) -> dict[str, Any]:
         return self._record(row, full=False)

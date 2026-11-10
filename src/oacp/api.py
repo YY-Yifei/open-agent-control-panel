@@ -254,6 +254,10 @@ def get_agent(request: Request, agent_id: str) -> dict[str, Any]:
         raise PanelError("agent_not_found", status=404, agent_id=agent_id)
 
     card = record.get("card") if isinstance(record.get("card"), dict) else {}
+    # The record itself is the contract's AgentRecord, which carries no facets.
+    # This endpoint is the panel's own, and the UI shows a name and skills, so
+    # the facets are added here rather than smuggled into the contract shape.
+    record = {**record, **cardmod.card_summary(card)}
     counts = _tasks(request).agent_counts([agent_id]).get(
         agent_id, {"taskCount": 0, "activeTaskCount": 0, "lastTaskAt": None}
     )
