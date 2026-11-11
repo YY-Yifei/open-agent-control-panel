@@ -116,6 +116,7 @@ class A2AClient:
         *,
         context_id: str | None = None,
         task_id: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
         push_config: dict[str, Any] | None = None,
     ) -> CallResult:
@@ -124,13 +125,21 @@ class A2AClient:
         ``push_config`` (``{"url": ..., "token": ...}``) is offered inline in the
         same call, which is the one position that cannot race: an agent that
         finishes before our next RPC still knows where to report.
+
+        ``attachments`` are ``{"data": <base64>, "mime": ..., "name": ...}`` dicts
+        and go out as file parts. They travel *inline* rather than behind a hosted
+        URL because the panel's own address is a loopback one by default: an agent
+        that is not on this machine could not fetch what we published, and a
+        feature that only works for agents on the same host is not a feature.
         """
         endpoint, style = self._target(agent_card)
         message_id = str(uuid.uuid4())
 
         def build(dialect: str) -> dict[str, Any]:
             params: dict[str, Any] = {
-                "message": _message(dialect, text, message_id, context_id, task_id)
+                "message": _message(
+                    dialect, text, message_id, context_id, task_id, attachments
+                )
             }
             if metadata:
                 params["metadata"] = metadata
@@ -360,22 +369,60 @@ def _message(
     message_id: str,
     context_id: str | None,
     task_id: str | None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a Message in the dialect the agent speaks."""
+    parts = _parts(style, text, attachments or [])
     if style == "v1":
         message: dict[str, Any] = {
             "messageId": message_id,
             "role": "ROLE_USER",
-            "parts": [{"text": text}],
+            "parts": parts,
         }
     else:
         message = {
             "messageId": message_id,
             "role": "user",
-            "parts": [{"kind": "text", "text": text}],
+            "parts": parts,
         }
     if context_id:
         message["contextId"] = context_id
     if task_id:
         message["taskId"] = task_id
     return message
+
+
+def _parts(style: str, text: str, attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The parts of one user message: its text first, then its files.
+
+    A message that is only an image has no text, and an empty text part is a part
+    some agents reject — so the text part is omitted rather than sent blank.
+
+    The two dialects spell a file differently and neither spelling is optional:
+
+    * v1    ``{"raw": <b64>, "mediaType": ..., "filename": ...}``
+    * v0.3  ``{"kind": "file", "file": {"bytes": <b64>, "mimeType": ..., "name": ...}}``
+
+    ``bytes`` and ``raw`` are the base64 of the file, not raw bytes: A2A puts them
+    in a proto ``bytes`` field, which JSON transports carry as base64.
+    """
+    parts: list[dict[str, Any]] = []
+    if text:
+        parts.append({"text": text} if style == "v1" else {"kind": "text", "text": text})
+    for item in attachments:
+        data = str(item.get("data") or "")
+        if not data:
+            continue
+        mime = str(item.get("mime") or "application/octet-stream")
+        name = str(item.get("name") or "")
+        if style == "v1":
+            part: dict[str, Any] = {"raw": data, "mediaType": mime}
+            if name:
+                part["filename"] = name
+        else:
+            file: dict[str, Any] = {"bytes": data, "mimeType": mime}
+            if name:
+                file["name"] = name
+            part = {"kind": "file", "file": file}
+        parts.append(part)
+    return parts

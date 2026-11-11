@@ -212,3 +212,15 @@ def test_summary_counts_agents_and_tasks(client, app, fetcher) -> None:
     assert summary["tasks"]["total"] == 1
     assert summary["tasks"]["byState"]["completed"] == 1
     assert summary["probe"]["enabled"] is False
+
+
+def test_an_image_only_task_is_named_after_its_file() -> None:
+    # `title_from("")` answers "(empty prompt)", which is what an image-only submit
+    # used to show in the ledger even though the message was not empty at all.
+    from oacp.tasks import _title_for
+
+    assert _title_for("", [{"name": "cat.png"}]) == "cat.png"
+    assert _title_for("   ", [{"name": "cat.png"}]) == "cat.png"
+    assert _title_for("hello", [{"name": "cat.png"}]) == "hello"
+    assert _title_for("", []) == "(empty prompt)"
+    assert _title_for("", [{"name": ""}]) == "(empty prompt)"

@@ -63,6 +63,7 @@ class GuardedFetcher:
         max_redirects: int = DEFAULT_MAX_REDIRECTS,
         user_agent: str = "open-agent-control-panel",
         allow_private: bool = False,
+        accept: str = "application/json",
     ) -> None:
         self.max_bytes = max_bytes
         self.connect_timeout = connect_timeout
@@ -71,6 +72,9 @@ class GuardedFetcher:
         self.user_agent = user_agent
         # Only ever True for local development; the registry itself keeps it off.
         self.allow_private = allow_private
+        # A card fetch wants JSON; the media fetcher wants bytes. Content-negotiating
+        # origins answer 406 (or an error document) to the wrong Accept.
+        self.accept = accept
 
     def fetch(self, url: str, *, expect_json: bool = True) -> Document:
         """Fetch ``url`` and return the parsed JSON object.
@@ -154,7 +158,7 @@ class GuardedFetcher:
         remaining: float,
     ) -> tuple[int, dict[str, str], bytes]:
         pinned_url, host_header, server_hostname = net.pin_target(url, addresses[0])
-        headers = {"user-agent": self.user_agent, "accept": "application/json", **host_header}
+        headers = {"user-agent": self.user_agent, "accept": self.accept, **host_header}
         timeout = httpx.Timeout(
             max(0.1, remaining),
             connect=min(self.connect_timeout, max(0.1, remaining)),

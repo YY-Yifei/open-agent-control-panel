@@ -8,6 +8,7 @@ the URL the panel handed out — exactly what a real agent would do.
 
 from __future__ import annotations
 
+import base64
 import json
 from typing import Any
 
@@ -23,6 +24,7 @@ CARD_URL = "https://agent.example.com/.well-known/agent-card.json"
 PANEL_URL = "https://panel.example.com"
 
 PUSH_METHODS = {"tasks/pushNotificationConfig/set", "CreateTaskPushNotificationConfig"}
+PNG_B64 = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 40).decode("ascii")
 GET_METHODS = {"tasks/get", "GetTask"}
 
 
@@ -271,10 +273,14 @@ def test_body_that_is_not_a_task_is_refused(client, app, fetcher) -> None:
 def test_oversized_callback_is_refused(client, app, fetcher, monkeypatch) -> None:
     _agent, task, _recorded = prepare(client, app, fetcher)
     token = token_of(app, task["id"])
-    monkeypatch.setattr("oacp.push.MAX_PUSH_BYTES", 64)
+    # The cap is a deployment setting, not a constant: the default has to be large
+    # enough for a callback that carries an inline image, which is a normal A2A
+    # answer. So the test shrinks the setting rather than the module default.
+    monkeypatch.setattr(app.state.settings, "max_push_bytes", 64)
 
     response = client.post(f"/a2a/push/{token}", json=task_payload())
     assert response.status_code == 413
+    assert "64" in response.json()["error"]["message"]
 
 
 # ------------------------------------------------------------------ capability gate
@@ -395,3 +401,32 @@ def test_a_default_panel_offers_a_callback_a_local_agent_can_reach(tmp_path) -> 
         assert reply.status_code == 200
         assert reply.json()["status"] == "applied"
         assert client.get(f"/api/panel/tasks/{task['id']}").json()["task"]["state"] == "completed"
+
+
+def test_a_retried_status_update_after_a_picture_is_a_duplicate(client, app, fetcher) -> None:
+    # Once a picture is stored, a callback that omits `artifacts` (a status-only
+    # update, the sloppy delivery `_merge_task` keeps the old answer for) used to
+    # compare an empty signature against a non-empty one and read as "news" on
+    # every retry: `applied` forever, one `push` event per delivery.
+    _agent, task, _recorded = prepare(client, app, fetcher)
+    token = token_of(app, task["id"])
+
+    pictures = task_payload(state="working", text="", artifacts=False)
+    pictures["artifacts"] = [
+        {
+            "parts": [
+                {
+                    "kind": "file",
+                    "file": {
+                        "bytes": PNG_B64,
+                        "mimeType": "image/png",
+                        "name": "chart.png",
+                    },
+                }
+            ]
+        }
+    ]
+    assert callback(client, token, pictures).json()["status"] == "applied"
+
+    bare = {"kind": "task", "id": "task-1", "contextId": "ctx-1", "status": {"state": "working"}}
+    assert callback(client, token, bare).json()["status"] == "duplicate"

@@ -98,6 +98,40 @@ TEXTS: dict[str, dict[str, str]] = {
         "zh": "会话标题不能为空",
         "en": "a conversation title cannot be empty",
     },
+    # Sending images. Every message here exists because the alternative — a
+    # generic "bad request" — leaves the user guessing which of four rules broke.
+    "attachment_bad_data": {
+        "zh": "图片数据不是有效的 base64",
+        "en": "the image is not valid base64",
+    },
+    "attachment_too_large": {
+        "zh": "图片太大：单张上限 {max}",
+        "en": "the image is too large: {max} per file",
+    },
+    "attachment_unsupported": {
+        "zh": "不支持的图片类型：只接受 {types}",
+        "en": "unsupported image type: only {types} are accepted",
+    },
+    "attachment_type_mismatch": {
+        "zh": "声明的类型 {declared} 与实际内容 {actual} 不符",
+        "en": "the declared type {declared} does not match the actual {actual}",
+    },
+    "too_many_attachments": {
+        "zh": "一条消息最多附 {max} 张图片",
+        "en": "one message may carry at most {max} images",
+    },
+    "attachment_not_found": {
+        "zh": "找不到这张图片",
+        "en": "no such image",
+    },
+    "agent_no_image_input": {
+        "zh": "这个智能体的卡片声明了输入类型，其中没有 image/* 类型",
+        "en": "this agent's card declares its inputs, and none of them is an image type",
+    },
+    "payload_too_large": {
+        "zh": "请求体太大：一个请求最多 {max} MB",
+        "en": "the request body is too large: at most {max} MB per request",
+    },
 }
 
 

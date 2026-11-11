@@ -25,6 +25,7 @@ from .adp.service import RegistryError
 from .errors import PanelError
 from .sessions import SessionService
 from .tasks import TaskService
+from .util import json_loads
 
 router = APIRouter(prefix="/api/panel", tags=["panel"])
 
@@ -110,17 +111,44 @@ class FollowUp(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+#: Backstop only: the real limit is computed by ``media.prepare`` from the
+#: deployment's ``max_image_bytes``. This exists so the server never parses a
+#: body of absurd size into a Python string; 48 MB of base64 is ~36 MB of bytes.
+#: The *request-level* cap (the one that bounds the product of this and
+#: ``MAX_ATTACHMENTS`` before parsing) is ``app.PANEL_BODY_LIMIT``.
+MAX_ATTACHMENT_B64 = 48 * 1024 * 1024
+#: How many attachments one request may carry. The service enforces the real cap;
+#: this only stops "tens of thousands of empty objects" from being parsed at all.
+MAX_ATTACHMENTS = 32
+
+
+class Attachment(BaseModel):
+    """One image the user attached, already base64-encoded.
+
+    The bytes arrive in the JSON body instead of through a multipart upload: the
+    send is then a single request, so there is no half-finished upload to reap and
+    no second endpoint whose only job would be to hold bytes that are about to be
+    forwarded anyway.
+    """
+
+    mime: str = Field(default="", max_length=100)
+    name: str = Field(default="", max_length=200)
+    data: str = Field(min_length=1, max_length=MAX_ATTACHMENT_B64)
+
+
 class NewSession(BaseModel):
     """A conversation to open, optionally with the message that starts it."""
 
     text: str | None = Field(default=None, max_length=20000)
+    attachments: list[Attachment] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
     title: str | None = Field(default=None, max_length=80)
 
 
 class SendMessage(BaseModel):
-    """One line the user says to an agent."""
+    """One line the user says to an agent, optionally with pictures."""
 
-    text: str = Field(min_length=1, max_length=20000)
+    text: str = Field(default="", max_length=20000)
+    attachments: list[Attachment] = Field(default_factory=list, max_length=MAX_ATTACHMENTS)
 
 
 class RenameSession(BaseModel):
@@ -159,6 +187,14 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client and request.client.host else "unknown"
 
 
+def _header_name(name: Any) -> str:
+    """A filename safe inside an HTTP header value (those are not UTF-8 safe)."""
+    text = "".join(
+        char if 32 <= ord(char) < 127 and char not in '"\\;' else "_" for char in str(name or "")
+    ).strip()
+    return text or "image"
+
+
 def _panel_error(exc: RegistryError, *, agent_id: str) -> PanelError:
     """Translate a registry error into a localized panel error.
 
@@ -195,10 +231,31 @@ def _with_counts(request: Request, items: list[dict[str, Any]]) -> list[dict[str
     fallback = {"taskCount": 0, "activeTaskCount": 0, "lastTaskAt": None}
     sessions = _sessions(request).agent_counts(agent_ids)
     session_fallback: dict[str, Any] = {"sessionCount": 0, "lastSessionAt": None}
+    images = _image_inputs(request, agent_ids)
     for item in items:
         item.update(counts.get(item["id"], fallback))
         item.update(sessions.get(item["id"], session_fallback))
+        item["acceptsImages"] = images.get(item["id"])
     return items
+
+
+def _image_inputs(request: Request, agent_ids: list[str]) -> dict[str, bool | None]:
+    """Whether each agent takes images: True, False, or None when it never said.
+
+    Read from the stored card here rather than added to the ADP record, because
+    that object is closed (``additionalProperties: false``) — a key the contract
+    does not define would make the response non-conformant for every consumer, for
+    the convenience of one panel.
+    """
+    if not agent_ids:
+        return {}
+    placeholders = ",".join("?" for _ in agent_ids)
+    with request.app.state.db.connect() as connection:
+        rows = connection.execute(
+            f"SELECT id, card FROM agents WHERE id IN ({placeholders})",
+            list(agent_ids),
+        ).fetchall()
+    return {row["id"]: cardmod.accepts_images(json_loads(row["card"], {})) for row in rows}
 
 
 # ---------------------------------------------------------------------- summary
@@ -218,6 +275,12 @@ def summary(request: Request) -> dict[str, Any]:
         "tasks": _tasks(request).stats(),
         "sessions": _sessions(request).stats(),
         "probe": {"enabled": settings.probe_enabled, "interval": settings.probe_interval},
+        # The UI gets the same limits the server enforces, so it can refuse a
+        # 20 MB photo before base64-ing it into a request that would be rejected.
+        "images": {
+            "maxBytes": settings.max_image_bytes,
+            "maxPerMessage": settings.max_images_per_message,
+        },
         "panelTokenRequired": bool(settings.panel_token),
         "pushEnabled": settings.push_enabled,
         "allowPrivateAgents": settings.allow_private_agents,
@@ -413,9 +476,43 @@ def create_session(
     session = _sessions(request).create(
         agent_id,
         text=payload.text if payload else None,
+        attachments=[item.model_dump() for item in payload.attachments] if payload else None,
         title=payload.title if payload else None,
     )
     return {"session": session}
+
+
+@router.get("/attachments/{attachment_id}")
+def get_attachment(request: Request, attachment_id: int) -> Response:
+    """Serve one image this panel stored, whichever direction it arrived from.
+
+    The bytes are the panel's own copy of a picture — one a person attached, or one
+    an agent sent back. The type is the one sniffed when the bytes were accepted,
+    and the answer carries ``nosniff``: a stored blob must never be able to talk
+    the browser into treating it as anything but the picture it was checked to be.
+
+    A row whose ``skipped`` is set has no bytes — it exists so the conversation can
+    say *why* a file is not on screen. Serving it would mean answering with an
+    empty body and an image content type, so it is a 404 like any other missing
+    attachment.
+    """
+    with request.app.state.db.connect() as connection:
+        row = connection.execute(
+            "SELECT mime, name, data, skipped FROM session_attachments WHERE id = ?",
+            (attachment_id,),
+        ).fetchone()
+    if row is None or row["skipped"]:
+        raise PanelError("attachment_not_found", status=404)
+    return Response(
+        content=bytes(row["data"]),
+        media_type=row["mime"],
+        headers={
+            "content-disposition": f'inline; filename="{_header_name(row["name"])}"',
+            "x-content-type-options": "nosniff",
+            # A row is immutable: this id always means these bytes.
+            "cache-control": "private, max-age=31536000, immutable",
+        },
+    )
 
 
 @router.get("/sessions/{session_id}")
@@ -431,7 +528,13 @@ def send_message(request: Request, session_id: str, payload: SendMessage) -> dic
     The answer may be ``working``: the agent accepted the message and will report
     back later. The UI then polls ``/sync`` (or waits for a push callback).
     """
-    return {"session": _sessions(request).send(session_id, payload.text)}
+    return {
+        "session": _sessions(request).send(
+            session_id,
+            payload.text,
+            attachments=[item.model_dump() for item in payload.attachments],
+        )
+    }
 
 
 @router.post("/sessions/{session_id}/sync")

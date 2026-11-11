@@ -251,6 +251,37 @@ def card_summary(card: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def input_modes(card: dict[str, Any]) -> list[str]:
+    """The input MIME types the card declares (empty when it declares none)."""
+    raw = card.get("defaultInputModes")
+    if not isinstance(raw, list):
+        return []
+    return [item.strip() for item in raw if isinstance(item, str) and item.strip()]
+
+
+def accepts_images(card: dict[str, Any]) -> bool | None:
+    """Whether this card accepts images: True, False, or None when it stays silent.
+
+    The third answer is the point. ADP requires ``defaultInputModes``, but cards in
+    the wild routinely omit it, and plenty declare ``["text/plain"]`` while happily
+    accepting files. So a declared list without an image type means "do not send",
+    a missing one means "unknown, let the agent decide" — folding the second into
+    False would switch the feature off for every card that under-declares.
+    """
+    declared = card.get("defaultInputModes")
+    if not isinstance(declared, list):
+        # 没有声明 = 未知，交给 agent 自己拒绝。
+        return None
+    # 声明了但是空列表 = 一个输入类型都没声明，与「声明了且没有 image/*」同解：
+    # 不送图。把空列表并进 None 会让这种卡收到它从未同意的图片。
+    return any(_is_image_mode(mode) for mode in input_modes(card))
+
+
+def _is_image_mode(mode: str) -> bool:
+    text = mode.strip().lower()
+    return text == "*/*" or text.startswith("image/")
+
+
 # ----------------------------------------------------------------------- states
 
 
@@ -283,6 +314,11 @@ def part_text(part: Any) -> str | None:
     """Render one A2A part as text, or None when it carries no rendering."""
     if not isinstance(part, dict):
         return None
+    if part_file(part) is not None:
+        # A file is shown as a picture (or as a chip saying why it is not), never
+        # as a line of its own name or URL. Rendering it here as well would print
+        # the same thing twice, once as text and once as the picture.
+        return None
     text = part.get("text")
     if isinstance(text, str):
         return text
@@ -312,6 +348,116 @@ def message_text(message: Any) -> str:
         return ""
     parts = message.get("parts")
     return parts_text(parts if isinstance(parts, list) else [])
+
+
+def part_file(part: Any) -> dict[str, Any] | None:
+    """The file one A2A part carries, in either dialect, or None.
+
+    Returns ``{"data": <base64 or None>, "uri": <str or None>, "mime": str,
+    "name": str}``. ``data`` and ``uri`` are the two ways a file travels and at
+    most one of them is set.
+
+    Two spellings, both real:
+
+    * v0.3 wire  ``{"kind": "file", "file": {"bytes": <b64> | "uri": ..., "mimeType": ..., "name": ...}}``
+    * v1 proto   ``{"raw": <b64> | "url": ..., "mediaType": ..., "filename": ...}``
+
+    A bare ``{"url": ...}`` with no media type and no filename is *not* treated as
+    a file: agents also use a url part to mean "here is a link", and fetching
+    every such part would turn each of those links into a download. Without a
+    declared type there is no way to tell the two apart, so the conservative
+    reading wins — it stays text, exactly as it did before files were understood.
+    """
+    if not isinstance(part, dict):
+        return None
+
+    nested = part.get("file")
+    if isinstance(nested, dict):
+        data = nested.get("bytes")
+        uri = nested.get("uri") or nested.get("url")
+        has_data = isinstance(data, str) and bool(data)
+        has_uri = isinstance(uri, str) and bool(uri)
+        if not has_data and not has_uri:
+            return None
+        # 有了内联字节就不再带 uri —— 与下面的 flat 分支保持同一条规矩，
+        # 否则「两者至多设置一个」只对一个分支成立，按文档写消费方就会多取一次。
+        return {
+            "data": data if has_data else None,
+            "uri": uri if has_uri and not has_data else None,
+            "mime": str(nested.get("mimeType") or nested.get("mime") or ""),
+            "name": str(nested.get("name") or nested.get("filename") or ""),
+        }
+
+    data = part.get("raw")
+    uri = part.get("url")
+    has_data = isinstance(data, str) and bool(data)
+    has_uri = isinstance(uri, str) and bool(uri)
+    mime = str(part.get("mediaType") or part.get("mimeType") or "")
+    name = str(part.get("filename") or part.get("name") or "")
+    if has_data:
+        return {"data": data, "uri": None, "mime": mime, "name": name}
+    if has_uri and (mime or name):
+        return {"data": None, "uri": uri, "mime": mime, "name": name}
+    return None
+
+
+def parts_files(parts: Iterable[Any]) -> list[dict[str, Any]]:
+    """Every file part among ``parts``, in order."""
+    # 注解说的是 Iterable，这里就收下任何可迭代：一个生成器/视图不该悄悄变成空列表。
+    if isinstance(parts, (str, bytes, dict)) or not isinstance(parts, Iterable):
+        return []
+    files = [file for file in (part_file(part) for part in parts) if file]
+    return files
+
+
+def result_files(result: Any) -> list[dict[str, Any]]:
+    """Every file a result carries — artifacts first, then the status message.
+
+    ``artifacts`` and the current ``status.message`` are both places an agent
+    puts its output, so both are read. ``history`` is deliberately *not* read:
+    it repeats every earlier message, and re-reading it would re-deliver files
+    the panel already holds on every single poll.
+    """
+    if not isinstance(result, dict):
+        return []
+    files: list[dict[str, Any]] = []
+
+    artifacts = result.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if isinstance(artifact, dict):
+                files.extend(parts_files(artifact.get("parts") or []))
+
+    status = result.get("status")
+    if isinstance(status, dict):
+        message = status.get("message")
+        if isinstance(message, dict):
+            files.extend(parts_files(message.get("parts") or []))
+
+    if "parts" in result:
+        # A bare ``Message`` answer rather than a ``Task``.
+        files.extend(parts_files(result.get("parts") or []))
+    return files
+
+
+def result_media_signature(result: Any) -> str:
+    """A stable fingerprint of the files a result carries, for dedupe.
+
+    Used where two snapshots have to be compared without decoding anything: a
+    push callback that only adds a picture must not be mistaken for a retry of
+    one that only repeated text.
+    """
+    files = result_files(result)
+    if not files:
+        return ""
+    import hashlib
+
+    marks = []
+    for file in files:
+        payload = file.get("data") or file.get("uri") or ""
+        digest = hashlib.sha1(str(payload).encode("utf-8")).hexdigest()
+        marks.append(f"{file.get('mime') or ''}:{file.get('name') or ''}:{digest}")
+    return "|".join(sorted(marks))
 
 
 def interpret_result(result: Any) -> dict[str, Any]:

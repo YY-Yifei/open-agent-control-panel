@@ -27,13 +27,17 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Request
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from .tasks import PushError, TaskService
 
 log = logging.getLogger(__name__)
 
-#: A Task object is small; anything larger is not a callback we want to parse.
+#: Fallback cap for a callback body when the deployment has not said otherwise.
+#: A Task object is usually small, but one that carries an inline image is a
+#: perfectly normal A2A answer — refusing it would mean losing whole turns from
+#: agents that reply with a picture. ``Settings.max_push_bytes`` is the real knob.
 MAX_PUSH_BYTES = 256 * 1024
 
 router = APIRouter(tags=["a2a"])
@@ -52,10 +56,11 @@ async def receive_push(request: Request, token: str) -> JSONResponse:
     ``duplicate`` (a retry of something we already have) or ``ignored`` (a late
     delivery that would move the task backwards).
     """
+    limit = _limit(request)
     try:
-        raw = await _read_limited(request)
+        raw = await _read_limited(request, limit)
     except _TooLarge:
-        return _refuse(413, "payload_too_large", f"callbacks are limited to {MAX_PUSH_BYTES} bytes")
+        return _refuse(413, "payload_too_large", f"callbacks are limited to {limit} bytes")
 
     try:
         payload: Any = json.loads(raw)
@@ -84,7 +89,12 @@ async def receive_push(request: Request, token: str) -> JSONResponse:
         sessions = getattr(request.app.state, "sessions", None)
         if sessions is not None:
             try:
-                sessions.absorb_task(str(outcome.get("taskId") or ""))
+                # absorb may download a URL the agent supplied (blocking, up to ten
+                # seconds). This is an async handler: calling it inline stalls the
+                # event loop for every other request, so it goes to a thread.
+                await run_in_threadpool(
+                    sessions.absorb_task, str(outcome.get("taskId") or "")
+                )
             except Exception:  # noqa: BLE001 — never fail a callback over this
                 log.exception("could not fold push %s into its conversation", outcome.get("taskId"))
 
@@ -96,7 +106,14 @@ def _refuse(status: int, code: str, detail: str) -> JSONResponse:
     return JSONResponse({"error": {"code": code, "message": detail}}, status_code=status)
 
 
-async def _read_limited(request: Request) -> bytes:
+def _limit(request: Request) -> int:
+    """The callback body cap for this deployment (settings win over the default)."""
+    settings = getattr(request.app.state, "settings", None)
+    value = getattr(settings, "max_push_bytes", 0) or 0
+    return int(value) if value > 0 else MAX_PUSH_BYTES
+
+
+async def _read_limited(request: Request, limit: int) -> bytes:
     """Read the body, refusing anything over the cap *while* reading it.
 
     ``Content-Length`` is checked first so a huge body is refused before a byte
@@ -104,14 +121,14 @@ async def _read_limited(request: Request) -> bytes:
     optional and a sender is free to lie about it.
     """
     declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > MAX_PUSH_BYTES:
+    if declared.isdigit() and int(declared) > limit:
         raise _TooLarge
 
     chunks: list[bytes] = []
     size = 0
     async for chunk in request.stream():
         size += len(chunk)
-        if size > MAX_PUSH_BYTES:
+        if size > limit:
             raise _TooLarge
         chunks.append(chunk)
     return b"".join(chunks)

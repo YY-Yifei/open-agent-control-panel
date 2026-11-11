@@ -96,6 +96,7 @@ class TaskService:
         text: str,
         *,
         context_id: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
         session_id: str | None = None,
     ) -> dict[str, Any]:
@@ -115,6 +116,14 @@ class TaskService:
         task_id = new_id("t")
         now = iso()
         request = {"text": text, "contextId": context_id, "metadata": metadata}
+        if attachments:
+            # Only the description of each file is kept in the ledger: the bytes
+            # already live in ``session_attachments``, and copying them in here
+            # would double the database without adding a second truth.
+            request["attachments"] = [
+                {key: item.get(key) for key in ("name", "mime", "size", "sha256")}
+                for item in attachments
+            ]
 
         # The callback URL is minted *before* the send and stored with the row:
         # an agent that finishes (or calls back) while our RPC is still open must
@@ -136,7 +145,7 @@ class TaskService:
                     str(card.get("name") or agent["url"]),
                     agent["url"],
                     endpoint.get("url") or "",
-                    title_from(text),
+                    _title_for(text, attachments),
                     text,
                     json_dumps(request),
                     now,
@@ -159,6 +168,7 @@ class TaskService:
                 card,
                 text,
                 context_id=context_id,
+                attachments=attachments,
                 metadata=metadata,
                 push_config=push_config,
             )
@@ -178,6 +188,7 @@ class TaskService:
         task_id: str,
         text: str,
         *,
+        attachments: list[dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Send another user message into the same task/context."""
@@ -194,6 +205,7 @@ class TaskService:
                 text,
                 context_id=context_id,
                 task_id=remote_id,
+                attachments=attachments,
                 metadata=metadata,
             )
         except A2AError as exc:
@@ -268,13 +280,29 @@ class TaskService:
         previous = json_loads(row["response_json"], None)
         text = (view.get("text") or view.get("statusText") or "").strip()
         seen = (_latest_text(previous) or "").strip()
+        # A callback that carries a picture and no words has empty text. Asking
+        # only about text would call it a duplicate of the previous empty-text
+        # snapshot and drop the picture on the floor — so the files it carries are
+        # part of what "the same update" means here.
+        #
+        # Both sides are read off the *merged* view, which is what gets stored: a
+        # callback that omits `artifacts` (the status-only update `_merge_task`
+        # exists to tolerate) would otherwise look like "the media changed" on
+        # every retry, because the payload's signature is empty and the stored one
+        # is not — so a retried delivery would never register as a duplicate.
+        merged = _merge_task(previous, payload)
+        media = cardmod.result_media_signature(merged)
+        seen_media = cardmod.result_media_signature(previous)
+        fresh = text != seen or media != seen_media
 
-        if incoming == current and text == seen:
-            verdict = "duplicate"
-        elif _outranks(incoming, current):
-            verdict = "applied"
-        else:
+        if not _outranks(incoming, current) and incoming != current:
+            # A late delivery that would move the task backwards. It is not news
+            # even if it does carry a file we do not have.
             verdict = "ignored"
+        elif incoming == current and not fresh:
+            verdict = "duplicate"
+        else:
+            verdict = "applied"
 
         now = iso()
         with self.db.connect() as connection:
@@ -283,7 +311,6 @@ class TaskService:
                 (now, row["id"]),
             )
             if verdict == "applied":
-                merged = _merge_task(previous, payload)
                 connection.execute(
                     """
                     UPDATE tasks
@@ -676,6 +703,22 @@ def _outranks(incoming: str, current: str) -> bool:
     if cardmod.is_terminal(current):
         return False
     return _PROGRESS.get(incoming, 1) >= _PROGRESS.get(current, 1)
+
+
+def _title_for(text: str, attachments: Any) -> str:
+    """A ledger title for a submit that may carry no words at all.
+
+    An image-only message is a valid submit, and calling its task "(empty
+    prompt)" in the ledger would misdescribe what was asked: the file name is
+    the closest thing to a prompt such a message contains.
+    """
+    if text.strip():
+        return title_from(text)
+    for item in attachments or []:
+        name = item.get("name") if isinstance(item, dict) else None
+        if name:
+            return title_from(str(name))
+    return title_from(text)
 
 
 def _merge_task(previous: Any, payload: dict[str, Any]) -> dict[str, Any]:

@@ -4,6 +4,112 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-11-11
+
+### Added
+
+- **Sending pictures.** The composer takes up to four images per message (PNG, JPEG,
+  WebP, GIF; 5 MB each by default) and forwards them as A2A `Part`s. The bytes travel
+  *inline* as base64 rather than behind a hosted URL, because the panel's own address is
+  a loopback one by default and an agent that is not on this machine cannot fetch what we
+  publish. Both dialects are spelled out — `{"raw", "mediaType", "filename"}` in 1.x,
+  `{"kind": "file", "file": {"bytes", "mimeType", "name"}}` in 0.3 — and a text part is
+  omitted rather than sent blank when the message is a picture and nothing else.
+- The type is decided by the magic bytes, never by the declared `mime`: a PDF labelled
+  `image/png` is refused (`415 attachment_type_mismatch`), an SVG is refused outright
+  (`415 attachment_unsupported`), and 5 MB is checked on the encoded length before
+  anything is decoded.
+- Pictures are kept in `session_attachments` (schema 7) and served back through
+  `GET /api/panel/attachments/{id}`, so an image you sent is still in the conversation
+  after a reload. Bytes stay out of the conversation JSON — the UI asks for each picture
+  separately — and a deleted conversation takes its pictures with it.
+- An agent whose card declares its input modes and lists no `image/*` is refused with
+  `415 agent_no_image_input` before anything is sent. A card that declares nothing is
+  still tried: under-declaration is common, and "unknown" is not "no".
+- **Receiving pictures.** A file part in an agent's answer — `{"kind": "file", "file":
+  {"bytes" | "uri", …}}` in 0.3, `{"raw" | "url", …}` in 1.x — now lands in the
+  conversation as a picture, in an `Artifact` or in the status message. Read from both,
+  never from `history`: that repeats every earlier message and would re-deliver every
+  file on every poll.
+- An answer that is **only** a picture is no longer lost. The conversation used to key
+  purely on text, so a text-free reply (which is what an image-only answer is) wrote no
+  row at all — the bytes sat in `tasks.response_json` where nobody could see them.
+- Files are deduped **within a turn** by content hash: A2A `artifacts` accumulate, so the
+  second snapshot of a task still carries the first picture. Across turns they are not
+  deduped — an agent that sends the same picture again in a new turn is doing something
+  a person can see, and swallowing it would be the panel editing the answer.
+- A file the panel will not show still leaves a row, so a reply never loses information
+  silently: not an image (`unsupported`), over the limit (`too_large`), unreadable base64
+  (`bad_data`), unfetchable (`unreachable`), or past the per-message count (`too_many`).
+  The row stores the *reason code*; the UI picks the words, so a stored conversation reads
+  correctly in either language. `GET /api/panel/attachments/{id}` answers 404 for those
+  rows rather than serving an empty body as an image.
+- A `url`-shaped file part is fetched through the same guard a card URL goes through
+  (public addresses only, DNS pinned after validation, redirects re-checked hop by hop,
+  body capped while streaming) and only when the part declares a type or a filename — a
+  bare `{"url": …}` is read as a link, exactly as before. When the part names no file but
+  the URL path does, the path's last segment becomes the name.
+- Receiving has its own limits, because it is a different trust decision from what a person
+  types: `max_inbound_image_bytes` and `max_inbound_images` (5 MB / 4 by default). The push
+  callback cap became `max_push_bytes` (8 MB by default): a callback carrying one inline
+  image is a normal A2A answer, and refusing it meant losing whole turns from agents that
+  reply with a picture.
+
+### Changed
+
+- `POST /api/panel/sessions/{id}/messages` (and the message that opens a conversation)
+  accepts `attachments: [{mime, name, data}]` beside `text`, and `text` may be empty when
+  a picture is attached. It is one request: no upload endpoint, nothing staged, so there
+  is no orphaned upload to reap when a send is abandoned.
+- `session_attachments` gained `skipped` and `source` (schema 7): `skipped` is NULL while
+  the bytes are shown and a reason code when they are not; `source` is the URL a part was
+  fetched from, so a `url` part is not downloaded again on every poll. A database written
+  by schema 6 widens in place.
+- An oversized body is refused in the contract of the surface it arrived on: `/api/panel`
+  keeps the panel's `{detail, code}` in the caller's language, and `/v1` answers the ADP
+  shape in English (`{code: PAYLOAD_TOO_LARGE, message}`), with a cap of its own (1 MB)
+  rather than the panel's image-derived one — an unauthenticated route whose body is a
+  URL has no business making the registry parse tens of megabytes.
+- A push callback is judged against (text, files) rather than text alone. An agent that
+  adds a picture to a task whose state has not moved is saying something new, not retrying
+  the previous delivery.
+
+### Fixed
+
+- **A `url`-shaped file part is downloaded once, not once per poll.** Dedupe keyed on the
+  bytes, and a `url` part has no bytes until it has been fetched; nothing remembered the
+  address, so every snapshot fetched it again (measured: four GETs for one send and three
+  syncs — a 5 MB picture, up to 10 s of a thread pool worker, per poll).
+  `session_attachments.source` keeps the address and the part is skipped before the fetch.
+  Only a row that *has* bytes counts as seen, so an `unreachable` part is tried again on the
+  next snapshot instead of disappearing because a CDN blinked.
+- **A reply that is only a picture is appended once, not once per poll.** The
+  already-there check compared identities that the same turn's intake had just filtered
+  out, so it never matched and each snapshot added another copy of the answer.
+- **The per-message picture quota does not restart on every snapshot.** It was counted from
+  zero each time, so the next poll accepted what the previous one had refused — over the
+  limit, and with an extra copy of the reply to go with it. It is now seeded with what the
+  turn already displays, and a download attempt counts against it even when it fails, so a
+  batch of broken URLs cannot make the panel fetch forever.
+- **A body over `max_push_bytes` is answered 413.** FastAPI turns an exception raised while
+  parsing a body into a 400, so the panel's own 413 was never reached; the guard now escapes
+  that wrapper, and a test drives the real route instead of the helper behind it.
+- **A push callback no longer blocks the event loop.** The handler is `async` and called the
+  download directly — up to `total_timeout` of a stalled fetch with the whole panel waiting.
+  Intake runs in the thread pool now, as the poll path already did.
+- **Base64 with legal line breaks is accepted**, `image/jpg` is read as the JPEG alias it
+  is, and a `data:` URL may carry parameters — three ways a correct part was answered 400
+  or 415.
+- **A `too_many` row keeps the file's name and its reason**, and the picture cache no longer
+  evicts a picture the page is still showing.
+- **`__version__` matches the version the package is published as.** It was left at 0.4.0
+  while `pyproject.toml` went to 0.4.1 and 0.4.2, so `--version`, `/health` and the
+  `User-Agent` all under-reported. They move together now, and a test fails if they drift
+  apart again.
+- **`Attachment` is declared before the models that use it.** It sat after `NewSession`,
+  which only worked because pydantic rebuilds lazily; `model_json_schema()` on the import
+  path would have raised.
+
 ## [0.4.2] — 2026-11-10
 
 ### Fixed

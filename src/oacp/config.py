@@ -73,12 +73,37 @@ class Settings:
     allow_private_agents: bool = False
     a2a_timeout: float = 60.0
 
+    # Images a user may send. The bytes travel inline in the A2A message (see
+    # ``a2a.client``), so this is a *wire* limit as much as a storage one: it is
+    # what keeps one JSON-RPC body inside what an agent will accept. Counted per
+    # message, not per conversation.
+    max_image_bytes: int = 5 * 1024 * 1024
+    max_images_per_message: int = 4
+
+    # Images an *agent* sends back. Separate knobs on purpose: what the panel
+    # accepts from a person it vouches for and what it accepts from a remote
+    # service are two different trust decisions, and only one of them is a
+    # person watching their own file be rejected.
+    max_inbound_image_bytes: int = 5 * 1024 * 1024
+    max_inbound_images: int = 4
+
+    # Whether the panel will GET a URL an agent names in a file part. On by
+    # default because that is how the picture gets shown; off for a deployment
+    # that must not act as a proxy for remote content. Switched off, a URL-shaped
+    # part becomes a chip saying it was not fetched — the reply still arrives.
+    fetch_inbound_files: bool = True
+
     # Inbound A2A push notifications (task callbacks). On by default: it is the
     # only protocol-defined way an agent can report a result without being asked,
     # and the callback base follows the bind address the same way local mode does,
     # so a loopback deployment already offers an address local agents can reach.
     # Switch it off (``--no-push``) when the panel cannot offer a reachable one.
     push_enabled: bool = True
+
+    # Largest callback body accepted. Above the default because a callback that
+    # carries an inline image is a normal A2A answer, and refusing it would mean
+    # the panel loses whole turns from agents that answer with a picture.
+    max_push_bytes: int = 8 * 1024 * 1024
 
     user_agent: str = f"open-agent-control-panel/{__version__}"
 
@@ -165,10 +190,21 @@ def _coerce(name: str, raw: str) -> Any:
         "max_card_bytes",
         "max_agents_per_domain",
         "register_per_hour",
+        "max_image_bytes",
+        "max_images_per_message",
+        "max_inbound_image_bytes",
+        "max_inbound_images",
+        "max_push_bytes",
     }:
         return int(raw)
     if name == "a2a_timeout":
         return float(raw)
-    if name in {"allow_private_agents", "allow_insecure_cards", "probe_enabled", "push_enabled"}:
+    if name in {
+        "allow_private_agents",
+        "allow_insecure_cards",
+        "probe_enabled",
+        "push_enabled",
+        "fetch_inbound_files",
+    }:
         return _as_bool(raw)
     return raw

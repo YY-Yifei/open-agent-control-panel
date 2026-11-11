@@ -11,6 +11,11 @@ const TOKEN_KEY = "oacp.token";
 const LANG_KEY = "oacp.lang";
 const MANAGE_KEY = "oacp.manageTokens";
 
+// 图片：真正的上限由 /summary 给出（服务端是唯一真源），这里的值是「还没拿到
+// summary 之前」的兜底，好让选图这一刻就能拦住明显太大的文件。
+const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+const IMAGE_LIMITS = { maxBytes: 5 * 1024 * 1024, maxPerMessage: 4 };
+
 /* ------------------------------------------------------------------ 文案 */
 
 const DICT = {
@@ -34,6 +39,22 @@ const DICT = {
 
     "composer.placeholder": "输入消息，Enter 发送，Shift+Enter 换行",
     "composer.busy": "对方正在处理，请稍候…",
+
+    "attach.add": "添加图片",
+    "attach.remove": "移除这张图",
+    "attach.unsupported": "这个智能体的卡片声明只接受文本输入",
+    "attach.tooBig": "{name} 超过 {max}",
+    "attach.tooMany": "一条消息最多 {n} 张图片",
+    "attach.type": "只支持 PNG、JPEG、WebP、GIF",
+    "attach.failed": "这张图读不出来：{name}",
+
+    // 附件到了但没显示。存进库里的是原因码，文案在这一层选 —— 同一段会话
+    // 换个语言再读，也仍然是它对的那一种语言。
+    "attach.skip.too_large": "{name} 太大，没有显示",
+    "attach.skip.unsupported": "{name} 不是能显示的图片",
+    "attach.skip.bad_data": "{name} 的数据读不出来",
+    "attach.skip.unreachable": "{name} 取不回来",
+    "attach.skip.too_many": "{name} 超出一条消息的张数上限",
 
     "state.idle": "空闲",
     "state.working": "正在处理",
@@ -118,6 +139,20 @@ const DICT = {
 
     "composer.placeholder": "Type a message — Enter to send, Shift+Enter for a new line",
     "composer.busy": "The agent is working…",
+
+    "attach.add": "Add images",
+    "attach.remove": "Remove this image",
+    "attach.unsupported": "This agent's card declares text input only",
+    "attach.tooBig": "{name} is larger than {max}",
+    "attach.tooMany": "One message may carry at most {n} images",
+    "attach.type": "Only PNG, JPEG, WebP and GIF are supported",
+    "attach.failed": "This image could not be read: {name}",
+
+    "attach.skip.too_large": "{name} was too large to show",
+    "attach.skip.unsupported": "{name} is not an image this panel can show",
+    "attach.skip.bad_data": "{name} could not be read",
+    "attach.skip.unreachable": "{name} could not be fetched",
+    "attach.skip.too_many": "{name} is over the per-message limit",
 
     "state.idle": "Idle",
     "state.working": "Working",
@@ -298,6 +333,9 @@ const state = {
   draft: false,
   q: "",
   busy: false,
+  // 还没发出去的图片：{ name, mime, size, data(base64), preview(data URL) }
+  pending: [],
+  limits: { ...IMAGE_LIMITS },
 };
 
 let pollTimer = null;
@@ -312,6 +350,13 @@ function applyLang() {
   });
   document.querySelectorAll("[data-i18n-ph]").forEach((node) => {
     node.placeholder = t(node.dataset.i18nPh);
+  });
+  document.querySelectorAll("[data-i18n-title]").forEach((node) => {
+    node.title = t(node.dataset.i18nTitle);
+  });
+  // aria-label 是可访问名，会盖过 title：写在 HTML 里的中文常量必须跟着语言走。
+  document.querySelectorAll("[data-i18n-aria]").forEach((node) => {
+    node.setAttribute("aria-label", t(node.dataset.i18nAria));
   });
   const toggle = $("#lang");
   if (toggle) toggle.textContent = lang === "zh" ? "English" : "中文";
@@ -462,8 +507,13 @@ function renderChat() {
     // 拼好的整句。
     const html = role === "agent" ? renderMarkdown(message.text) : esc(message.text);
     const cls = role === "agent" ? "bubble md" : "bubble";
+    // 图与文分开渲染：文字要保留换行与转义，图要有自己的尺寸规则。src 先留空，
+    // 由 hydrateAttachments 用带口令的请求填上 —— <img src> 带不了请求头。
+    const files = (message.attachments || []).map(attachmentNode).join("");
+    if (!html && !files) return "";
     return `<div class="msg ${role}">
-      <div class="${cls}">${html || esc(message.text)}</div>
+      ${files ? `<div class="files">${files}</div>` : ""}
+      ${html ? `<div class="${cls}">${html}</div>` : ""}
       <div class="meta">${esc(fmtTime(message.at))}</div>
     </div>`;
   });
@@ -473,6 +523,24 @@ function renderChat() {
   const nearBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 120;
   chat.innerHTML = rows.join("");
   if (nearBottom || chat.scrollTop === 0) chat.scrollTop = chat.scrollHeight;
+  // 图是异步到的：填完再贴一次底边，否则图一出来就把位置顶走。
+  hydrateAttachments(chat, () => {
+    if (nearBottom) chat.scrollTop = chat.scrollHeight;
+  });
+}
+
+// 一条附件要么是张图（src 由 hydrateAttachments 后填），要么是一枚说明为什么
+// 没有图的 chip。后者也占一行：agent 回了一个 PDF 这件事本身是要让人看见的，
+// 静默丢掉才是真的丢信息。
+function attachmentNode(file) {
+  if (file.skipped) {
+    const why = t(`attach.skip.${file.skipped}`, { name: file.name });
+    // 原因要看得见，不能只藏在 title 里：触屏没有悬停，键盘也到不了这个 span。
+    // 原因文案自带 {name}，所以文件名不会丢。
+    return `<span class="attachment-skip" title="${esc(file.name)}">${esc(why)}</span>`;
+  }
+  // 唯一的未转义属性插值：id 现在是 int，但不该让 id 的形状决定这里安不安全。
+  return `<img class="sent" data-attach="${esc(file.id)}" alt="${esc(file.name)}" title="${esc(file.name)}" />`;
 }
 
 function renderComposer() {
@@ -482,9 +550,198 @@ function renderComposer() {
   if (form.hidden) return;
   const working = Boolean(state.session && state.session.state === "working");
   const blocked = state.busy || working;
+  const agent = currentAgent();
+  // 「卡片声明了输入类型，且其中没有 image/*」才关掉入口。卡片没声明（null）
+  // 时照常允许 —— 没声明不等于不支持，让 agent 自己去拒绝。
+  const takesImages = !agent || agent.acceptsImages !== false;
   input.disabled = blocked;
   input.placeholder = working ? t("composer.busy") : t("composer.placeholder");
-  $("#send").disabled = blocked || !input.value.trim();
+  const attach = $("#attach");
+  attach.disabled = blocked || !takesImages;
+  const attachLabel = takesImages ? t("attach.add") : t("attach.unsupported");
+  attach.title = attachLabel;
+  // aria-label 是可访问名，会盖过 title：只改 title 的话，卡片只收文本时
+  // 屏幕阅读器听到的仍然是「添加图片」。
+  attach.setAttribute("aria-label", attachLabel);
+  attach.classList.toggle("blocked", !takesImages);
+  renderAttachments();
+  $("#send").disabled = blocked || (!input.value.trim() && !state.pending.length);
+}
+
+/* ------------------------------------------------------------------ 图片 */
+
+function renderAttachments() {
+  const strip = $("#attach-strip");
+  if (!strip) return;
+  strip.innerHTML = state.pending
+    .map(
+      (item, index) => `<figure class="chip" title="${esc(item.name)}">
+        <img src="${esc(item.preview)}" alt="${esc(item.name)}" />
+        <button type="button" data-detach="${index}" aria-label="${esc(t("attach.remove"))}">×</button>
+        <figcaption>${esc(shortName(item.name))}</figcaption>
+      </figure>`,
+    )
+    .join("");
+  strip.hidden = state.pending.length === 0;
+}
+
+function shortName(name) {
+  const text = String(name || "");
+  return text.length > 18 ? `${text.slice(0, 15)}…` : text;
+}
+
+function sizeLabel(bytes) {
+  // 上限来自服务端配置，可能是 500 KB：一律说成 "1 MB" 会和它自己的报错互相矛盾。
+  if (bytes >= 1024 * 1024) {
+    // 整数就写整数，其余保留一位：四舍五入会把 1.6 MB 的上限说成 "2 MB"，
+    // 于是拒收 1.8 MB 的报错自己打自己。
+    const mb = bytes / (1024 * 1024);
+    return `${Number.isInteger(mb) ? mb : mb.toFixed(1)} MB`;
+  }
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function readAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(t("attach.failed", { name: file.name })));
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const comma = result.indexOf(",");
+      if (comma < 0) return reject(new Error(t("attach.failed", { name: file.name })));
+      // data URL 前半段是声明，真正要发给服务端的是逗号之后的 base64。
+      resolve({ data: result.slice(comma + 1), preview: result });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addFiles(fileList) {
+  const limits = state.limits;
+  // 比数组身份，而不是 agentId：同一 agent 下换会话时 agentId 不变，
+  // 但 route() 会整体替换 state.pending —— 那时读出来的图也不能落进去。
+  const scope = state.pending;
+  for (const file of Array.from(fileList || [])) {
+    // 先看类型与大小，再看名额：满了 4 张时混选一个 .txt，该说的是「不支持的类型」。
+    if (!IMAGE_TYPES.includes(file.type)) {
+      toast(t("attach.type"), "error");
+      continue;
+    }
+    if (file.size > limits.maxBytes) {
+      toast(t("attach.tooBig", { name: file.name, max: sizeLabel(limits.maxBytes) }), "error");
+      continue;
+    }
+    if (state.pending.length >= limits.maxPerMessage) {
+      toast(t("attach.tooMany", { n: limits.maxPerMessage }), "error");
+      break;
+    }
+    try {
+      const { data, preview } = await readAsBase64(file);
+      if (state.pending !== scope) return;
+      // 读文件是异步的：等的这段时间里另一次 addFiles 可能把名额填满了，
+      // 所以名额要在这之后再判一次，否则前端会发出服务端必然拒收的那种消息。
+      if (state.pending.length >= limits.maxPerMessage) {
+        toast(t("attach.tooMany", { n: limits.maxPerMessage }), "error");
+        break;
+      }
+      state.pending.push({ name: file.name, mime: file.type, size: file.size, data, preview });
+    } catch (error) {
+      toast(error.message, "error");
+    }
+  }
+  renderComposer();
+}
+
+// 已取回的图按附件 id 缓存成 Promise<blob URL>：切会话再切回来不必重新下载，
+// renderChat 在轮询期间反复重跑时，重叠的两次也不会对同一张图发两次请求。
+// 缓存有上限、并且在换口令时整体作废 —— 长开的页面不该把看过的图全攒着，
+// 旧口令取回的 blob 也不该在换了口令之后继续显示。
+const ATTACHMENT_URLS = new Map(); // id -> { promise, url }
+const ATTACHMENT_CACHE_MAX = 48;
+
+function dropAttachmentCache() {
+  for (const record of ATTACHMENT_URLS.values()) {
+    record.promise.then((url) => URL.revokeObjectURL(url)).catch(() => {});
+  }
+  ATTACHMENT_URLS.clear();
+}
+
+// 图上还引用着这个 URL 时不能吊销：驱逐是为了省内存，不是为了让正在看的图
+// 变成「已消失」。全都在用时这一轮就不驱逐。
+function attachmentInUse(url) {
+  return Array.from(document.querySelectorAll("img[src]")).some((node) => node.src === url);
+}
+
+function evictOldestAttachment(skipId) {
+  for (const [id, record] of ATTACHMENT_URLS) {
+    if (id === skipId) continue;
+    // 还没取回来：URL 还不存在，等它 resolve 再吊销的话，正 await 的 <img>
+    // 刚拿到就被撤掉，图就碎了。在飞的记录一律不动。
+    if (!record.url || attachmentInUse(record.url)) continue;
+    ATTACHMENT_URLS.delete(id);
+    record.promise.then((url) => URL.revokeObjectURL(url)).catch(() => {});
+    return;
+  }
+}
+
+function attachmentUrl(id) {
+  const cached = ATTACHMENT_URLS.get(id);
+  if (cached) return cached.promise;
+  const record = { promise: null, url: null };
+  record.promise = (async () => {
+    const token = localStorage.getItem(TOKEN_KEY) || "";
+    const headers = token ? { "x-panel-token": token } : {};
+    const response = await fetch(`${API}/attachments/${encodeURIComponent(id)}`, { headers });
+    if (response.status === 401) {
+      // 和 api() 一样：口令缺失/过期要弹出输口令的窗口。否则整屏图会静默
+      // 变成「已消失」，而人既看不出是口令问题，也没有入口去修。
+      openTokenDialog();
+      throw new Error(t("token.required"));
+    }
+    if (!response.ok) throw new Error("gone");
+    const url = URL.createObjectURL(await response.blob());
+    record.url = url;
+    // 一次只试一个：没有可删的（图都还在屏上）就让缓存暂时超一点上限，
+    // 不能在这里 while —— evictOldestAttachment 什么都不删时 size 永远不变。
+    if (ATTACHMENT_URLS.size >= ATTACHMENT_CACHE_MAX) evictOldestAttachment(id);
+    return url;
+  })();
+  // 失败不留缓存，下一帧还能重试（比如口令刚填完、网络刚恢复）。
+  record.promise.catch(() => {
+    // 只删「还是这一条」的记录：同一个 id 可能已经被驱逐、又被重新取过一次，
+    // 按 key 直接删会把那条新记录的 blob URL 漏成永久泄漏。
+    if (ATTACHMENT_URLS.get(id) === record) ATTACHMENT_URLS.delete(id);
+  });
+  ATTACHMENT_URLS.set(id, record);
+  return record.promise;
+}
+
+async function hydrateAttachments(root, done) {
+  const nodes = Array.from(root.querySelectorAll("img[data-attach]"));
+  if (!nodes.length) {
+    if (done) done();
+    return;
+  }
+  await Promise.all(
+    nodes.map(async (node) => {
+      try {
+        node.src = await attachmentUrl(node.dataset.attach);
+        // 等解码完再算「是否贴底」：此刻图才有尺寸，早一步读 scrollHeight
+        // 读到的还是零高度，图一显示就把视口顶走了。
+        await node.decode?.().catch(() => {});
+      } catch {
+        node.replaceWith(attachmentPlaceholder(node.alt));
+      }
+    }),
+  );
+  if (done) done();
+}
+
+function attachmentPlaceholder(name) {
+  const node = document.createElement("span");
+  node.className = "attachment-gone";
+  node.textContent = name || "image";
+  return node;
 }
 
 /* ------------------------------------------------------------------ 路由 */
@@ -509,6 +766,11 @@ function go(hash) {
 async function route() {
   stopPolling();
   const { agentId, sessionId } = parseRoute();
+  // 只有真的换了会话才清空待发图片。go() 对同一段路由也会调用 route()，
+  // 点一下「我本来就在的这段会话」不该把选好的图弄丢。
+  const target = sessionId && sessionId !== "new" ? sessionId : null;
+  const current = state.session ? state.session.id : null;
+  if (agentId !== state.agentId || target !== current) state.pending = [];
 
   if (!agentId) {
     state.agentId = null;
@@ -553,6 +815,7 @@ async function loadSummary() {
   try {
     const summary = await api(`${API}/summary`);
     $("#version").textContent = summary.version || "";
+    if (summary.images) state.limits = { ...IMAGE_LIMITS, ...summary.images };
   } catch (error) {
     if (error.message !== t("token.required")) toast(error.message, "error");
   }
@@ -600,25 +863,28 @@ async function openSession(id) {
 async function send() {
   const input = $("#input");
   const text = input.value.trim();
-  if (!text || state.busy || !state.agentId) return;
+  const files = state.pending.map((item) => ({ mime: item.mime, name: item.name, data: item.data }));
+  if ((!text && !files.length) || state.busy || !state.agentId) return;
   if (state.session && state.session.state === "working") return;
 
   state.busy = true;
   renderComposer();
   try {
     const creating = !state.session || state.draft;
+    const body = files.length ? { text, attachments: files } : { text };
     const data = creating
       ? await api(`${API}/agents/${encodeURIComponent(state.agentId)}/sessions`, {
           method: "POST",
-          body: { text },
+          body,
         })
       : await api(`${API}/sessions/${encodeURIComponent(state.session.id)}/messages`, {
           method: "POST",
-          body: { text },
+          body,
         });
 
     input.value = "";
     autosize(input);
+    state.pending = [];
     state.busy = false;
 
     if (creating) {
@@ -956,6 +1222,8 @@ function openTokenDialog() {
     const value = $("#token-input").value.trim();
     if (!value) return;
     localStorage.setItem(TOKEN_KEY, value);
+    // 旧口令取回的 blob 不能带进新口令。
+    dropAttachmentCache();
     location.reload();
   });
 }
@@ -979,10 +1247,21 @@ function bindDom() {
     send();
   });
 
+  // 可选类型只在 IMAGE_TYPES 声明一次，选择器的 accept 由它派生。
+  $("#attach-input").accept = IMAGE_TYPES.join(",");
+  $("#attach").addEventListener("click", () => $("#attach-input").click());
+  $("#attach-input").addEventListener("change", (event) => {
+    const picker = event.target;
+    addFiles(picker.files).finally(() => {
+      // 清空 value：同一个文件再选一次也要能触发 change。
+      picker.value = "";
+    });
+  });
+
   const input = $("#input");
   input.addEventListener("input", () => {
     autosize(input);
-    $("#send").disabled = state.busy || !input.value.trim();
+    $("#send").disabled = state.busy || (!input.value.trim() && !state.pending.length);
   });
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
@@ -1007,6 +1286,12 @@ function bindDom() {
       const id = session.dataset.session;
       const base = `#/a/${encodeURIComponent(state.agentId)}`;
       go(id ? `${base}/${encodeURIComponent(id)}` : `${base}/new`);
+      return;
+    }
+    const detach = event.target.closest("[data-detach]");
+    if (detach) {
+      state.pending.splice(Number(detach.dataset.detach), 1);
+      renderComposer();
       return;
     }
     const action = event.target.closest("[data-act]");

@@ -135,6 +135,15 @@ method names and push tokens stay behind `/api/panel`; the page itself only ever
   the agent, so coming back tomorrow continues the same thread.
 * **Messages** — you write, the agent answers. While it works the composer waits and a *stop*
   button appears; a turn that asks for more input turns the composer back on.
+* **Pictures** — the paperclip takes up to four images per message (PNG, JPEG, WebP, GIF,
+  5 MB each by default), previews them above the composer and sends them as A2A file parts.
+  An agent whose card lists its input modes without any `image/*` gets no paperclip at all,
+  and the server answers `415 agent_no_image_input` if one is forced through anyway.
+  Pictures *from* an agent are shown too, including an answer that is nothing but an image —
+  inline `bytes`/`raw` directly, a `url`/`uri` through the same guard a card URL goes through
+  (off by default only because a panel with no outbound access still has to show the reply).
+  A file the panel will not put on screen still leaves a chip saying why: not an image, too
+  large, unreadable, unfetchable, or past the per-message count. Nothing is dropped quietly.
 * **Six states** — 空闲 / 正在处理 / 等待回复 / 已完成 / 出错 / 已停止. Nothing else is shown,
   and no protocol word reaches the page.
 * **Removing an agent** — the dialog uses the manage token from first registration when this
@@ -248,6 +257,7 @@ A2A has no conversation object. It has a `contextId` that ties tasks together, a
 |---|---|
 | a conversation | `sessions.context_id`, assigned by the agent on the first turn |
 | a message you send | `SendMessage` — a follow-up into the open task while there is one, a fresh send carrying the same `contextId` once the turn is finished |
+| a picture you attach | a file `Part` in that same message — `{"raw", "mediaType", "filename"}` in 1.x, `{"kind": "file", "file": {"bytes", "mimeType", "name"}}` in 0.3 |
 | the agent's answer | the task's text, folded into one message |
 | 正在处理 / 等待回复 | `working` / `input-required`, `auth-required` |
 | 已停止 | `canceled` |

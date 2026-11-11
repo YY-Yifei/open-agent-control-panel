@@ -19,7 +19,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 
 class MigrationError(RuntimeError):
@@ -124,6 +124,23 @@ CREATE TABLE IF NOT EXISTS session_messages (
 );
 
 CREATE INDEX IF NOT EXISTS session_messages_session ON session_messages (session_id, id);
+
+CREATE TABLE IF NOT EXISTS session_attachments (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    message_id  INTEGER,
+    at          TEXT NOT NULL,
+    mime        TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    sha256      TEXT NOT NULL,
+    data        BLOB NOT NULL,
+    skipped     TEXT,
+    source      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS session_attachments_session ON session_attachments (session_id, id);
+CREATE INDEX IF NOT EXISTS session_attachments_message ON session_attachments (message_id, id);
 """
 
 #: Task columns added after schema v1 (push notifications) and v2 (sessions).
@@ -191,6 +208,17 @@ def _widen(connection: sqlite3.Connection) -> None:
     connection.execute("CREATE INDEX IF NOT EXISTS tasks_push_token ON tasks (push_token)")
     connection.execute("CREATE INDEX IF NOT EXISTS tasks_session ON tasks (session_id)")
 
+    # Schema 6 added the table (the outbound-only build); schema 7 added two
+    # columns. ``skipped``: an inbound file the panel will not show is still a row,
+    # so a conversation can say why a picture is missing instead of pretending
+    # nothing arrived. ``source``: a file that came from a URL remembers that URL,
+    # so the next poll does not download it again. A row that never needed either
+    # keeps NULL, which is what the ALTER gives an existing file.
+    existing = {row["name"] for row in connection.execute("PRAGMA table_info(session_attachments)")}
+    for name, declaration in (("skipped", "TEXT"), ("source", "TEXT")):
+        if existing and name not in existing:
+            connection.execute(f"ALTER TABLE session_attachments ADD COLUMN {name} {declaration}")
+
 
 def _rekey_agents(connection: sqlite3.Connection, previous: int) -> None:
     """Re-derive ids from the stored URL (schema 4 → 5).
@@ -215,7 +243,10 @@ def _rekey_agents(connection: sqlite3.Connection, previous: int) -> None:
     has to be idempotent: an interrupted run leaves ``user_version`` at 4 and the
     next start finishes the job without moving anything twice.
     """
-    if previous >= SCHEMA_VERSION:
+    # ``5`` and not ``SCHEMA_VERSION``: this pass takes a *schema 4* file to
+    # schema 5. Later versions keep the same derivation, so a 5 file must not be
+    # walked again — the check has to name the boundary it guards.
+    if previous >= 5:
         return
 
     from .net import derive_id  # local: ``net`` must stay ignorant of storage

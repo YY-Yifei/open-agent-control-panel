@@ -315,7 +315,9 @@ def test_a_conversation_payload_speaks_about_messages_only(client, app, fetcher)
 
     assert not [key for key in session if "task" in key.lower() or "context" in key.lower()]
     for message in session["messages"]:
-        assert set(message) == {"id", "role", "text", "at", "state"}
+        # ``attachments`` is the panel's own word for the pictures a message
+        # carries; it is still not protocol vocabulary, which is what this guards.
+        assert set(message) == {"id", "role", "text", "at", "state", "attachments"}
 
 
 def test_unknown_ids_are_404(client) -> None:
