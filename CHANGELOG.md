@@ -4,6 +4,86 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-11-11
+
+### Added
+
+- **Agent Native: the panel is a caller.** It can hand its own capabilities to a model
+  instead of only being typed at. The browser opens a WebSocket to an
+  [aaas](https://pypi.org/project/aaas/) server (`ws://localhost:8888` by default,
+  `--aaas-url` to point elsewhere), declares what it can do, and executes those
+  functions when the model calls them. The page speaks `aaas.v1` directly — there is no
+  second protocol implementation on the server, and no server-side agent loop.
+- The caller is the **page**, not the server, on purpose: half of the capabilities worth
+  having exist only in a browser. System notifications, the clipboard, a file download,
+  scrolling a row into view, writing a draft into the composer so a person can finish it
+  and press send. A server-side caller can reach the HTTP API and nothing else.
+- **22 declared capabilities and one hidden**, in four tiers: 9 `ui_*` (theme, language,
+  notify, toast, open, draft, download, modal, client info), 8 `panel_*` reads (overview,
+  search, agents, sessions, tasks), 3 `panel_*` acts (rename, refresh, cancel), 2
+  `panel_*` destroys (delete conversation, delete agent). `panel_send_message` is
+  declared only under `--agent-policy delegate`: letting a model speak to another agent
+  in the user's name is how loops start.
+- `GET /api/panel/agent` resolves *one* URL — `wsUrl` — so the page never has to reason
+  about transport. With `--aaas-token`, `wsUrl` points at this panel's own
+  `/api/panel/agent/ws` proxy, because `new WebSocket()` cannot set an `Authorization`
+  header. The token is added upstream and **never** appears in a response body: that
+  endpoint is unauthenticated by design, and it answers `enabled: false` when the feature
+  is switched off, so an unconfigured panel shows no entry rather than a dead button.
+- `GET /api/panel/search` finds agents, conversations and tasks by any word they contain.
+  This is the one read the page could not do itself, since it holds a single agent's
+  conversations at a time while "which conversation mentioned this" needs the ledger.
+  Read-only; `%` and `_` are matched **literally**, and the agent scope re-checks the
+  parsed card rather than the raw JSON — matching the raw row would also hit every key
+  name, so searching for `name` would return the entire registry.
+- **A confirmation gate on the two destructive capabilities.** `panel_delete_session` and
+  `panel_delete_agent` open this panel's own `confirmDialog` and wait up to 120 seconds.
+  A refusal comes back as `status: "rejected", reason: "denied"`, a timeout as
+  `reason: "busy"` — the model is told the truth (nothing happened), never "already
+  deleted". The gate is why model output is never parsed as a command: an instruction to
+  change the theme is a real function with a JSON Schema, decided by the executor.
+- **A dark theme.** The stylesheet had 27 hard-coded colours and two `:root` blocks; they
+  are now variables, with `[data-theme="dark"]` alongside a `prefers-color-scheme`
+  fallback for readers who have not chosen yet. Theme, like everything else above, is
+  reachable as `ui_theme`.
+- **One active tab.** Two tabs would each hold their own `sessionId`, transcript and
+  declaration, and would tell the person different things about the same conversation
+  ("this one says it was deleted, that one says it wasn't"). A `localStorage` lock with a
+  3-second heartbeat and a 10-second TTL elects one tab, ordered by `(startedAt, tabId)`
+  so simultaneous starts resolve the same way in both. The other tab keeps its button and
+  explains itself in a toast instead of looking broken.
+
+### Changed
+
+- `--agent-policy read|act|all|delegate` decides which tiers are declared at all — a
+  narrower policy means the functions do not exist for the model, not that they fail when
+  called. This is a smaller surface to reason about, and it shows up in the declaration.
+- The banner warns when `--aaas-url` points at a plaintext `ws://` on a non-loopback
+  host: that socket can drive every capability above.
+- **The assistant drawer is a chat, not a log.** Model turns render as Markdown through
+  the same renderer the conversation bubbles use — tables, code, links and quotes — instead
+  of showing the source. Its input is the conversation's composer (same border, padding,
+  autosize ceiling and send button) rather than a bare browser textarea, a turn in flight
+  shows one muted 「正在回答…」 line instead of a page that looks stuck, and a reader who
+  scrolled up is no longer dragged to the bottom by the next message. The drawer is 400px
+  wide, because a table in 360px is a column of single characters. A turn in flight
+  can be stopped from the header, and Escape closes the drawer and returns focus to
+  the button that opened it.
+
+### Notes
+
+- The feature is **absent when it cannot work**, not degraded: no aaas library, no server
+  listening, or `--no-agent` all resolve to `enabled: false` and no UI entry at all.
+- `panel_token` travels in the WebSocket query when the proxy is used, because
+  `new WebSocket()` cannot send a header. It therefore shows up in a reverse proxy's
+  access log — the built-in server does not log requests, but a proxy in front of it
+  usually logs the URI. That token also carries operator authority, so it must not be
+  reused as any other credential. A one-shot ticket is the fix if this ever matters;
+  the shape is already there (`GET /api/panel/agent` would return `?ticket=` instead).
+- Conversation transcripts for the drawer live in `localStorage` (the last 12 turns,
+  6000 characters), because `historyMode: "stateless"` requires the caller to resend
+  context each turn. No table was added to the ledger for this.
+
 ## [0.5.0] — 2026-11-11
 
 ### Added

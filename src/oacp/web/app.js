@@ -9,6 +9,7 @@ import { renderMarkdown } from "./md.js";
 const API = "/api/panel";
 const TOKEN_KEY = "oacp.token";
 const LANG_KEY = "oacp.lang";
+const THEME_KEY = "oacp.theme";
 const MANAGE_KEY = "oacp.manageTokens";
 
 // 图片：真正的上限由 /summary 给出（服务端是唯一真源），这里的值是「还没拿到
@@ -117,6 +118,23 @@ const DICT = {
     "time.just": "刚刚",
     "time.minutes": "{n} 分钟前",
     "time.hours": "{n} 小时前",
+    "agent.title": "助手",
+    "agent.drawer": "内置助手",
+    "agent.close": "关闭",
+    "agent.input": "内置助手输入框",
+    "agent.online": "在线",
+    "agent.offline": "未连接",
+    "agent.elsewhere": "助手在另一个标签页运行",
+    "agent.ready": "已连接，{n} 个能力可用",
+    "agent.thinking": "正在回答…",
+    "agent.placeholder": "问我面板里的事，或让我操作界面",
+    "agent.clear": "清空",
+    "agent.stop": "停止",
+    "agent.cleared": "对话已清空",
+    "agent.cancelled": "这一轮被取消了",
+    "agent.failed": "这一轮失败了",
+    "agent.empty": "这一轮没有文字输出",
+    "agent.confirm.ok": "确认",
     "error.generic": "出错了",
   },
   en: {
@@ -215,6 +233,23 @@ const DICT = {
     "time.just": "just now",
     "time.minutes": "{n} min ago",
     "time.hours": "{n} h ago",
+    "agent.title": "Assistant",
+    "agent.drawer": "Assistant panel",
+    "agent.close": "Close",
+    "agent.input": "Message to the assistant",
+    "agent.online": "online",
+    "agent.offline": "not connected",
+    "agent.elsewhere": "The assistant is running in another tab",
+    "agent.ready": "connected, {n} capabilities available",
+    "agent.thinking": "Answering…",
+    "agent.placeholder": "Ask about this panel, or tell me to change it",
+    "agent.clear": "Clear",
+    "agent.stop": "Stop",
+    "agent.cleared": "Conversation cleared",
+    "agent.cancelled": "The turn was cancelled",
+    "agent.failed": "The turn failed",
+    "agent.empty": "The turn produced no text",
+    "agent.confirm.ok": "Confirm",
     "error.generic": "Something went wrong",
   },
 };
@@ -279,10 +314,13 @@ function relTime(value) {
 function toast(message, kind = "ok") {
   const root = $("#toast-root");
   const node = document.createElement("div");
-  node.className = `toast ${kind === "error" ? "error" : ""}`;
+  node.className = "toast";
+  if (kind === "error" || kind === "warn") node.classList.add(kind);
   node.textContent = message;
   root.appendChild(node);
-  setTimeout(() => node.remove(), kind === "error" ? 5000 : 2400);
+  // A warning is something to act on ("the assistant is in another tab"), so it
+  // lives as long as an error rather than blinking past.
+  setTimeout(() => node.remove(), kind === "ok" ? 2400 : 5000);
 }
 
 function autosize(textarea) {
@@ -362,11 +400,32 @@ function applyLang() {
   if (toggle) toggle.textContent = lang === "zh" ? "English" : "中文";
 }
 
+/**
+ * Apply a theme. `auto` removes the attribute so the stylesheet's
+ * prefers-color-scheme block decides — the same block that already existed.
+ */
+function applyTheme(theme, { persist = true } = {}) {
+  const value = theme === "light" || theme === "dark" ? theme : "auto";
+  if (value === "auto") delete document.documentElement.dataset.theme;
+  else document.documentElement.dataset.theme = value;
+  if (persist) {
+    try {
+      localStorage.setItem(THEME_KEY, value);
+    } catch {
+      /* private mode: the choice still holds for this page view */
+    }
+  }
+  return value;
+}
+
 function setLang(next) {
   lang = next === "en" ? "en" : "zh";
   localStorage.setItem(LANG_KEY, lang);
   applyLang();
   renderAll();
+  // The drawer's hint and thinking line are written by script, not `data-i18n`;
+  // without this they keep the language they were last written in.
+  if (window.oacp && window.oacp.agent && window.oacp.agent.relabel) window.oacp.agent.relabel();
   const input = $("#input");
   if (input) autosize(input);
 }
@@ -1001,6 +1060,12 @@ async function handleAction(action) {
 
 function openModal(html) {
   const root = $("#modal-root");
+  // Another dialog is about to take `#modal-root`. If a confirmation was pending
+  // there, settle it now as unanswered: leaving it armed would fire the model's
+  // canceller later, when an unrelated dialog is closed.
+  const pending = confirmCanceller;
+  confirmCanceller = null;
+  if (pending) pending();
   root.innerHTML = `<div class="modal-backdrop" data-close="1">
     <div class="modal" role="dialog" aria-modal="true">${html}</div>
   </div>`;
@@ -1009,12 +1074,20 @@ function openModal(html) {
   if (focusable) setTimeout(() => focusable.focus(), 0);
 }
 
+//: Who to tell when the dialog goes away without a decision (backdrop, Escape,
+//: the close button). Without this a gated delete would look cancelled to the
+//: user and still be pending to the model — for up to its 120s timeout.
+let confirmCanceller = null;
+
 function closeModal() {
+  const cancel = confirmCanceller;
+  confirmCanceller = null;
   $("#modal-root").innerHTML = "";
   document.body.style.overflow = "";
+  if (cancel) cancel();
 }
 
-function confirmDialog({ title, sub, ok, onConfirm }) {
+function confirmDialog({ title, sub, ok, onConfirm, onCancel }) {
   openModal(`
     <h2>${esc(title)}</h2>
     <p class="sub">${esc(sub)}</p>
@@ -1022,7 +1095,10 @@ function confirmDialog({ title, sub, ok, onConfirm }) {
       <button class="btn ghost" data-close="1" type="button">${esc(t("cancel"))}</button>
       <button class="btn primary" id="confirm-ok" type="button">${esc(ok)}</button>
     </footer>`);
+  // Armed after mounting: `openModal` settles (and clears) the previous one.
+  confirmCanceller = onCancel || null;
   $("#confirm-ok").addEventListener("click", () => {
+    confirmCanceller = null;
     closeModal();
     onConfirm();
   });
@@ -1307,10 +1383,73 @@ function bindDom() {
 
 async function boot() {
   applyLang();
+  try {
+    const storedTheme = localStorage.getItem(THEME_KEY);
+    if (storedTheme) applyTheme(storedTheme, { persist: false });
+  } catch {
+    /* no storage: follow the system preference */
+  }
   bindDom();
   await loadSummary();
   await loadAgents().catch((error) => toast(error.message, "error"));
   await route();
+  startAgent();
+}
+
+/* ------------------------------------------------- 内置助手（agent native）
+ *
+ * The drawer is the only module that may touch the page from the agent side, so
+ * it gets one explicit façade instead of reaching into this file's closures.
+ * Everything here already existed; nothing is exported from app.js itself, which
+ * keeps the page a page rather than a library.
+ */
+
+window.oacp = {
+  api,
+  go,
+  state,
+  t,
+  toast,
+  setLang,
+  setTheme: applyTheme,
+  renderAll,
+  openModal,
+  closeModal,
+  confirmDialog,
+  lang: () => lang,
+  panelToken: () => localStorage.getItem(TOKEN_KEY) || "",
+  // The assistant removes agents through the same endpoint the page does, so it
+  // needs the same per-agent manage token; without it a network-exposed panel
+  // answers 401 to the assistant while a manual removal succeeds.
+  manageToken: (id) => {
+    try {
+      const tokens = JSON.parse(localStorage.getItem(MANAGE_KEY) || "{}");
+      return tokens[id] || "";
+    } catch {
+      return "";
+    }
+  },
+};
+
+async function startAgent() {
+  let panel = null;
+  try {
+    // Imported lazily. A static import would make a parse or evaluation error in the
+    // assistant's modules abort *this* module before `boot()` ever runs — a blank
+    // panel, which is the one failure "never a precondition" promises not to happen.
+    const { createAgentPanel } = await import("./agent/panel.js");
+    panel = createAgentPanel({ host: window.oacp });
+    panel.bind();
+  } catch (error) {
+    // Absent, not broken: the page must still be the page. But a module that fails to
+    // import or start is a bug, not "feature disabled", and silence would hide it.
+    console.warn("assistant panel unavailable", error);
+    return;
+  }
+  window.oacp.agent = panel;
+  // Deliberately not awaited — connecting must never delay first paint, and a
+  // server that is not there must not surface as an error on an unrelated page.
+  panel.boot().catch((error) => console.warn("assistant panel failed to start", error));
 }
 
 boot();

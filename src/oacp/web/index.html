@@ -36,6 +36,9 @@
       <div class="side-foot">
         <button class="btn ghost" id="add-agent" type="button" data-i18n="add">添加智能体</button>
         <button class="btn ghost" id="lang" type="button">English</button>
+        <!-- 内置助手的入口：只有确认它能连上才出现（连不上 = 没有这个功能），
+             所以这里一开始是 hidden，由 agent/panel.js 决定是否揭开。 -->
+        <button class="btn ghost" id="agent" type="button" data-i18n="agent.title" hidden>助手</button>
       </div>
     </aside>
 
@@ -55,6 +58,26 @@
       </form>
     </main>
   </div>
+
+  <aside class="agent-drawer" id="agent-drawer" hidden aria-label="内置助手" data-i18n-aria="agent.drawer" role="dialog" aria-modal="false">
+    <header class="agent-head">
+      <span class="agent-dot" id="agent-dot" data-state="offline"></span>
+      <strong><span id="agent-title" data-i18n="agent.title">助手</span><span id="agent-model"></span></strong>
+      <span class="agent-hint" id="agent-hint"></span>
+      <button class="link" id="agent-stop" type="button" data-i18n="agent.stop" hidden>停止</button>
+      <button class="link" id="agent-clear" type="button" data-i18n="agent.clear">清空</button>
+      <button class="link" id="agent-close" type="button" aria-label="关闭" data-i18n-aria="agent.close">✕</button>
+    </header>
+    <div class="agent-log" id="agent-log" aria-live="polite"></div>
+    <!-- 输入区复用主对话的 composer 类：同一个边框、同一套自增高高度、同一个发送按钮。
+         助手不接收图片，所以这里没有附件按钮 —— 点了没反应的按钮比没有更糟。 -->
+    <form class="composer agent-compose" id="agent-form">
+      <div class="composer-inner">
+        <textarea id="agent-input" rows="1" aria-label="内置助手输入框" data-i18n-aria="agent.input" data-i18n-ph="agent.placeholder" placeholder="问我面板里的事，或让我操作界面"></textarea>
+        <button class="btn primary" id="agent-send" type="submit" data-i18n="send">发送</button>
+      </div>
+    </form>
+  </aside>
 
   <div id="modal-root"></div>
   <div id="toast-root" class="toast-root" aria-live="polite"></div>

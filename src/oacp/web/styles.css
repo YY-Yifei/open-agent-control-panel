@@ -1,6 +1,14 @@
 /* 智能体面板 —— 素净的通知式布局：左栏选智能体与会话，右栏对话。
    没有框架、没有构建步骤；一个文件，读得完。 */
 
+/* `hidden` is the switch the agent drawer uses, and an author `display` rule
+   (`.btn { display: inline-flex }`) beats the UA `[hidden]` one — without this
+   reset the assistant entry shows on a deployment where the feature is off, and
+   the drawer never closes. */
+[hidden] {
+  display: none !important;
+}
+
 :root {
   --bg: #ffffff;
   --bg-soft: #f6f7f9;
@@ -12,13 +20,36 @@
   --accent-soft: #eef3ff;
   --danger: #b42318;
   --danger-soft: #fef3f2;
+  --ok: #17a34a;
+  --down: #d92d20;
+  --on-accent: #ffffff;
+  --overlay: rgba(15, 18, 22, .38);
+  --shadow: rgba(0, 0, 0, .18);
   --radius: 8px;
   --font: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
+:root[data-theme="dark"] {
+  --bg: #17191c;
+  --bg-soft: #1e2125;
+  --bg-hover: #262a2f;
+  --line: #2f343a;
+  --text: #e6e8ea;
+  --muted: #9aa1a9;
+  --accent: #6b9bff;
+  --accent-soft: #1d2738;
+  --danger: #ff8f85;
+  --danger-soft: #2b1b1a;
+  --ok: #4ade80;
+  --down: #ff8f85;
+  --on-accent: #0f1115;
+}
+
+/* No choice stored (or "auto") = follow the system; an explicit light choice
+   must win over a dark system preference. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #17191c;
     --bg-soft: #1e2125;
     --bg-hover: #262a2f;
@@ -29,6 +60,9 @@
     --accent-soft: #1d2738;
     --danger: #ff8f85;
     --danger-soft: #2b1b1a;
+    --ok: #4ade80;
+    --down: #ff8f85;
+    --on-accent: #0f1115;
   }
 }
 
@@ -181,11 +215,11 @@ a { color: inherit; text-decoration: none; }
   margin-top: 6px;
   flex: none;
   border-radius: 50%;
-  background: #b9bec6;
+  background: var(--muted);
 }
 
-.dot.ok { background: #17a34a; }
-.dot.down { background: #d92d20; }
+.dot.ok { background: var(--ok); }
+.dot.down { background: var(--down); }
 .dot.working { background: var(--accent); }
 
 .side-foot {
@@ -293,7 +327,7 @@ a { color: inherit; text-decoration: none; }
 
 .msg.user .bubble {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .msg.agent .bubble {
@@ -397,7 +431,7 @@ a { color: inherit; text-decoration: none; }
 .btn.primary {
   border-color: transparent;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .btn.primary:hover { filter: brightness(1.05); }
@@ -441,7 +475,7 @@ a { color: inherit; text-decoration: none; }
   align-items: center;
   justify-content: center;
   padding: 20px;
-  background: rgba(15, 18, 22, .38);
+  background: var(--overlay);
 }
 
 .modal {
@@ -451,7 +485,7 @@ a { color: inherit; text-decoration: none; }
   border-radius: 10px;
   background: var(--bg);
   border: 1px solid var(--line);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, .18);
+  box-shadow: 0 12px 32px var(--shadow);
 }
 
 .modal h2 {
@@ -540,10 +574,10 @@ a { color: inherit; text-decoration: none; }
 .toast {
   padding: 8px 14px;
   border-radius: 999px;
-  background: #1f2328;
-  color: #fff;
+  background: var(--text);
+  color: var(--on-accent);
   font-size: 12px;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, .2);
+  box-shadow: 0 6px 18px var(--shadow);
 }
 
 .toast.error { background: var(--danger); }
@@ -565,51 +599,52 @@ a { color: inherit; text-decoration: none; }
   .composer { padding: 8px 12px 12px; }
 }
 
-/* ── 气泡里的 Markdown ──────────────────────────────────────────────
-   .bubble 默认 pre-wrap（用户输入按原样换行）；md 气泡改回 normal，
-   排版交给 <p> / <br>。层级只有一层，嵌套列表不支持，所以这里也没有
-   嵌套选择器。 */
+/* ── 消息里的 Markdown ──────────────────────────────────────────────
+   `.md` 是唯一的 Markdown 容器类：主对话的气泡和内置助手的回复都用它，
+   于是两处不会各自长成一套排版。普通气泡默认 pre-wrap（用户输入按原样
+   换行）；带 `.md` 的改回 normal，排版交给 <p> / <br>。层级只有一层，
+   嵌套列表不支持，所以这里也没有嵌套选择器。 */
 
-.bubble.md {
+.md {
   white-space: normal;
 }
 
-.bubble.md > :first-child { margin-top: 0; }
-.bubble.md > :last-child { margin-bottom: 0; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
 
-.bubble.md p {
+.md p {
   margin: 0 0 8px;
 }
 
-.bubble.md h1,
-.bubble.md h2,
-.bubble.md h3,
-.bubble.md h4,
-.bubble.md h5,
-.bubble.md h6 {
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
   margin: 12px 0 6px;
   font-weight: 600;
   line-height: 1.35;
 }
 
-.bubble.md h1 { font-size: 17px; }
-.bubble.md h2 { font-size: 16px; }
-.bubble.md h3 { font-size: 15px; }
-.bubble.md h4,
-.bubble.md h5,
-.bubble.md h6 { font-size: 14px; }
+.md h1 { font-size: 17px; }
+.md h2 { font-size: 16px; }
+.md h3 { font-size: 15px; }
+.md h4,
+.md h5,
+.md h6 { font-size: 14px; }
 
-.bubble.md ul,
-.bubble.md ol {
+.md ul,
+.md ol {
   margin: 0 0 8px;
   padding-left: 22px;
 }
 
-.bubble.md li {
+.md li {
   margin: 2px 0;
 }
 
-.bubble.md code {
+.md code {
   padding: 1px 4px;
   border-radius: 4px;
   background: var(--bg-hover);
@@ -617,7 +652,7 @@ a { color: inherit; text-decoration: none; }
   font-size: 12.5px;
 }
 
-.bubble.md pre {
+.md pre {
   margin: 0 0 8px;
   padding: 10px 12px;
   border: 1px solid var(--line);
@@ -626,7 +661,7 @@ a { color: inherit; text-decoration: none; }
   overflow-x: auto;
 }
 
-.bubble.md pre code {
+.md pre code {
   padding: 0;
   background: none;
   font-size: 12.5px;
@@ -634,26 +669,26 @@ a { color: inherit; text-decoration: none; }
   white-space: pre;
 }
 
-.bubble.md blockquote {
+.md blockquote {
   margin: 0 0 8px;
   padding: 2px 0 2px 10px;
   border-left: 3px solid var(--line);
   color: var(--muted);
 }
 
-.bubble.md hr {
+.md hr {
   margin: 10px 0;
   border: 0;
   border-top: 1px solid var(--line);
 }
 
-.bubble.md a {
+.md a {
   color: var(--accent);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
 
-.bubble.md img {
+.md img {
   max-width: 100%;
   height: auto;
   border-radius: 6px;
@@ -661,7 +696,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 /* 表格可能比气泡宽：让它自己横向滚，而不是把整个列撑开。 */
-.bubble.md table {
+.md table {
   display: block;
   max-width: 100%;
   overflow-x: auto;
@@ -670,20 +705,22 @@ a { color: inherit; text-decoration: none; }
   font-size: 13px;
 }
 
-.bubble.md th,
-.bubble.md td {
+.md th,
+.md td {
   padding: 4px 8px;
   border: 1px solid var(--line);
   text-align: left;
 }
 
-.bubble.md th {
+.md th {
   background: var(--bg-hover);
   font-weight: 600;
+  /* Headers are short words; letting them break turns a column name into a vertical stack. */
+  white-space: nowrap;
 }
 
-.bubble.md .ta-center { text-align: center; }
-.bubble.md .ta-right { text-align: right; }
+.md .ta-center { text-align: center; }
+.md .ta-right { text-align: right; }
 
 
 /* -------------------------------------------------------------- 图片附件 */
@@ -808,4 +845,129 @@ a { color: inherit; text-decoration: none; }
   border-radius: var(--radius);
   font-size: 12px;
   color: var(--muted);
+}
+
+/* ------------------------------------------------------- 内置助手（抽屉） */
+
+/* The entry sits with the other two foot buttons and is `hidden` until the page
+   knows the assistant exists. Not greyed out: a disabled button on every panel
+   would advertise a feature most deployments do not have. */
+#agent.online { color: var(--accent); border-color: var(--accent); }
+
+.agent-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 400px;
+  max-width: 92vw;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border-left: 1px solid var(--line);
+  box-shadow: -8px 0 24px var(--shadow);
+  /* Below .modal-backdrop (20) and .toast-root (30). The drawer's destructive
+     calls are confirmed in the page's own dialog, and a dialog behind the
+     drawer cannot be answered — the model then waits out its budget for
+     nothing. Toasts the drawer itself raises have the same problem. */
+  z-index: 15;
+}
+
+.agent-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-soft);
+}
+
+.agent-head strong { font-size: 13px; }
+
+.agent-hint {
+  flex: 1;
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.agent-dot[data-state="online"] { background: var(--ok); }
+.agent-dot[data-state="offline"] { background: var(--down); }
+.agent-dot[data-state="elsewhere"] { background: var(--accent); }
+
+.agent-log {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-msg {
+  max-width: 88%;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+}
+
+.agent-msg.user { align-self: flex-end; background: var(--accent-soft); }
+/* `.agent-msg` is pre-wrap so notes and errors keep their line breaks; a model
+   turn is laid out by the Markdown renderer instead. This rule sits after it on
+   purpose — same specificity, so order is what decides. */
+.agent-msg.md { white-space: normal; }
+.agent-msg.agent { align-self: flex-start; background: var(--bg-soft); border: 1px solid var(--line); }
+.agent-msg.note { align-self: center; color: var(--muted); font-size: 12px; padding: 2px; }
+.agent-msg.error { align-self: stretch; background: var(--danger-soft); color: var(--danger); font-size: 12px; }
+
+/* A called capability is shown, not hidden: "agent native" is only believable if
+   the user can see what ran, with what, and how long it took. */
+.agent-chip {
+  align-self: flex-start;
+  max-width: 96%;
+  padding: 4px 8px;
+  border: 1px dashed var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-chip.error { border-color: var(--danger); color: var(--danger); }
+.agent-chip.rejected { border-style: dotted; }
+
+/* It carries `.composer` / `.composer-inner` so border, padding, autosize ceiling
+   and button placement are the same object as the conversation below — only the
+   side padding narrows, because the drawer is not the whole window. */
+.agent-compose {
+  padding: 10px 12px 12px;
+}
+
+.agent-modal-body {
+  white-space: pre-wrap;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+/* .toast is a filled pill with no border: colour has to be the fill. */
+.toast.warn { background: var(--accent); }
+
+@media (max-width: 720px) {
+  .agent-drawer { width: 100vw; max-width: 100vw; }
 }

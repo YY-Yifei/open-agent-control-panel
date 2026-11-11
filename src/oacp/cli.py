@@ -11,7 +11,7 @@ from typing import Sequence
 from urllib.parse import urlsplit
 
 from . import __version__
-from .config import Settings
+from .config import AGENT_POLICIES, Settings
 
 LOG_LEVELS = ["critical", "error", "warning", "info", "debug", "trace"]
 
@@ -78,6 +78,30 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="stop offering callback URLs; tasks are then only updated when asked",
     )
+    serve.add_argument(
+        "--aaas-url",
+        dest="aaas_url",
+        help="aaas server the built-in assistant connects to (default: ws://localhost:8888)",
+    )
+    serve.add_argument(
+        "--aaas-token",
+        dest="aaas_token",
+        help="bearer token for that server; the panel then proxies the socket so the"
+        " token never reaches the browser",
+    )
+    serve.add_argument(
+        "--agent-policy",
+        dest="agent_policy",
+        choices=sorted(AGENT_POLICIES),
+        help="how much of the panel the assistant may touch (default: act)",
+    )
+    serve.add_argument(
+        "--no-agent",
+        dest="no_agent",
+        action="store_true",
+        default=None,
+        help="switch the built-in assistant off entirely",
+    )
     serve.add_argument("--probe-interval", type=int, dest="probe_interval", help="probe interval in seconds")
     serve.add_argument("--a2a-timeout", type=float, dest="a2a_timeout", help="A2A request timeout in seconds")
     serve.add_argument("--log-level", default="info", choices=LOG_LEVELS, help="log level (default: info)")
@@ -106,6 +130,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "probe_interval": args.probe_interval,
         "a2a_timeout": args.a2a_timeout,
         "push_enabled": _push_override(args),
+        "aaas_url": args.aaas_url,
+        "aaas_token": args.aaas_token,
+        "agent_policy": args.agent_policy,
+        "agent_enabled": False if args.no_agent else None,
     }
 
     # A loopback bind is reachable only from this machine, so the SSRF battery
@@ -141,6 +169,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"  registry API : {settings.api_base}")
     print(f"  database     : {settings.db_path}")
     for line in _push_banner(settings, args.host):
+        print(line)
+    for line in _agent_banner(settings):
         print(line)
     if settings.local_mode:
         print(
@@ -197,6 +227,27 @@ def _push_banner(settings: Settings, bind_host: str) -> list[str]:
             " pass --public-url to offer a reachable one",
         ]
     return [f"  callbacks    : {base}"]
+
+
+def _agent_banner(settings: Settings) -> list[str]:
+    """Where the assistant connects, and when that address is a bad idea.
+
+    A cleartext ``ws://`` to anything but loopback puts every panel query the
+    model makes on the wire — worth one line, not a refusal: the operator may be
+    on a trusted network and knows the trade-off.
+    """
+    if not settings.agent_enabled:
+        return ["  assistant    : off (--no-agent)"]
+    parts = urlsplit(settings.aaas_url)
+    suffix = " via same-origin proxy" if settings.aaas_token else ""
+    line = f"  assistant    : {settings.aaas_url} ({settings.agent_policy}){suffix}"
+    if parts.scheme == "ws" and not _is_loopback_host(parts.hostname or ""):
+        return [
+            line,
+            "                 cleartext ws:// to a non-loopback host — every panel"
+            " query travels in the clear; use wss:// if that matters",
+        ]
+    return [line]
 
 
 def _local_mode_overrides(args: argparse.Namespace) -> dict[str, bool]:

@@ -213,6 +213,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # panel token, and it is mounted before the protected surface on purpose.
     app.include_router(push_router)
     app.include_router(api.router, dependencies=[Depends(api.require_panel_token)])
+    # The assistant's socket carries its own gate (same-origin, plus the panel
+    # token in the query when one is set): a browser cannot send headers on a
+    # WebSocket handshake, and the Request-based dependency above cannot run
+    # on a socket route at all.
+    app.include_router(api.agent_ws_router)
 
     @app.exception_handler(RegistryError)
     async def _registry_error(_request: Request, exc: RegistryError) -> JSONResponse:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "open-agent-control-panel"
-version = "0.5.0"
+version = "0.6.0"
 description = "A control panel for A2A agents: register, discover, submit tasks and follow them."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -45,6 +45,10 @@ dev = [
     "pytest>=8.0",
     "twine>=5.0",
 ]
+# Only needed to proxy the assistant's socket when the aaas server wants a
+# bearer token. Every other path — including a token-free aaas — works
+# without it, so it is an extra rather than a dependency.
+agent = ["websockets>=13"]
 
 [project.scripts]
 oacp = "oacp.cli:main"
@@ -58,7 +62,7 @@ include-package-data = true
 where = ["src"]
 
 [tool.setuptools.package-data]
-oacp = ["web/*.html", "web/*.css", "web/*.js", "web/*.svg"]
+oacp = ["web/*.html", "web/*.css", "web/*.js", "web/*.svg", "web/agent/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -13,10 +13,12 @@ human-readable message — see ``oacp.errors`` for the catalog.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from typing import Any
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Body, Depends, Header, Query, Request, Response
+from fastapi import APIRouter, Body, Depends, Header, Query, Request, Response, WebSocket
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -560,3 +562,347 @@ def delete_session(request: Request, session_id: str) -> Response:
     """Forget a conversation; the agent keeps its own copy of what was said."""
     _sessions(request).delete(session_id)
     return Response(status_code=204)
+
+
+# ------------------------------------------------------------------------ agent
+#
+# The built-in assistant (docs/agent-native.md). The **browser** is the WebSocket
+# caller of an ``aaas`` server: these endpoints only answer where to connect and
+# what the panel holds. The capability list is built in the page
+# (``web/agent/catalog.js``) because nine of those abilities — theme, language,
+# system notification, draft, download — exist nowhere else.
+#
+# ``agent_policy`` is therefore applied where the declarations are built, not
+# here. That is honest rather than lax: the page already holds the panel token,
+# so it is the same authority as this process. The policy limits what a *model*
+# is offered, and the confirm gate is what stops a mistaken call from landing.
+
+#: Where the page connects when the aaas server expects a bearer token. The token
+#: stays in this process; the browser only ever sees this same-origin path.
+PROXY_PATH = "/api/panel/agent/ws"
+
+#: Wire subprotocol of that socket (``aaas.SUBPROTOCOL``). Spelled out because the
+#: panel does not depend on the SDK just to serve its own pages.
+SUBPROTOCOL = "aaas.v1"
+
+#: How many rows one search scope scans before the needle is judged against the
+#: parsed record. Bounded so a one-letter query cannot walk the whole ledger.
+SEARCH_SCAN = 200
+
+
+@router.get("/agent")
+def agent_config(request: Request) -> dict[str, Any]:
+    """Where the drawer should connect, resolved here so the page never guesses.
+
+    ``wsUrl`` is the whole answer: the aaas URL when the server takes no token,
+    otherwise this proxy's path. The browser has exactly one source of truth, and
+    an unconfigured or switched-off deployment says ``enabled: false`` — the page
+    then shows no entry at all rather than a button that cannot work.
+    """
+    settings = request.app.state.settings
+    if not settings.agent_enabled:
+        return {
+            "enabled": False,
+            "wsUrl": None,
+            "viaProxy": False,
+            "policy": settings.agent_policy,
+            "modelHint": "",
+        }
+    if settings.aaas_token:
+        # A same-origin *path*, resolved by the browser against its own origin.
+        # Building an absolute URL here would mean trusting `Host` (client-supplied)
+        # or `request.url.scheme` (wrong behind a TLS-terminating proxy) — and the
+        # page appends its panel token to whatever we return, so a rewritten Host
+        # would hand that credential to another authority.
+        return {
+            "enabled": True,
+            "wsUrl": PROXY_PATH,
+            "viaProxy": True,
+            "policy": settings.agent_policy,
+            "modelHint": settings.agent_model_hint,
+        }
+    return {
+        "enabled": True,
+        "wsUrl": settings.aaas_url,
+        "viaProxy": False,
+        "policy": settings.agent_policy,
+        "modelHint": settings.agent_model_hint,
+    }
+
+
+def _like_pattern(needle: str) -> str:
+    """A LIKE pattern matching the needle literally.
+
+    ``%`` and ``_`` are wildcards, so an unescaped search for ``a_b`` would match
+    ``axb`` and a lone ``%`` would match the entire ledger — a wrong answer that
+    looks like a working one.
+    """
+    escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _haystack_matches(needle: str, *fields: Any) -> bool:
+    """Case-insensitive substring test over the given fields."""
+    lowered = needle.lower()
+    return any(lowered in str(field or "").lower() for field in fields)
+
+
+@router.get("/search")
+def search(
+    request: Request,
+    q: str = Query(min_length=1, max_length=100),
+    scope: str = Query(default="all", pattern="^(all|agents|sessions|tasks)$"),
+    limit: int = Query(default=20, ge=1, le=50),
+) -> dict[str, Any]:
+    """Find agents, conversations and tasks by any word they contain.
+
+    This is the one read the page could not do itself: the browser holds a single
+    agent's conversations at a time, so "which conversation mentioned this" needs
+    the ledger. Read-only, three bounded scans, and the agent scope re-checks the
+    parsed card — matching the raw JSON would also hit every key name (``name``,
+    ``skills``) and hand back the whole registry for a query like "name".
+    """
+    needle = q.strip()
+    if not needle:
+        # ``q=%20`` passes ``min_length=1`` before the strip, and an empty needle
+        # becomes ``%%`` — a wildcard that matches every row in all three scopes.
+        return {
+            "q": "",
+            "scope": scope,
+            "counts": {"agents": 0, "sessions": 0, "tasks": 0},
+            "agents": [],
+            "sessions": [],
+            "tasks": [],
+        }
+    pattern = _like_pattern(needle)
+    database = request.app.state.db
+
+    agent_items: list[dict[str, Any]] = []
+    session_items: list[dict[str, Any]] = []
+    task_items: list[dict[str, Any]] = []
+
+    with database.connect() as connection:
+        if scope in ("all", "agents"):
+            rows = connection.execute(
+                "SELECT id, url, card, status FROM agents"
+                " WHERE id LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\'"
+                " OR card LIKE ? ESCAPE '\\'"
+                " ORDER BY first_seen_at DESC LIMIT ?",
+                (pattern, pattern, pattern, SEARCH_SCAN),
+            ).fetchall()
+            for row in rows:
+                card = json_loads(row["card"], {})
+                name = str(card.get("name") or "")
+                description = str(card.get("description") or "")
+                skills = [
+                    str(skill.get("name") or "")
+                    for skill in (card.get("skills") or [])
+                    if isinstance(skill, dict)
+                ]
+                if not _haystack_matches(needle, row["id"], row["url"], name, description, *skills):
+                    continue
+                agent_items.append(
+                    {
+                        "id": row["id"],
+                        "name": name or row["id"],
+                        "url": row["url"],
+                        "status": row["status"],
+                    }
+                )
+
+        if scope in ("all", "sessions"):
+            rows = connection.execute(
+                "SELECT id, agent_id, agent_name, title, state, updated_at, message_count"
+                " FROM sessions WHERE id LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\'"
+                " OR agent_name LIKE ? ESCAPE '\\'"
+                " ORDER BY updated_at DESC LIMIT ?",
+                (pattern, pattern, pattern, SEARCH_SCAN),
+            ).fetchall()
+            session_items = [
+                {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "agentId": row["agent_id"],
+                    "agentName": row["agent_name"],
+                    "state": row["state"],
+                    "updatedAt": row["updated_at"],
+                    "messageCount": row["message_count"],
+                }
+                for row in rows
+            ]
+
+        if scope in ("all", "tasks"):
+            rows = connection.execute(
+                "SELECT id, agent_id, agent_name, title, state, created_at, session_id"
+                " FROM tasks WHERE id LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\'"
+                " OR input_text LIKE ? ESCAPE '\\' OR agent_name LIKE ? ESCAPE '\\'"
+                " ORDER BY created_at DESC LIMIT ?",
+                (pattern, pattern, pattern, pattern, SEARCH_SCAN),
+            ).fetchall()
+            task_items = [
+                {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "agentId": row["agent_id"],
+                    "agentName": row["agent_name"],
+                    "state": row["state"],
+                    "createdAt": row["created_at"],
+                    "sessionId": row["session_id"],
+                }
+                for row in rows
+            ]
+
+    return {
+        "q": needle,
+        "scope": scope,
+        "counts": {
+            "agents": len(agent_items),
+            "sessions": len(session_items),
+            "tasks": len(task_items),
+        },
+        "agents": agent_items[:limit],
+        "sessions": session_items[:limit],
+        "tasks": task_items[:limit],
+    }
+
+
+# ---------------------------------------------------------------- agent: socket
+#
+# Mounted separately from ``router`` on purpose. The panel-token dependency takes
+# a ``Request``, which a WebSocket route cannot supply; and this route has its own
+# gate anyway (same-origin, plus the panel token in the query when one is set,
+# because ``new WebSocket()`` cannot send headers).
+
+agent_ws_router = APIRouter(prefix="/api/panel", tags=["panel"])
+
+
+def _same_origin(websocket: WebSocket) -> bool:
+    """True when the page that opened this socket came from this deployment.
+
+    A browser always sends ``Origin`` on a WebSocket handshake, and a page on
+    another site can reach ``ws://127.0.0.1:PORT`` just as easily as the panel
+    can. Without this check, any web page the operator happens to open could
+    drive the assistant — and through it, the registry. No header at all means a
+    non-browser client, where the token check is the only gate.
+    """
+    origin = websocket.headers.get("origin")
+    if not origin:
+        return True
+    host = (websocket.headers.get("host") or "").lower()
+    return urlsplit(origin).netloc.lower() == host
+
+
+async def _pump_client_to_upstream(client: WebSocket, upstream: Any) -> None:
+    """Forward browser frames upstream until either side goes away."""
+    try:
+        while True:
+            message = await client.receive()
+            if message["type"] == "websocket.disconnect":
+                return
+            if message.get("text") is not None:
+                await upstream.send(message["text"])
+            elif message.get("bytes") is not None:
+                await upstream.send(message["bytes"])
+    except Exception:  # noqa: BLE001 - a closed peer is a normal end, not a fault
+        return
+
+
+async def _pump_upstream_to_client(client: WebSocket, upstream: Any) -> None:
+    """Forward upstream frames to the browser until either side goes away."""
+    try:
+        async for raw in upstream:
+            if isinstance(raw, (bytes, bytearray)):
+                await client.send_bytes(bytes(raw))
+            else:
+                await client.send_text(raw)
+    except Exception:  # noqa: BLE001 - same: this is the disconnect path
+        return
+
+
+@agent_ws_router.websocket("/agent/ws")
+async def agent_ws_proxy(websocket: WebSocket) -> None:
+    """Carry the aaas socket through this process, adding the bearer token.
+
+    Only mounted when an aaas token is configured — otherwise the page connects
+    to that server directly. The panel is still the *caller* in every sense that
+    matters: protocol framing, capability execution and event handling all happen
+    in the page. This is a byte pump, and the token never leaves this process.
+    """
+    settings = websocket.app.state.settings
+    if not settings.agent_enabled or not settings.aaas_token:
+        await websocket.close(code=4404)
+        return
+    if SUBPROTOCOL not in (websocket.scope.get("subprotocols") or []):
+        await websocket.close(code=4400)
+        return
+    if not _same_origin(websocket):
+        await websocket.close(code=4403)
+        return
+    if settings.panel_token:
+        supplied = websocket.query_params.get("token", "")
+        # Bytes, not str: `compare_digest` raises TypeError on non-ASCII text, and a
+        # query value is attacker-supplied — that would be a 500 instead of a 4401.
+        if not secrets.compare_digest(
+            supplied.encode("utf-8", "surrogatepass"),
+            settings.panel_token.encode("utf-8", "surrogatepass"),
+        ):
+            await websocket.close(code=4401)
+            return
+
+    try:
+        import websockets
+    except ImportError:  # pragma: no cover - optional dependency
+        # No client library, no proxy. The page falls back to "feature absent",
+        # which is the honest answer: it cannot reach a token-protected server.
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept(subprotocol=SUBPROTOCOL)
+    headers = {"Authorization": f"Bearer {settings.aaas_token}"}
+    try:
+        upstream = await websockets.connect(
+            settings.aaas_url,
+            subprotocols=[SUBPROTOCOL],
+            additional_headers=headers,
+            open_timeout=5,
+        )
+    except TypeError:  # pragma: no cover - websockets < 14
+        try:
+            upstream = await websockets.connect(
+                settings.aaas_url,
+                subprotocols=[SUBPROTOCOL],
+                extra_headers=headers,
+                open_timeout=5,
+            )
+        except Exception:
+            await websocket.close(code=1011, reason="upstream unreachable")
+            return
+    except Exception:
+        await websocket.close(code=1011, reason="upstream unreachable")
+        return
+
+    tasks = [
+        asyncio.create_task(_pump_client_to_upstream(websocket, upstream)),
+        asyncio.create_task(_pump_upstream_to_client(websocket, upstream)),
+    ]
+    try:
+        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    finally:
+        # Cancel and await *both* pumps here, not only on the normal return path:
+        # if this handler is cancelled while awaiting `asyncio.wait` (shutdown, or a
+        # dropped browser), the tasks would otherwise keep running against closed
+        # peers and their exceptions would never be retrieved.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await upstream.close()
+        except Exception:  # noqa: BLE001 - teardown must not raise
+            pass
+        try:
+            await websocket.close()
+        except Exception:  # noqa: BLE001 - already gone, most likely
+            pass

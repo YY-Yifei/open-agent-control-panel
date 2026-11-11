@@ -21,6 +21,12 @@ _FALSY = {"0", "false", "no", "off", ""}
 
 CARD_MODES = {"strict", "relaxed"}
 
+#: How much of the panel the built-in assistant may touch. Applied where the
+#: declarations are built (``web/agent/catalog.js``) — the browser holds the panel
+#: token already, so this is a product decision about how much surface to hand a
+#: model, not a security boundary we could enforce from here.
+AGENT_POLICIES = {"read", "act", "all", "delegate"}
+
 
 def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
@@ -105,6 +111,18 @@ class Settings:
     # the panel loses whole turns from agents that answer with a picture.
     max_push_bytes: int = 8 * 1024 * 1024
 
+    # Built-in assistant (agent native). The *browser* is the WebSocket caller of
+    # an ``aaas`` server — this deployment only says where that server is, and
+    # optionally proxies to it so a bearer token never reaches the page. An
+    # unreachable URL is not an error: the feature is simply absent and the rest
+    # of the panel behaves exactly as before (docs/agent-native.md).
+    agent_enabled: bool = True
+    aaas_url: str = "ws://localhost:8888"
+    aaas_token: str = ""
+    agent_policy: str = "act"
+    #: Free-text label the drawer shows for the model behind that server.
+    agent_model_hint: str = ""
+
     user_agent: str = f"open-agent-control-panel/{__version__}"
 
     def __post_init__(self) -> None:
@@ -118,6 +136,14 @@ class Settings:
             raise ValueError("probe_interval must be at least 5 seconds")
         if self.a2a_timeout <= 0:
             raise ValueError("a2a_timeout must be positive")
+        policy = str(self.agent_policy or "").strip().lower()
+        if policy not in AGENT_POLICIES:
+            raise ValueError(f"agent_policy must be one of {sorted(AGENT_POLICIES)}")
+        self.agent_policy = policy
+        url = str(self.aaas_url or "").strip()
+        if not url.startswith(("ws://", "wss://")):
+            raise ValueError("aaas_url must be an absolute ws:// or wss:// URL")
+        self.aaas_url = url
 
     # ------------------------------------------------------------------ derived
 
@@ -205,6 +231,7 @@ def _coerce(name: str, raw: str) -> Any:
         "probe_enabled",
         "push_enabled",
         "fetch_inbound_files",
+        "agent_enabled",
     }:
         return _as_bool(raw)
     return raw

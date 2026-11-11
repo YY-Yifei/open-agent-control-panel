@@ -160,6 +160,72 @@ method names and push tokens stay behind `/api/panel`; the page itself only ever
   `Accept-Language`, Chinese by default) and always carry a stable `code`; ADP `/v1` errors
   keep their English `code`/`message` contract, which the UI shows verbatim.
 
+## Agent Native
+
+The panel can also be *driven*: an external model calls the panel's own functions
+instead of only typing into it. The caller is the **browser**. It opens a WebSocket to an
+[aaas](https://pypi.org/project/aaas/) server, declares what it can do, and executes those
+functions when the model asks. The panel does not embed an agent loop, and the protocol
+lives in `web/agent/`, not on the server.
+
+The page is the caller because half of the useful capabilities only exist in a page:
+system notifications, the clipboard, a download, scrolling a row into view, writing a
+draft into the composer so you can finish it and press send. A server-side caller can
+reach the HTTP API and nothing else — and the panel *is* mostly the HTTP API, so that
+would buy a shell around `fetch`.
+
+### Connecting
+
+```bash
+oacp serve                                  # ws://localhost:8888 by default
+oacp serve --aaas-url ws://127.0.0.1:9999   # somewhere else
+oacp serve --no-agent                       # no entry in the UI at all
+```
+
+Nothing to install on this side. If the socket cannot be opened — no server listening, or
+no `aaas` library — the entry does not appear. An absent feature is honest; a button that
+cannot work is not.
+
+`GET /api/panel/agent` answers with the one URL the page should dial. With
+`--aaas-token` it points at this panel's `/api/panel/agent/ws` instead, a byte pump that
+adds the `Authorization` header the browser cannot set. The token never leaves the
+process, and never appears in a response body.
+
+### What the model can call
+
+| Tier | Count | Examples |
+| --- | --- | --- |
+| `ui_*` | 9 | `ui_theme`, `ui_notify`, `ui_open`, `ui_draft`, `ui_download`, `ui_modal` |
+| `panel_*` read | 8 | `panel_overview`, `panel_search`, `panel_list_agents`, `panel_get_session` |
+| `panel_*` act | 3 | `panel_rename_session`, `panel_refresh_agent`, `panel_cancel_session` |
+| `panel_*` destroy | 2 | `panel_delete_session`, `panel_delete_agent` |
+
+`--agent-policy` decides which tiers are *declared*: `read` (17), `act` (20, the default),
+`all` (22), `delegate` (23). A capability outside the policy does not exist for the model —
+it is not declared, so it cannot be called and cannot be dialectically talked around.
+
+`panel_send_message` — speaking to another agent in your name — is only declared under
+`delegate`. It is off by default because that is how two agents end up in a loop.
+
+### Two things the model may not do
+
+Deleting goes through the panel's own confirmation dialog, with a 120-second deadline. A
+refusal comes back as `rejected`/`denied`, a timeout as `rejected`/`busy`, and the model
+is told that **nothing was deleted**. It never gets to report a deletion that did not
+happen.
+
+Only one tab is connected at a time. Two tabs would each hold their own transcript and
+their own view of the same conversation, and would disagree in front of the person using
+them. A second tab keeps its button and says so in a toast.
+
+### Search
+
+`GET /api/panel/search?q=&scope=&limit=` spans agents, conversations and tasks. It is the
+one read the page could not do itself: the page holds a single agent's conversations,
+while "which conversation mentioned this" needs the ledger. It is read-only, treats `%`
+and `_` as literal characters, and re-checks the parsed card for the agent scope so that
+searching for `name` does not return every agent whose JSON contains that key.
+
 ## Protocol surface
 
 | Method | Path | Purpose |
