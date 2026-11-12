@@ -27,6 +27,10 @@ function fakeHost(overrides = {}) {
       calls.push({ download: id });
       return `file-${id}.png`;
     },
+    attach: async (id) => {
+      calls.push({ attach: id });
+      return `file-${id}.png`;
+    },
     clientInfo: () => ({ viewport: "800x600" }),
     confirm: async ({ title }) => {
       calls.push({ confirm: title });
@@ -39,7 +43,7 @@ function fakeHost(overrides = {}) {
 test("every declaration is a legal name with an object schema, and none repeat", () => {
   const { api, ui } = fakeHost();
   const catalog = createCatalog({ api, ui, policy: "delegate" });
-  assert.equal(catalog.declarations.length, 23);
+  assert.equal(catalog.declarations.length, 24);
   const names = catalog.declarations.map((item) => item.name);
   assert.equal(new Set(names).size, names.length, "duplicate function name");
   for (const declaration of catalog.declarations) {
@@ -56,11 +60,102 @@ test("the policy decides what is even declared", () => {
   for (const policy of ["read", "act", "all", "delegate"]) {
     sizes[policy] = createCatalog({ api, ui, policy }).declarations.length;
   }
-  assert.deepEqual(sizes, { read: 17, act: 20, all: 22, delegate: 23 });
+  assert.deepEqual(sizes, { read: 17, act: 21, all: 23, delegate: 24 });
   // The delegate capability is the one that can make one agent drive another.
   const all = createCatalog({ api, ui, policy: "all" }).names;
   assert.ok(!all.includes("panel_send_message"));
   assert.ok(POLICY_TIERS.read.length === 1);
+});
+
+test("ui_attach stays out of the read policy — staging a file is an act", () => {
+  const { api, ui } = fakeHost();
+  // The whole point of a separate name: `--agent-policy read` promises the page
+  // is read-only, and widening `ui_draft` with an attachment argument would have
+  // broken that promise without changing a single declaration count.
+  assert.ok(!createCatalog({ api, ui, policy: "read" }).names.includes("ui_attach"));
+  assert.ok(createCatalog({ api, ui, policy: "act" }).names.includes("ui_attach"));
+});
+
+test("ui_draft says whether it wrote or appended", async () => {
+  const { api, ui } = fakeHost();
+  const appended = createCatalog({ api, ui: { ...ui, draft: () => "appended" }, policy: "read" });
+  const fresh = createCatalog({ api, ui, policy: "read" });
+  const wrote = await appended.execute({ name: "ui_draft", arguments: { text: "hi" }, deadlineMs: 5000 });
+  const made = await fresh.execute({ name: "ui_draft", arguments: { text: "hi" }, deadlineMs: 5000 });
+  assert.equal(wrote.status, "ok");
+  assert.match(wrote.parts[0].text, /appended/);
+  assert.equal(made.status, "ok");
+  assert.match(made.parts[0].text, /draft written/);
+});
+
+test("ui_draft defaults to append and only replaces when asked", async () => {
+  const seen = [];
+  const { api, ui } = fakeHost();
+  const catalog = createCatalog({
+    api,
+    ui: {
+      ...ui,
+      draft: (_text, mode) => {
+        seen.push(mode);
+        return "appended";
+      },
+    },
+    policy: "read",
+  });
+  await catalog.execute({ name: "ui_draft", arguments: { text: "hi" }, deadlineMs: 5000 });
+  // Omitting the argument must never clobber what the person typed.
+  assert.deepEqual(seen, ["append"]);
+  await catalog.execute({
+    name: "ui_draft",
+    arguments: { text: "hi", mode: "replace" },
+    deadlineMs: 5000,
+  });
+  assert.deepEqual(seen, ["append", "replace"]);
+});
+
+test("ui_draft reports a replacement as a replacement", async () => {
+  const { api, ui } = fakeHost();
+  const catalog = createCatalog({
+    api,
+    ui: { ...ui, draft: (_text, mode) => (mode === "replace" ? "replaced" : "appended") },
+    policy: "read",
+  });
+  const result = await catalog.execute({
+    name: "ui_draft",
+    arguments: { text: "short", mode: "replace" },
+    deadlineMs: 5000,
+  });
+  assert.equal(result.status, "ok");
+  assert.match(result.parts[0].text, /replaced/);
+  assert.doesNotMatch(result.parts[0].text, /appended/);
+});
+
+test("ui_draft refuses a mode it does not define", async () => {
+  const { api, ui } = fakeHost();
+  const catalog = createCatalog({ api, ui, policy: "read" });
+  const result = await catalog.execute({
+    name: "ui_draft",
+    arguments: { text: "hi", mode: "overwrite" },
+    deadlineMs: 5000,
+  });
+  assert.equal(result.status, "error");
+});
+
+test("ui_attach passes the id through and reports that nothing was sent", async () => {
+  const { api, ui, calls } = fakeHost();
+  const catalog = createCatalog({ api, ui, policy: "act" });
+  const result = await catalog.execute({ name: "ui_attach", arguments: { attachment_id: 7 }, deadlineMs: 5000 });
+  assert.equal(result.status, "ok");
+  assert.deepEqual(calls.filter((call) => call.attach !== undefined), [{ attach: 7 }]);
+  assert.match(result.parts[0].text, /still has to send it/);
+});
+
+test("ui_attach refuses a non-positive id before it touches the page", async () => {
+  const { api, ui, calls } = fakeHost();
+  const catalog = createCatalog({ api, ui, policy: "act" });
+  const result = await catalog.execute({ name: "ui_attach", arguments: { attachment_id: 0 }, deadlineMs: 5000 });
+  assert.equal(result.status, "error");
+  assert.equal(calls.filter((call) => call.attach !== undefined).length, 0);
 });
 
 test("unknown function, missing arguments, and bad arguments are three different answers", async () => {

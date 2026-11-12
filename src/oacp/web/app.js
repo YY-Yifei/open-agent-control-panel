@@ -5,6 +5,14 @@
  */
 
 import { renderMarkdown } from "./md.js";
+import {
+  IMAGE_TYPES,
+  fitPlan,
+  isAnimatedImage,
+  pasteFiles,
+  pastedFiles,
+  sniffImageType,
+} from "./paste.js";
 
 const API = "/api/panel";
 const TOKEN_KEY = "oacp.token";
@@ -14,7 +22,7 @@ const MANAGE_KEY = "oacp.manageTokens";
 
 // 图片：真正的上限由 /summary 给出（服务端是唯一真源），这里的值是「还没拿到
 // summary 之前」的兜底，好让选图这一刻就能拦住明显太大的文件。
-const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+// 可选类型只有一份，在 paste.js —— 粘贴也要用同一张表判「这是不是图」。
 const IMAGE_LIMITS = { maxBytes: 5 * 1024 * 1024, maxPerMessage: 4 };
 
 /* ------------------------------------------------------------------ 文案 */
@@ -48,6 +56,10 @@ const DICT = {
     "attach.tooMany": "一条消息最多 {n} 张图片",
     "attach.type": "只支持 PNG、JPEG、WebP、GIF",
     "attach.failed": "这张图读不出来：{name}",
+    "attach.shrunk": "{name} 超过 {max}，已压缩到 {size} 后附加",
+    "attach.shrunkSize": "{width}×{height}，{size}",
+    "attach.gifTooBig": "动图不压缩：{name} 超过 {max}，请截取区域或先压缩",
+    "attach.drawerNoImages": "助手不收图片，请到主对话里粘贴",
 
     // 附件到了但没显示。存进库里的是原因码，文案在这一层选 —— 同一段会话
     // 换个语言再读，也仍然是它对的那一种语言。
@@ -165,6 +177,10 @@ const DICT = {
     "attach.tooMany": "One message may carry at most {n} images",
     "attach.type": "Only PNG, JPEG, WebP and GIF are supported",
     "attach.failed": "This image could not be read: {name}",
+    "attach.shrunk": "{name} was over {max}; attached at {size}",
+    "attach.shrunkSize": "{width}×{height}, {size}",
+    "attach.gifTooBig": "Animated images are not re-encoded: {name} is over {max}",
+    "attach.drawerNoImages": "The assistant takes no images — paste in the main conversation",
 
     "attach.skip.too_large": "{name} was too large to show",
     "attach.skip.unsupported": "{name} is not an image this panel can show",
@@ -608,11 +624,12 @@ function renderComposer() {
   const input = $("#input");
   if (form.hidden) return;
   const working = Boolean(state.session && state.session.state === "working");
-  const blocked = state.busy || working;
-  const agent = currentAgent();
+  // 闸门只写在 blockedNow / takesImagesNow 里，粘贴走同一对判据 ——
+  // 两处各写一遍，就会出现「按钮是灰的、粘贴却进得去」。
+  const blocked = blockedNow();
   // 「卡片声明了输入类型，且其中没有 image/*」才关掉入口。卡片没声明（null）
   // 时照常允许 —— 没声明不等于不支持，让 agent 自己去拒绝。
-  const takesImages = !agent || agent.acceptsImages !== false;
+  const takesImages = takesImagesNow();
   input.disabled = blocked;
   input.placeholder = working ? t("composer.busy") : t("composer.placeholder");
   const attach = $("#attach");
@@ -644,9 +661,33 @@ function renderAttachments() {
   strip.hidden = state.pending.length === 0;
 }
 
+/**
+ * 让附件条里的名字不重样。
+ *
+ * `pastedName` 精确到秒、序号只在同一次粘贴内递增，所以同一秒里按两次
+ * Ctrl+V 会拿到同一个名字。服务端按内容 hash 落库，两张图都不会丢；
+ * 但附件条上并排两个 `screenshot-…`，人分不清哪张是哪张。
+ */
+function uniqueName(name) {
+  const taken = new Set(state.pending.map((item) => item.name));
+  if (!taken.has(name)) return name;
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : "";
+  let index = 2;
+  while (taken.has(`${stem}-${index}${ext}`)) index += 1;
+  return `${stem}-${index}${ext}`;
+}
+
 function shortName(name) {
   const text = String(name || "");
-  return text.length > 18 ? `${text.slice(0, 15)}…` : text;
+  if (text.length <= 18) return text;
+  // 头尾都留。粘贴来的图名字只差时间戳（screenshot-20261112-092940.png），
+  // 只留头部会让附件条上四张图长得一模一样 —— 命名本来就是为了分得清，
+  // 显示层不能又把它截成同一个样子。尾部通常才是真正区分的那一段。
+  // 尾部要留住完整的时间（`HHMMSS` 6 位）加扩展名 —— 取 9 位会砍掉小时的十位，
+  // `092940` 与 `192940` 于是渲染成同一个 `screen…92940.png`，正好毁掉命名的目的。
+  return `${text.slice(0, 6)}…${text.slice(-10)}`;
 }
 
 function sizeLabel(bytes) {
@@ -675,40 +716,216 @@ function readAsBase64(file) {
   });
 }
 
+/* ------------------------------------------- 超限适配（只缩，不换内容） */
+
+/**
+ * 只在超限时动手：没超的一个字节都不碰。
+ *
+ * 三条护栏，少一条就成了「花里胡哨且悄悄改内容」：
+ *   - 只缩尺寸、只做同格式重编码（PNG→PNG 保住 alpha，JPEG→JPEG 保住底色）；
+ *   - GIF 不动：canvas 只出一帧，压缩动图等于把内容换掉；
+ *   - 压不下来就把原图交回去，让服务端的 413 说真话，而不是前端假装成功。
+ */
+async function fitToLimit(file, maxBytes) {
+  if (file.size <= maxBytes) return { file, shrunk: null };
+  // 超过上限一个数量级的文件不尝试解码：`createImageBitmap` 的像素内存随边长平方
+  // 增长，几十 MB 的 PNG（或一张只有 2 MB、却是 20000×20000 的纯色图）足以把标签页
+  // 顶死，而它本来也压不回上限里 —— 直接交回原图，让「太大」这句话由 413 说。
+  if (file.size > maxBytes * 8) return { file, shrunk: null };
+  // 动图一律不压：GIF、APNG、动态 WebP。后两种的 MIME 就是 image/png 与
+  // image/webp —— 只按 GIF 判，它们会被压成一张只剩第一帧的静止图，还被
+  // 告知「已压缩」。静默换掉内容比拒收更糟，所以按 chunk 判真身。
+  if (await isAnimatedImage(file)) {
+    throw new Error(t("attach.gifTooBig", { name: file.name, max: sizeLabel(maxBytes) }));
+  }
+  const bitmap = await loadBitmap(file);
+  if (!bitmap) return { file, shrunk: null }; // 解不开：原样交给服务端
+  try {
+    const plan = fitPlan(bitmap.width, bitmap.height);
+    // 尺寸不超、字节超（高噪点的 PNG）：仍按原尺寸重编码一次；变不小就交回原图。
+    if (!plan.length) plan.push({ width: bitmap.width, height: bitmap.height });
+    for (const step of plan) {
+      const blob = await drawToBlob(bitmap, step, file.type);
+      if (!blob || blob.size > maxBytes) continue;
+      return {
+        file: new File([blob], file.name, { type: file.type }),
+        shrunk: { width: step.width, height: step.height, to: blob.size },
+      };
+    }
+    return { file, shrunk: null };
+  } finally {
+    if (bitmap.close) bitmap.close();
+    if (bitmap.__revoke) URL.revokeObjectURL(bitmap.__revoke);
+  }
+}
+
+function loadBitmap(file) {
+  // EXIF 方向：手机截图/照片不声明就会转 90°，压出来是一张躺着的图。
+  if (typeof createImageBitmap === "function") {
+    return createImageBitmap(file, { imageOrientation: "from-image" }).catch(() => loadViaImg(file));
+  }
+  return Promise.resolve().then(() => loadViaImg(file));
+}
+
+function loadViaImg(file) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      // 把 URL 挂到对象上，由 fitToLimit 的 finally 统一回收。
+      img.__revoke = url;
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(null);
+    };
+    img.src = url;
+  });
+}
+
+function drawToBlob(bitmap, step, mime) {
+  return new Promise((resolve) => {
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = step.width;
+      canvas.height = step.height;
+      const context = canvas.getContext("2d");
+      if (!context) return resolve(null);
+      context.drawImage(bitmap, 0, 0, step.width, step.height);
+      // 只做同格式重编码：PNG 无损、不带质量参数，JPEG/WebP 用接近原图的档位。
+      const quality = { "image/jpeg": 0.92, "image/webp": 0.9 }[mime];
+      // 编码器不支持目标格式时会静默退回 PNG。那种 blob 的字节和 type 对不上，
+      // 服务端嗅出来就会 415 —— 所以宁可放弃这一档。
+      canvas.toBlob((blob) => resolve(blob && blob.type === mime ? blob : null), mime, quality);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/* ------------------------------------------------------------- 粘贴入口 */
+
+/**
+ * 粘贴只在「没有更该收这件事的地方」接管。
+ *
+ * 监听挂在 document 上：paste 只派发给焦点元素、再按树冒泡。用户「刚截完图、
+ * 手还在键盘上」时焦点是 body，事件根本不经过 #composer —— 挂在 composer 上
+ * 会漏掉最自然的那一次粘贴。
+ */
+function pasteAllowed(target) {
+  const node = target && target.nodeType === 1 ? target : null;
+  const tag = node ? String(node.tagName || "").toLowerCase() : "";
+  const editing = Boolean(node) && (node.isContentEditable || tag === "input" || tag === "textarea");
+  // 别的输入框（搜索、添加智能体、改名）优先：不抢它们的粘贴。
+  if (editing && node.id !== "input") return false;
+  // 弹窗开着时粘贴该落在弹窗自己的字段里；主输入框此刻多半也被盖住了。
+  const root = $("#modal-root");
+  return !root || !root.querySelector(".modal-backdrop");
+}
+
+/** 与 renderComposer 同一判据：卡片只收文本时，粘贴也不该进得去。 */
+function takesImagesNow() {
+  const agent = currentAgent();
+  return !agent || agent.acceptsImages !== false;
+}
+
+/** 与 renderComposer 同一判据：忙碌/工作中，粘贴也不该进得去。 */
+function blockedNow() {
+  return Boolean(state.busy || (state.session && state.session.state === "working"));
+}
+
 async function addFiles(fileList) {
   const limits = state.limits;
+  // 三扇门共用这一道闸门：选文件、Ctrl+V、ui_attach。判据原本散在调用方，
+  // 而 ui_attach 正是绕过它的那一条 —— 在首页（没选智能体）它照样把图塞进
+  // state.pending 并回报「已附加」，可附件条根本没渲染，下次 route() 就把
+  // 那张图静默丢了。闸门放在这里，三扇门才真的只有一套判据。
+  if (!state.agentId) {
+    toast(t("empty.noAgent"), "error");
+    return 0;
+  }
+  if (!takesImagesNow()) {
+    toast(t("attach.unsupported"), "error");
+    return 0;
+  }
+  if (blockedNow()) {
+    toast(t("composer.busy"), "error");
+    return 0;
+  }
   // 比数组身份，而不是 agentId：同一 agent 下换会话时 agentId 不变，
   // 但 route() 会整体替换 state.pending —— 那时读出来的图也不能落进去。
   const scope = state.pending;
-  for (const file of Array.from(fileList || [])) {
-    // 先看类型与大小，再看名额：满了 4 张时混选一个 .txt，该说的是「不支持的类型」。
-    if (!IMAGE_TYPES.includes(file.type)) {
+  let added = 0;
+  for (const original of Array.from(fileList || [])) {
+    // 字节说了算 —— 三扇门（选文件 / Ctrl+V / ui_attach）在这里归一成同一条规则。
+    // 只听声明会让「没有扩展名的截图」（type 为空或 octet-stream）被当成不支持的
+    // 类型拒掉，也会放一个改了扩展名的 PDF 过去、直到服务端重新嗅一遍才 415。
+    // 只有「字节读不了」才退回声明 —— 那时除了声明没有别的东西可依据。
+    const sniffed = (await sniffImageType(original)) ?? String(original.type || "").toLowerCase();
+    // 先看类型，再看名额：满了 4 张时混选一个 .txt，该说的是「不支持的类型」。
+    if (!IMAGE_TYPES.includes(sniffed)) {
       toast(t("attach.type"), "error");
-      continue;
-    }
-    if (file.size > limits.maxBytes) {
-      toast(t("attach.tooBig", { name: file.name, max: sizeLabel(limits.maxBytes) }), "error");
       continue;
     }
     if (state.pending.length >= limits.maxPerMessage) {
       toast(t("attach.tooMany", { n: limits.maxPerMessage }), "error");
       break;
     }
+    // 超限的图先就地适配，适配不下来才报错。放在名额判断之后：名额已经满了，
+    // 就不该白压一张图再把它丢掉。
+    // 声明与字节不符时以字节为准：压缩要按真实格式重编码（PNG 免得把 alpha 压成
+    // 黑底），base64 也要带上正确的 mime，否则服务端照样 415。
+    let file = original.type === sniffed ? original : new File([original], original.name, { type: sniffed });
+    try {
+      const fitted = await fitToLimit(file, limits.maxBytes);
+      // 作用域已经换了：前面攒下的都随旧数组一起丢了，不能再算作「加上了」，
+      // 否则 ui_attach 会把一次没落地的附件报成成功。
+      if (state.pending !== scope) return 0;
+      file = fitted.file;
+      if (fitted.shrunk) {
+        toast(
+          t("attach.shrunk", {
+            name: original.name,
+            max: sizeLabel(limits.maxBytes),
+            size: t("attach.shrunkSize", {
+              width: fitted.shrunk.width,
+              height: fitted.shrunk.height,
+              size: sizeLabel(fitted.shrunk.to),
+            }),
+          }),
+          "warn",
+        );
+      }
+    } catch (error) {
+      toast(error.message, "error");
+      continue;
+    }
+    // 适配过仍然超限（或者压不下来交回了原图）：如实拒收。
+    if (file.size > limits.maxBytes) {
+      toast(t("attach.tooBig", { name: file.name, max: sizeLabel(limits.maxBytes) }), "error");
+      continue;
+    }
     try {
       const { data, preview } = await readAsBase64(file);
-      if (state.pending !== scope) return;
+      if (state.pending !== scope) return 0;
       // 读文件是异步的：等的这段时间里另一次 addFiles 可能把名额填满了，
       // 所以名额要在这之后再判一次，否则前端会发出服务端必然拒收的那种消息。
       if (state.pending.length >= limits.maxPerMessage) {
         toast(t("attach.tooMany", { n: limits.maxPerMessage }), "error");
         break;
       }
-      state.pending.push({ name: file.name, mime: file.type, size: file.size, data, preview });
+      const name = uniqueName(file.name);
+      state.pending.push({ name, mime: file.type, size: file.size, data, preview });
+      added += 1;
     } catch (error) {
       toast(error.message, "error");
     }
   }
   renderComposer();
+  // 返回真实加进去的张数：助手层的 ui_attach 靠它区分「加上了」与「被拒了」，
+  // 否则会把一次拒收谎报成成功。
+  return added;
 }
 
 // 已取回的图按附件 id 缓存成 Promise<blob URL>：切会话再切回来不必重新下载，
@@ -1334,6 +1551,46 @@ function bindDom() {
     });
   });
 
+  // Ctrl+V 粘一张截图。挂在 document 上，不是挂在 #composer 上 —— 理由见 pasteAllowed。
+  document.addEventListener("paste", (event) => {
+    const clipboard = event.clipboardData;
+    if (!clipboard) return;
+    // 剪贴板只扫一次：纯文字粘贴一根手指都不碰，完整交还浏览器。
+    // 抽好的列表往下传，pastedFiles 不再自己扫一遍 —— 两次 getAsFile()
+    // 万一给出不同的东西，「有没有文件」与「收了什么」就会各说各话。
+    const raw = pasteFiles(clipboard);
+    if (!raw.length) return;
+    if (event.target && event.target.id === "agent-input") {
+      // 内置助手不收图（服务端也不收）；静默忽略等于「贴了，什么也没发生」。
+      toast(t("attach.drawerNoImages"), "warn");
+      return;
+    }
+    if (!pasteAllowed(event.target)) return;
+    // 不 preventDefault：图片进附件条，文字照常落进 textarea。浏览器的原生粘贴
+    // 一行都不用接管，也就没有「接管错了把文字吃掉」这一类 bug。
+    pastedFiles(raw)
+      .then((files) => {
+        // 剪贴板里有文件、却没有一张是我们能收的（BMP/TIFF/PDF…）。
+        // 静默丢弃正是这个仓库反复在修的那种失败，必须说一句话。
+        if (!files.length) {
+          toast(t("attach.type"), "error");
+          return;
+        }
+        // 截图混着一个 PDF 一起贴进来：图收下了，PDF 不能悄悄没掉。
+        // 选文件那条路是逐个报的，两条入口该说同样的话。
+        if (files.length < raw.length) toast(t("attach.type"), "warn");
+        // 准入闸门（有没有智能体、收不收图、忙不忙）统在 addFiles 里，不在这里
+        // 再抄一遍 —— 抄两处，迟早一处改了另一处忘了，而两边一旦不一致，
+        // 就会出现「按钮是灰的、Ctrl+V 却进得去」这种说不清的事。
+        return addFiles(files);
+      })
+      .catch((error) => {
+        // 只进 console 等于「贴了没反应」—— 正是本文件反复在修的那种静默丢弃。
+        console.warn("paste failed", error);
+        toast(t("error.generic"), "error");
+      });
+  });
+
   const input = $("#input");
   input.addEventListener("input", () => {
     autosize(input);
@@ -1410,6 +1667,7 @@ window.oacp = {
   state,
   t,
   toast,
+  addFiles,
   setLang,
   setTheme: applyTheme,
   renderAll,

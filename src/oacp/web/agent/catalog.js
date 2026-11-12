@@ -273,13 +273,29 @@ export function createCatalog({ api, ui, policy = "act" } = {}) {
       tier: TIER_READ,
       declaration: {
         name: "ui_draft",
-        description: "把一段话写进输入框（不发送），让用户改完自己按发送。要用户确认或补充时用它。",
+        description:
+          "把一段话写进输入框（不发送），让用户改完自己按发送。要用户确认或补充时用它。默认追加在用户已有草稿之后、绝不覆盖；要改写你自己刚写的那段（用户说「缩短它」「换个说法」），传 mode=replace。",
         timeoutMs: 5000,
-        parameters: object({ text: { type: "string", minLength: 1, maxLength: 20000 } }, ["text"]),
+        parameters: object({
+          text: { type: "string", minLength: 1, maxLength: 20000 },
+          mode: {
+            type: "string",
+            enum: ["append", "replace"],
+            description: "append=接在原有草稿后面（默认，安全）；replace=整段替换输入框，只在改写你自己写的草稿时用",
+          },
+        }, ["text"]),
       },
-      run: async ({ text }) => {
-        ui.draft(text);
-        return "draft written; the user still has to send it";
+      run: async ({ text, mode }) => {
+        // Say which one happened: the model needs to know whether the person is
+        // looking at a fresh draft, at their own text with ours appended, or at a
+        // draft we replaced outright.
+        const outcome = ui.draft(text, mode || "append");
+        if (outcome === "replaced") {
+          return "draft replaced the whole composer; the user still has to send it";
+        }
+        return outcome === "appended"
+          ? "draft appended to the text already in the composer; the user still has to send it"
+          : "draft written; the user still has to send it";
       },
     },
     {
@@ -316,7 +332,8 @@ export function createCatalog({ api, ui, policy = "act" } = {}) {
       tier: TIER_READ,
       declaration: {
         name: "ui_client_info",
-        description: "浏览器现在是什么状态：视口、时区、语言、主题、当前路由、是否在线。",
+        description:
+          "浏览器现在是什么状态：视口、时区、语言、主题、当前路由、是否在线，以及输入框里的草稿字数与待发附件张数（composer=；closed 表示当前页面没有输入框）。往输入框写东西（ui_draft / ui_attach）之前先看它，免得盖掉用户正在打的字。",
         timeoutMs: 5000,
         parameters: object({}, []),
       },
@@ -325,6 +342,25 @@ export function createCatalog({ api, ui, policy = "act" } = {}) {
         return Object.entries(info)
           .map(([key, value]) => `${key}=${value}`)
           .join("\n");
+      },
+    },
+
+    // ---------------------------------------------------------- ui: act
+    {
+      tier: TIER_ACT,
+      declaration: {
+        name: "ui_attach",
+        description:
+          "把会话里已有的一张图片放进输入框（不发送），用户自己改完再按发送。用户问「把那张图发给某人」时用它；附件 id 从 panel_get_session 的 attachments 取，不许编造。",
+        timeoutMs: 30000,
+        parameters: object({ attachment_id: { type: "integer", minimum: 1 } }, ["attachment_id"]),
+      },
+      run: async ({ attachment_id }, ctx) => {
+        ctx.markDispatched();
+        // Honour cancellation: a fetch that outlives the call would stage a file
+        // for a turn that is already over.
+        const name = await ui.attach(attachment_id, ctx.signal);
+        return `attached ${name} to the composer; the user still has to send it`;
       },
     },
 

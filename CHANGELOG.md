@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] — 2026-11-12
+
+### Added
+
+- **Ctrl+V now pastes a screenshot.** A pasted picture is staged exactly like one chosen
+  from the file picker: same type check, same 5 MB limit, same four-per-message cap, and
+  the same "the session changed while we were reading" guard. The listener hangs on
+  `document`, not on the composer — right after a screenshot the focus is `<body>`, and a
+  paste event only travels to the focused element. It never calls `preventDefault()`, so
+  text pastes straight through and a picture pasted together with text yields both.
+- Oversized screenshots are **downscaled in the browser** instead of rejected: a length
+  ladder of 1920 / 1600 / 1440 / 1280 on the long edge, same-format re-encode only (PNG
+  keeps its alpha), and the toast states the real before-and-after size. Animated images
+  (GIF, APNG, animated WebP) are refused rather than "compressed" — canvas keeps only the
+  first frame, which is a content swap, not an optimisation.
+- Pasted files get a readable name (`screenshot-20261112-092940.png`, `-2` for the second
+  picture in the same paste) instead of four attachments all called `image.png`.
+- **`ui_attach`** (tier `act`): the drawer can move an existing conversation attachment
+  into the composer. The bytes never leave the browser and never pass through the model,
+  and the user still presses send. Tier counts are now read 17 / act 21 / all 23 /
+  delegate 24.
+- `ui_draft` gained `mode: append|replace`. Append stays the default — it can never
+  swallow what the person typed — and `replace` is how the model revises a draft it wrote
+  itself. `ui_client_info` now reports `composer=` (draft length and staged attachment
+  count, never the text itself).
+
+### Fixed
+
+- The composer's admission checks (no agent open, busy, agent declares text only) moved
+  into `addFiles`, so the picker, Ctrl+V and `ui_attach` share one verdict. Before,
+  `ui_attach` walked past all of them and reported success for an attachment no chip
+  could ever show.
+- The MIME is decided by the bytes on all three doors, not just the paste path: a
+  screenshot saved without an extension is no longer rejected as an unsupported type, and
+  a renamed PDF no longer gets through only to fail with a 415 when sending.
+- `shortName` was one character short, so `092940` and `192940` rendered identically —
+  exactly the ambiguity the naming was meant to remove.
+- The animated-image check walks chunk *headers* instead of reading one 64 KB window, so
+  an ICC profile sitting ahead of `acTL` / `ANIM` can no longer push the animation past
+  the window and get the picture silently flattened to one frame.
+- A paste that fails now says so; it used to reach only the console.
+
+### Changed
+
+- `docs/agent-native.md` §4.5 records the admission test used here: what the feature does
+  for a person, whether only the page can do it, which tier it belongs to, and whether its
+  failure silently destroys something.
+
 ## [0.6.0] — 2026-11-11
 
 ### Added
