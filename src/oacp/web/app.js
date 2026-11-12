@@ -13,6 +13,17 @@ import {
   pastedFiles,
   sniffImageType,
 } from "./paste.js";
+// 附件预览的判据（类型、文本解码、截断、体积文案）都在 preview.js：灯箱与
+// 选文件必须用同一套，两份判据迟早分叉出「选得进来、显示不出来」。
+import {
+  bytesToBase64,
+  classify,
+  decodeText,
+  fileMeta,
+  formatBytes,
+  truncateText,
+  typeLabel,
+} from "./preview.js";
 
 const API = "/api/panel";
 const TOKEN_KEY = "oacp.token";
@@ -49,13 +60,15 @@ const DICT = {
     "composer.placeholder": "输入消息，Enter 发送，Shift+Enter 换行",
     "composer.busy": "对方正在处理，请稍候…",
 
-    "attach.add": "添加图片",
-    "attach.remove": "移除这张图",
+    "attach.add": "添加图片或文本",
+    "attach.addText": "添加文本文件（此智能体不接受图片）",
+    "attach.remove": "移除这个附件",
     "attach.unsupported": "这个智能体的卡片声明只接受文本输入",
     "attach.tooBig": "{name} 超过 {max}",
-    "attach.tooMany": "一条消息最多 {n} 张图片",
-    "attach.type": "只支持 PNG、JPEG、WebP、GIF",
-    "attach.failed": "这张图读不出来：{name}",
+    "attach.tooMany": "一条消息最多 {n} 个附件",
+    "attach.type": "只支持 PNG、JPEG、WebP、GIF，以及 UTF-8 文本",
+    "attach.typeImages": "粘贴只收图片；文本文件请用回形针添加",
+    "attach.failed": "这个文件读不出来：{name}",
     "attach.shrunk": "{name} 超过 {max}，已压缩到 {size} 后附加",
     "attach.shrunkSize": "{width}×{height}，{size}",
     "attach.gifTooBig": "动图不压缩：{name} 超过 {max}，请截取区域或先压缩",
@@ -68,6 +81,23 @@ const DICT = {
     "attach.skip.bad_data": "{name} 的数据读不出来",
     "attach.skip.unreachable": "{name} 取不回来",
     "attach.skip.too_many": "{name} 超出一条消息的张数上限",
+
+    // 附件预览（灯箱）。文案在这一层选：服务端只存原因码与 mime。
+    "preview.title": "附件预览",
+    "preview.open": "查看 {name}",
+    "preview.close": "关闭",
+    "preview.download": "下载",
+    "preview.openTab": "新标签打开",
+    "preview.loading": "正在读取…",
+    "preview.missing": "这个附件没有可显示的字节，可能已被清理。",
+    "preview.broken": "这个附件打不开，可能已损坏。",
+    "preview.unauthorized": "需要面板口令才能查看这个附件。",
+    "preview.textTruncated": "仅显示前 {shown} 行（共 {lines} 行 / {total} 字符），下载可看全文。",
+    "preview.imageMeta": "{width}×{height}，{size}",
+    "preview.pdfHint": "PDF 交给浏览器自己的阅读器打开，面板不在这里渲染它。",
+    "preview.otherHint": "这类文件面板不渲染内容，可以下载或在新标签打开。",
+    "preview.failed": "打不开这个附件：{name}",
+    "preview.popupBlocked": "浏览器拦下了这个新标签页，请允许弹出窗口后重试。",
 
     "state.idle": "空闲",
     "state.working": "正在处理",
@@ -170,13 +200,15 @@ const DICT = {
     "composer.placeholder": "Type a message — Enter to send, Shift+Enter for a new line",
     "composer.busy": "The agent is working…",
 
-    "attach.add": "Add images",
-    "attach.remove": "Remove this image",
+    "attach.add": "Add images or text",
+    "attach.addText": "Add a text file (this agent takes no images)",
+    "attach.remove": "Remove this attachment",
     "attach.unsupported": "This agent's card declares text input only",
     "attach.tooBig": "{name} is larger than {max}",
-    "attach.tooMany": "One message may carry at most {n} images",
-    "attach.type": "Only PNG, JPEG, WebP and GIF are supported",
-    "attach.failed": "This image could not be read: {name}",
+    "attach.tooMany": "One message may carry at most {n} attachments",
+    "attach.type": "Only PNG, JPEG, WebP, GIF and UTF-8 text are supported",
+    "attach.typeImages": "Pasting takes pictures only — add text files with the paperclip",
+    "attach.failed": "This file could not be read: {name}",
     "attach.shrunk": "{name} was over {max}; attached at {size}",
     "attach.shrunkSize": "{width}×{height}, {size}",
     "attach.gifTooBig": "Animated images are not re-encoded: {name} is over {max}",
@@ -187,6 +219,22 @@ const DICT = {
     "attach.skip.bad_data": "{name} could not be read",
     "attach.skip.unreachable": "{name} could not be fetched",
     "attach.skip.too_many": "{name} is over the per-message limit",
+
+    "preview.title": "Attachment preview",
+    "preview.open": "Open {name}",
+    "preview.close": "Close",
+    "preview.download": "Download",
+    "preview.openTab": "Open in a new tab",
+    "preview.loading": "Loading…",
+    "preview.missing": "This attachment has no bytes to show — it may have been removed.",
+    "preview.broken": "This attachment could not be opened — it may be damaged.",
+    "preview.unauthorized": "This attachment needs the panel token.",
+    "preview.textTruncated": "Showing the first {shown} of {lines} lines ({total} characters). Download for the whole file.",
+    "preview.imageMeta": "{width}×{height}, {size}",
+    "preview.pdfHint": "A PDF goes to the browser's own reader; the panel does not render it.",
+    "preview.otherHint": "The panel does not render this type — download it or open it in a new tab.",
+    "preview.failed": "Could not open this attachment: {name}",
+    "preview.popupBlocked": "The browser blocked the new tab — allow pop-ups and try again.",
 
     "state.idle": "Idle",
     "state.working": "Working",
@@ -612,10 +660,25 @@ function attachmentNode(file) {
     const why = t(`attach.skip.${file.skipped}`, { name: file.name });
     // 原因要看得见，不能只藏在 title 里：触屏没有悬停，键盘也到不了这个 span。
     // 原因文案自带 {name}，所以文件名不会丢。
+    // 它不可点：没有字节的附件点开只能看到一个空层。
     return `<span class="attachment-skip" title="${esc(file.name)}">${esc(why)}</span>`;
   }
+  const label = t("preview.open", { name: file.name });
   // 唯一的未转义属性插值：id 现在是 int，但不该让 id 的形状决定这里安不安全。
-  return `<img class="sent" data-attach="${esc(file.id)}" alt="${esc(file.name)}" title="${esc(file.name)}" />`;
+  const id = esc(file.id);
+  if (classify(file) === "image") {
+    // 图外面包一个真按钮：按钮天然可 Tab、可 Enter / 空格，触屏与鼠标同一个
+    // 手势，不需要另写一套键位映射。
+    return `<button class="thumb" type="button" data-preview="${id}" aria-label="${esc(label)}">
+      <img class="sent" data-attach="${id}" alt="${esc(file.name)}" title="${esc(file.name)}" />
+    </button>`;
+  }
+  // 非图片：一枚文件卡。名字 + 类型 + 体积，足够让人决定要不要点开。
+  const meta = fileMeta(file);
+  return `<button class="thumb attachment-file" type="button" data-preview="${id}" aria-label="${esc(label)}">
+    <span class="attachment-file-name">${esc(file.name)}</span>
+    <span class="attachment-file-meta">${esc(meta)}</span>
+  </button>`;
 }
 
 function renderComposer() {
@@ -633,13 +696,14 @@ function renderComposer() {
   input.disabled = blocked;
   input.placeholder = working ? t("composer.busy") : t("composer.placeholder");
   const attach = $("#attach");
-  attach.disabled = blocked || !takesImages;
-  const attachLabel = takesImages ? t("attach.add") : t("attach.unsupported");
+  // 入口只由「忙碌 / 没有会话」关掉：卡片只收文本时，附一个 .txt 仍然有意义，
+  // 整扇门都关上就把它一起关掉了。图片那一侧由 addFiles 按卡片判。
+  attach.disabled = blocked;
+  const attachLabel = takesImages ? t("attach.add") : t("attach.addText");
   attach.title = attachLabel;
   // aria-label 是可访问名，会盖过 title：只改 title 的话，卡片只收文本时
   // 屏幕阅读器听到的仍然是「添加图片」。
   attach.setAttribute("aria-label", attachLabel);
-  attach.classList.toggle("blocked", !takesImages);
   renderAttachments();
   $("#send").disabled = blocked || (!input.value.trim() && !state.pending.length);
 }
@@ -650,13 +714,18 @@ function renderAttachments() {
   const strip = $("#attach-strip");
   if (!strip) return;
   strip.innerHTML = state.pending
-    .map(
-      (item, index) => `<figure class="chip" title="${esc(item.name)}">
-        <img src="${esc(item.preview)}" alt="${esc(item.name)}" />
+    .map((item, index) => {
+      // 文本附件没有缩略图可画：给一枚写着类型的文件卡，而不是一个 src=""
+      // 的破图（浏览器会给它画一个带边框的空白方块）。
+      const face = item.preview
+        ? `<img src="${esc(item.preview)}" alt="${esc(item.name)}" />`
+        : `<span class="chip-file">${esc(typeLabel(item.mime))}</span>`;
+      return `<figure class="chip" title="${esc(item.name)}">
+        ${face}
         <button type="button" data-detach="${index}" aria-label="${esc(t("attach.remove"))}">×</button>
         <figcaption>${esc(shortName(item.name))}</figcaption>
-      </figure>`,
-    )
+      </figure>`;
+    })
     .join("");
   strip.hidden = state.pending.length === 0;
 }
@@ -690,16 +759,9 @@ function shortName(name) {
   return `${text.slice(0, 6)}…${text.slice(-10)}`;
 }
 
-function sizeLabel(bytes) {
-  // 上限来自服务端配置，可能是 500 KB：一律说成 "1 MB" 会和它自己的报错互相矛盾。
-  if (bytes >= 1024 * 1024) {
-    // 整数就写整数，其余保留一位：四舍五入会把 1.6 MB 的上限说成 "2 MB"，
-    // 于是拒收 1.8 MB 的报错自己打自己。
-    const mb = bytes / (1024 * 1024);
-    return `${Number.isInteger(mb) ? mb : mb.toFixed(1)} MB`;
-  }
-  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
-}
+// 体积文案只有一份，在 preview.js：附件条、灯箱、报错必须说同一个数。
+// 两份四舍五入迟早会在某个边界上互相矛盾（500 KB 与 1 MB）。
+const sizeLabel = formatBytes;
 
 function readAsBase64(file) {
   return new Promise((resolve, reject) => {
@@ -845,10 +907,6 @@ async function addFiles(fileList) {
     toast(t("empty.noAgent"), "error");
     return 0;
   }
-  if (!takesImagesNow()) {
-    toast(t("attach.unsupported"), "error");
-    return 0;
-  }
   if (blockedNow()) {
     toast(t("composer.busy"), "error");
     return 0;
@@ -863,9 +921,54 @@ async function addFiles(fileList) {
     // 类型拒掉，也会放一个改了扩展名的 PDF 过去、直到服务端重新嗅一遍才 415。
     // 只有「字节读不了」才退回声明 —— 那时除了声明没有别的东西可依据。
     const sniffed = (await sniffImageType(original)) ?? String(original.type || "").toLowerCase();
-    // 先看类型，再看名额：满了 4 张时混选一个 .txt，该说的是「不支持的类型」。
+    // 先分类型：图片往下走自己的名额检查；不是图片的先看体积与名额，再用字节
+    // 判它是不是文本 —— 名额已满时先报「太多」，不再为它白读一遍字节。
     if (!IMAGE_TYPES.includes(sniffed)) {
-      toast(t("attach.type"), "error");
+      // 不是图片。文本是唯一另一种允许附上的东西，而且必须由字节证明：
+      // 改名叫 notes.txt 的 PNG 进不来，叫 README 的纯文本进得来。
+      if (original.size > limits.maxBytes) {
+        toast(t("attach.tooBig", { name: original.name, max: sizeLabel(limits.maxBytes) }), "error");
+        continue;
+      }
+      // 名额要在读文件之前查：已经满了还去读 5 MB、再扫一遍文本判据，是纯浪费
+      // 的主线程工作（图片那一侧本来就是先查名额）。下面读完之后那次检查仍然
+      // 留着 —— 它是「读文件期间名额被别处填满」的竞态守卫。
+      if (state.pending.length >= limits.maxPerMessage) {
+        toast(t("attach.tooMany", { n: limits.maxPerMessage }), "error");
+        break;
+      }
+      let bytes;
+      try {
+        bytes = new Uint8Array(await original.arrayBuffer());
+      } catch {
+        toast(t("attach.failed", { name: original.name }), "error");
+        continue;
+      }
+      // 读文件是异步的：等的这段时间里可能已经切了会话。
+      if (state.pending !== scope) return 0;
+      if (decodeText(bytes) === null) {
+        toast(t("attach.type"), "error");
+        continue;
+      }
+      if (state.pending.length >= limits.maxPerMessage) {
+        toast(t("attach.tooMany", { n: limits.maxPerMessage }), "error");
+        break;
+      }
+      // 存原始字节：预览读的是同一份内容，服务端也会再判一次是否真是文本。
+      // preview 留空 —— 文本没有缩略图，附件条会画一枚文件卡。
+      state.pending.push({
+        name: uniqueName(original.name),
+        mime: "text/plain",
+        size: bytes.length,
+        data: bytesToBase64(bytes),
+        preview: "",
+      });
+      added += 1;
+      continue;
+    }
+    // 图片这一侧仍然受卡片声明约束：只收文本的智能体不该收到图。
+    if (!takesImagesNow()) {
+      toast(t("attach.unsupported"), "error");
       continue;
     }
     if (state.pending.length >= limits.maxPerMessage) {
@@ -935,9 +1038,17 @@ async function addFiles(fileList) {
 const ATTACHMENT_URLS = new Map(); // id -> { promise, url }
 const ATTACHMENT_CACHE_MAX = 48;
 
+function releaseAttachment(record) {
+  // 读 record 上的字段，而不是 promise 的结果：promise 现在 resolve 成整个
+  // 记录（灯箱要 blob），拿着它去 revokeObjectURL 只会静默失败，于是每一次
+  // 驱逐、每一次换口令都漏掉一个永不回收的 blob URL。
+  if (record.url) URL.revokeObjectURL(record.url);
+  if (record.textUrl) URL.revokeObjectURL(record.textUrl);
+}
+
 function dropAttachmentCache() {
   for (const record of ATTACHMENT_URLS.values()) {
-    record.promise.then((url) => URL.revokeObjectURL(url)).catch(() => {});
+    record.promise.then(() => releaseAttachment(record)).catch(() => {});
   }
   ATTACHMENT_URLS.clear();
 }
@@ -949,21 +1060,32 @@ function attachmentInUse(url) {
 }
 
 function evictOldestAttachment(skipId) {
+  const skip = String(skipId);
   for (const [id, record] of ATTACHMENT_URLS) {
-    if (id === skipId) continue;
+    if (id === skip) continue;
+    // 打开的灯箱也是「正在用」。文本与 PDF 的预览里没有 <img>，`attachmentInUse`
+    // 看不见它 —— 于是这条记录会被驱逐、URL 被吊销，「新标签打开」就打开一个
+    // 死链接，而层还开在屏幕上。
+    if (record === LIGHTBOX.record) continue;
     // 还没取回来：URL 还不存在，等它 resolve 再吊销的话，正 await 的 <img>
     // 刚拿到就被撤掉，图就碎了。在飞的记录一律不动。
     if (!record.url || attachmentInUse(record.url)) continue;
     ATTACHMENT_URLS.delete(id);
-    record.promise.then((url) => URL.revokeObjectURL(url)).catch(() => {});
+    record.promise.then(() => releaseAttachment(record)).catch(() => {});
     return;
   }
 }
 
-function attachmentUrl(id) {
-  const cached = ATTACHMENT_URLS.get(id);
+// 记录里同时留 blob 与 URL：灯箱要把文本读成字符串，而对象 URL 本身不给出
+// 字节；两者共用一次请求，也共用同一套 401 与「没有字节」的处理。
+function attachmentRecord(id) {
+  // key 一律是字符串：`hydrateAttachments` 从 dataset 拿到的是 "5"，而
+  // `openPreview` 拿到的是数字 5。Map 把两者当两个键，于是同一张图被下载两次
+  // （灯箱一开就重下一份），驱逐时的 id 比对也会失配。
+  const key = String(id);
+  const cached = ATTACHMENT_URLS.get(key);
   if (cached) return cached.promise;
-  const record = { promise: null, url: null };
+  const record = { promise: null, url: null, blob: null };
   record.promise = (async () => {
     const token = localStorage.getItem(TOKEN_KEY) || "";
     const headers = token ? { "x-panel-token": token } : {};
@@ -972,24 +1094,35 @@ function attachmentUrl(id) {
       // 和 api() 一样：口令缺失/过期要弹出输口令的窗口。否则整屏图会静默
       // 变成「已消失」，而人既看不出是口令问题，也没有入口去修。
       openTokenDialog();
-      throw new Error(t("token.required"));
+      // 带 code 的错：灯箱要能区分「口令问题」与「这个附件没有字节」。
+      // 混成一句就会让人去改口令，去修一个其实是 404 的问题。
+      throw Object.assign(new Error(t("preview.unauthorized")), { code: "unauthorized" });
     }
-    if (!response.ok) throw new Error("gone");
-    const url = URL.createObjectURL(await response.blob());
+    // 只有 404 才是「这个附件没有字节」。把 5xx / 403 也标成 gone，会让一次
+    // 临时故障读作「文件已被删除」，于是没人会去重试。
+    if (response.status === 404) throw Object.assign(new Error("gone"), { code: "gone" });
+    if (!response.ok) throw new Error(`attachment fetch failed: HTTP ${response.status}`);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    record.blob = blob;
     record.url = url;
     // 一次只试一个：没有可删的（图都还在屏上）就让缓存暂时超一点上限，
     // 不能在这里 while —— evictOldestAttachment 什么都不删时 size 永远不变。
     if (ATTACHMENT_URLS.size >= ATTACHMENT_CACHE_MAX) evictOldestAttachment(id);
-    return url;
+    return record;
   })();
   // 失败不留缓存，下一帧还能重试（比如口令刚填完、网络刚恢复）。
   record.promise.catch(() => {
     // 只删「还是这一条」的记录：同一个 id 可能已经被驱逐、又被重新取过一次，
     // 按 key 直接删会把那条新记录的 blob URL 漏成永久泄漏。
-    if (ATTACHMENT_URLS.get(id) === record) ATTACHMENT_URLS.delete(id);
+    if (ATTACHMENT_URLS.get(key) === record) ATTACHMENT_URLS.delete(key);
   });
-  ATTACHMENT_URLS.set(id, record);
+  ATTACHMENT_URLS.set(key, record);
   return record.promise;
+}
+
+function attachmentUrl(id) {
+  return attachmentRecord(id).then((record) => record.url);
 }
 
 async function hydrateAttachments(root, done) {
@@ -1018,6 +1151,296 @@ function attachmentPlaceholder(name) {
   node.className = "attachment-gone";
   node.textContent = name || "image";
   return node;
+}
+
+/* ------------------------------------------------------------ 附件预览 */
+
+// 灯箱有自己的根节点，刻意不复用 #modal-root：`openModal` 会把挂起的确认
+// 当成「已取消」结算，而看一张图不该替用户取消一个待确认的删除。
+const LIGHTBOX = {
+  items: [],
+  opener: null,
+  token: 0,
+  record: null,
+  file: null,
+  // 加载失败与还在加载是两种状态：都显示「正在读取」会让人一直等一个不会来的图。
+  failed: false,
+};
+
+function isPreviewOpen() {
+  const root = $("#lightbox-root");
+  return Boolean(root && root.firstElementChild);
+}
+
+/** 当前会话里的全部附件，按出现顺序 —— 灯箱签名的第一半。 */
+function previewItems() {
+  const session = state.session;
+  if (!session || !Array.isArray(session.messages)) return [];
+  const out = [];
+  for (const message of session.messages) {
+    for (const file of message.attachments || []) out.push(file);
+  }
+  return out;
+}
+
+function lightboxShell(file) {
+  const meta = fileMeta(file);
+  return `<div class="lightbox-backdrop">
+    <figure class="lightbox" role="dialog" aria-modal="true" aria-label="${esc(t("preview.title"))}">
+      <header class="lightbox-head">
+        <span class="lightbox-name" title="${esc(file.name)}">${esc(file.name)}</span>
+        <span class="lightbox-meta">${esc(meta)}</span>
+        <span class="lightbox-actions">
+          <button class="btn ghost" type="button" data-lightbox-download="${esc(file.id)}">${esc(t("preview.download"))}</button>
+          <button class="btn ghost" type="button" data-lightbox-open="${esc(file.id)}">${esc(t("preview.openTab"))}</button>
+          <button class="link lightbox-close" type="button" data-lightbox-close="1" aria-label="${esc(t("preview.close"))}">✕</button>
+        </span>
+      </header>
+      <div class="lightbox-body"><p class="lightbox-note">${esc(t("preview.loading"))}</p></div>
+    </figure>
+  </div>`;
+}
+
+function lightboxNote(body, text) {
+  const note = document.createElement("p");
+  note.className = "lightbox-note";
+  note.textContent = text;
+  body.replaceChildren(note);
+}
+
+/**
+ * 打开一张附件。
+ *
+ * `items` 是这个会话里可预览的附件序列，`index` 是起点（翻页的签名先留好，
+ * 加的时候是局部改动）。**不是附件 id** —— 传 id 会落到 `previewItems()` 那条
+ * 回退上，层里显示的是会话的第一张附件，而不是你要的那一张。把 id 解析成
+ * `(items, index)` 是 `panel.js` 的 `preview(attachmentId)` 的责任。
+ */
+async function openPreview(items, index) {
+  const root = $("#lightbox-root");
+  if (!root) return;
+  // 传错形态时不要静默回退：一句 warn 比「打开了一张毫不相干的图」好查得多。
+  if (!Array.isArray(items)) console.warn("openPreview expects (items, index), not an id:", items);
+  const list = (Array.isArray(items) && items.length ? items : previewItems()).filter(Boolean);
+  if (!list.length) return;
+  const at = Math.min(Math.max(Number(index) || 0, 0), list.length - 1);
+  const file = list[at];
+  // token 让在飞的加载作废：关掉或换了附件之后回来的响应不该往新视图里塞。
+  const token = (LIGHTBOX.token += 1);
+  LIGHTBOX.items = list;
+  LIGHTBOX.record = null;
+  LIGHTBOX.file = file;
+  LIGHTBOX.failed = false;
+  // 打开前记住焦点，关闭时还回去：键盘用户不该被扔回页面顶部。
+  if (!LIGHTBOX.opener) LIGHTBOX.opener = document.activeElement;
+  document.body.classList.add("lightbox-open");
+  root.innerHTML = lightboxShell(file);
+  const body = root.querySelector(".lightbox-body");
+  const close = root.querySelector(".lightbox-close");
+  if (close) close.focus();
+  if (classify(file) === "missing") {
+    // record 永远是 null：不标 failed 的话，「新标签打开」会一直说「正在加载」。
+    // 一个已知没有内容的文件不该看起来还在路上。
+    LIGHTBOX.failed = true;
+    lightboxNote(body, t("preview.missing"));
+    return;
+  }
+  try {
+    const record = await attachmentRecord(file.id);
+    if (token !== LIGHTBOX.token) return;
+    LIGHTBOX.record = record;
+    const kind = classify(file);
+    if (kind === "text") {
+      // 走 `decodeText`，而不是 `blob.text()`：后者对非 UTF-8 字节会塞 U+FFFD，
+      // 于是「这份字节其实不是文本」在渲染路径上永远不成立。收侧的判据和渲染
+      // 侧的判据必须是同一套 —— 否则一边是标准，一边是感觉。
+      const decoded = decodeText(new Uint8Array(await record.blob.arrayBuffer()));
+      if (token !== LIGHTBOX.token) return;
+      if (decoded === null) {
+        LIGHTBOX.failed = true;
+        lightboxNote(body, t("preview.broken"));
+        return;
+      }
+      renderTextPreview(body, truncateText(decoded));
+      return;
+    }
+    if (kind === "image") {
+      renderImagePreview(body, file, record.url, token);
+      return;
+    }
+    renderFileCard(body, file, kind);
+  } catch (error) {
+    if (token !== LIGHTBOX.token) return;
+    if (error && error.code === "unauthorized") {
+      // 口令框挂在 #modal-root（z-index 20），灯箱在 22 之上：不先关灯箱，
+      // 用户看到的是「需要口令」加一张盖住输入框的图，还得自己先关掉才能填。
+      // `openTokenDialog` 已经在 attachmentRecord 里弹过了。
+      closePreview();
+      return;
+    }
+    LIGHTBOX.failed = true;
+    // 只有 404 才是「这个附件没有字节」。网络断了、5xx、blob 解不出来都不等于
+    // 文件没了 —— 说成「可能已被清理」会让人放弃重试，还藏起真正的原因。
+    lightboxNote(
+      body,
+      error && error.code === "gone" ? t("preview.missing") : t("preview.failed", { name: file.name }),
+    );
+  }
+}
+
+function renderTextPreview(body, part) {
+  const pre = document.createElement("pre");
+  pre.className = "lightbox-text";
+  // 只经 textContent：附件内容永远不是 HTML。用 innerHTML 就等于让 agent 的
+  // 回复在这个 origin 里执行（而且它手里还有面板口令）。
+  pre.textContent = part.text;
+  body.replaceChildren(pre);
+  if (part.truncated) {
+    const note = document.createElement("p");
+    note.className = "lightbox-note";
+    note.textContent = t("preview.textTruncated", {
+      shown: part.shownLines,
+      lines: part.lines,
+      total: part.total,
+    });
+    body.appendChild(note);
+  }
+}
+
+function renderImagePreview(body, file, url, token) {
+  const img = document.createElement("img");
+  img.className = "lightbox-image";
+  img.alt = file.name;
+  img.onload = () => {
+    // 与 openPreview 其余异步续体同一条守卫：助手抽屉可以再调一次 ui_preview，
+    // 迟到的 onload 不该往新视图里写旧文件的宽高。
+    if (token !== LIGHTBOX.token) return;
+    const meta = body.closest(".lightbox")?.querySelector(".lightbox-meta");
+    // 尺寸只有解码后才知道：先写类型与体积，拿到宽高再补上。
+    if (meta) {
+      meta.textContent = t("preview.imageMeta", {
+        width: img.naturalWidth,
+        height: img.naturalHeight,
+        size: formatBytes(file.size),
+      });
+    }
+  };
+  // 解码失败与「没有字节」是两件事：前者说明存下来的字节打不开（被截断、
+  // 被中间层改过），后者说明这行本来就没有字节。混成一句会让人查错方向。
+  img.onerror = () => {
+    if (token !== LIGHTBOX.token) return;
+    // 层里已经说了「显示不出来」，但「新标签打开」读的是 LIGHTBOX.failed：
+    // 不标它，那颗按钮会打开同一个解不出来的 blob，一句提示都没有。
+    LIGHTBOX.failed = true;
+    lightboxNote(body, t("preview.broken"));
+  };
+  body.replaceChildren(img);
+  img.src = url;
+}
+
+function renderFileCard(body, file, kind) {
+  const card = document.createElement("div");
+  card.className = "lightbox-card";
+  const name = document.createElement("strong");
+  name.textContent = file.name;
+  const meta = document.createElement("span");
+  // 与附件条、灯箱头共用同一份格式化：同一个类型/体积对不该在两处用两种
+  // 标点（`·` 与「，」）。`·` 是分隔符而不是语法标点，两种语言都成立。
+  meta.textContent = fileMeta(file);
+  const hint = document.createElement("p");
+  hint.className = "lightbox-note";
+  hint.textContent = kind === "pdf" ? t("preview.pdfHint") : t("preview.otherHint");
+  card.append(name, meta, hint);
+  body.replaceChildren(card);
+}
+
+function closePreview() {
+  const root = $("#lightbox-root");
+  if (!root || !root.firstElementChild) return;
+  // token 递增让在飞的加载作废：否则关掉后回来的响应会往空节点里塞内容。
+  LIGHTBOX.token += 1;
+  LIGHTBOX.items = [];
+  LIGHTBOX.record = null;
+  LIGHTBOX.file = null;
+  LIGHTBOX.failed = false;
+  root.innerHTML = "";
+  document.body.classList.remove("lightbox-open");
+  const opener = LIGHTBOX.opener;
+  LIGHTBOX.opener = null;
+  // 触发它的那个按钮可能已经被重渲染换掉了：只在还挂在文档上时还焦点。
+  if (opener && document.contains(opener) && typeof opener.focus === "function") opener.focus();
+}
+
+async function downloadAttachment(id) {
+  const file = LIGHTBOX.items.find((item) => String(item.id) === String(id));
+  try {
+    const record = await attachmentRecord(id);
+    const anchor = document.createElement("a");
+    anchor.href = record.url;
+    anchor.download = (file && file.name) || "file";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    // URL 由缓存持有，这里不 revoke：缓存逐出时会统一吊销。
+  } catch (error) {
+    // 404 的 message 是内部字面量 "gone"：把它直接 toast 出来，用户看到的是
+    // 一个英文单词，而不是「这个附件没有字节」。
+    let why = t("preview.failed", { name: (file && file.name) || id });
+    if (error && error.code === "unauthorized") {
+      // `openTokenDialog` 已在 attachmentRecord 里弹过，而口令框在 #modal-root
+      // （z 20）之下、灯箱（22）之上：不先关灯箱，输入框既看不见也点不到，
+      // 焦点还会被 openModal 的 setTimeout 移进那个看不见的 input。
+      closePreview();
+      why = t("preview.unauthorized");
+    } else if (error && error.code === "gone") {
+      why = t("preview.missing");
+    }
+    toast(why, "error");
+  }
+}
+
+function openAttachmentTab(id) {
+  const record = LIGHTBOX.record;
+  // 失败与正在加载是两件事，而且 `failed` 必须单独成一条：图片解码失败时
+  // record 与 record.url 都在，只有这个标志知道「刚打开的那个 blob 是坏的」。
+  // 不查它，就会把同一个坏 blob 再开一次 —— 正是 `img.onerror` 那句注释
+  // 承诺要拦住的事。
+  if (LIGHTBOX.failed) {
+    toast(t("preview.failed", { name: (LIGHTBOX.file && LIGHTBOX.file.name) || id }), "warn");
+    return;
+  }
+  if (!record || !record.url) {
+    toast(t("preview.loading"), "warn");
+    return;
+  }
+  const type = String((record.blob && record.blob.type) || "");
+  let url = record.url;
+  // 与服务端 `api.py` 同一张白名单：`image/` 前缀连 `image/svg+xml` 也放行，
+  // 而 SVG 是脚本容器 —— 作为同源 blob 打开就能读到 localStorage 里的口令。
+  if (!IMAGE_TYPES.includes(type) && type !== "application/pdf") {
+    // 同源 blob URL 会按它自己的类型渲染：一个 type=text/html 的 blob 打开就是
+    // 一个能跑脚本、且带着面板口令的同源文档。服务端只发 text/plain，这里再
+    // 兜一层：既不是图片也不是 PDF 的，一律以 text/plain 打开。
+    //
+    // 每个记录只建一次：每次点击都新建一个的话，点几次就漏几个永不回收的
+    // blob URL。它随缓存驱逐一起吊销（releaseAttachment）。
+    if (type === "text/plain") {
+      // 服务端回吐文本附件时给的已经是 text/plain：同一份字节再包一个 Blob、
+      // 再建一个 URL，只是多一份永不回收的对象。
+      url = record.url;
+    } else {
+      if (!record.textUrl) {
+        record.textUrl = URL.createObjectURL(new Blob([record.blob], { type: "text/plain" }));
+      }
+      url = record.textUrl;
+    }
+  }
+  // 带 `noopener` 特性时，规范要求 window.open **一律返回 null** —— 那个返回值
+  // 就不能用来判断拦截（每次成功都会报一次「被拦」）。先正常打开，再自己切断
+  // opener；只有真被拦下时返回值才是 null。
+  const win = window.open(url, "_blank");
+  if (win) win.opener = null;
+  else toast(t("preview.popupBlocked"), "warn");
 }
 
 /* ------------------------------------------------------------------ 路由 */
@@ -1541,7 +1964,15 @@ function bindDom() {
   });
 
   // 可选类型只在 IMAGE_TYPES 声明一次，选择器的 accept 由它派生。
-  $("#attach-input").accept = IMAGE_TYPES.join(",");
+  // 文本附件也走这个 input。只列图片时系统选择器会把 .txt / .md / .log 滤掉，
+  // 而按钮现在承诺它们能选。accept 只影响选择器的过滤，不参与校验：
+  // 到底是不是文本仍然由字节说了算（decodeText），服务端还会再判一次。
+  $("#attach-input").accept = [
+    ...IMAGE_TYPES,
+    ".txt", ".md", ".markdown", ".csv", ".json", ".log", ".yaml", ".yml",
+    ".toml", ".ini", ".conf", ".xml", ".html", ".css", ".js", ".ts",
+    "text/plain", "text/markdown", "text/csv", "application/json",
+  ].join(",");
   $("#attach").addEventListener("click", () => $("#attach-input").click());
   $("#attach-input").addEventListener("change", (event) => {
     const picker = event.target;
@@ -1572,13 +2003,16 @@ function bindDom() {
       .then((files) => {
         // 剪贴板里有文件、却没有一张是我们能收的（BMP/TIFF/PDF…）。
         // 静默丢弃正是这个仓库反复在修的那种失败，必须说一句话。
+        // 粘贴这条路上仍然只收图片：`pastedFiles` 把非图片都滤掉了，而文字
+        // 粘贴必须继续落进 textarea。所以这里说的是「粘贴只收图片」，不是
+        // 「不支持这种类型」—— 后者会把一句正确的提示用在错误的场景里。
         if (!files.length) {
-          toast(t("attach.type"), "error");
+          toast(t("attach.typeImages"), "error");
           return;
         }
         // 截图混着一个 PDF 一起贴进来：图收下了，PDF 不能悄悄没掉。
         // 选文件那条路是逐个报的，两条入口该说同样的话。
-        if (files.length < raw.length) toast(t("attach.type"), "warn");
+        if (files.length < raw.length) toast(t("attach.typeImages"), "warn");
         // 准入闸门（有没有智能体、收不收图、忙不忙）统在 addFiles 里，不在这里
         // 再抄一遍 —— 抄两处，迟早一处改了另一处忘了，而两边一旦不一致，
         // 就会出现「按钮是灰的、Ctrl+V 却进得去」这种说不清的事。
@@ -1604,6 +2038,35 @@ function bindDom() {
   });
 
   document.addEventListener("click", (event) => {
+    // 灯箱先于弹窗：它的根节点与 #modal-root 是两个，谁也不该被对方关掉。
+    const preview = event.target.closest("[data-preview]");
+    if (preview) {
+      const id = preview.dataset.preview;
+      const items = previewItems();
+      const index = items.findIndex((item) => String(item.id) === String(id));
+      // 找不到就是视图过期了（附件被删、或已经换了会话）。回退到 0 会打开一张
+      // 毫不相干的图 —— 正是 openPreview 文档注释里警告的那种结果。
+      if (index < 0) return;
+      openPreview(items, index);
+      return;
+    }
+    if (
+      event.target.closest("[data-lightbox-close]") ||
+      event.target === event.target.closest(".lightbox-backdrop")
+    ) {
+      closePreview();
+      return;
+    }
+    const save = event.target.closest("[data-lightbox-download]");
+    if (save) {
+      downloadAttachment(save.dataset.lightboxDownload);
+      return;
+    }
+    const newTab = event.target.closest("[data-lightbox-open]");
+    if (newTab) {
+      openAttachmentTab(newTab.dataset.lightboxOpen);
+      return;
+    }
     const close = event.target.closest("[data-close]");
     if (close) {
       closeModal();
@@ -1632,10 +2095,51 @@ function bindDom() {
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeModal();
+    // 灯箱声明了 aria-modal，焦点就不能走到背后的页面上：Tab / Shift+Tab 在
+    // 它自己的可聚焦元素之间循环。没有这一条，aria-modal 只是一句声明。
+    if (event.key === "Tab" && isPreviewOpen()) {
+      const root = $("#lightbox-root");
+      const focusable = Array.from(
+        root.querySelectorAll(
+          "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])",
+        ),
+      ).filter((node) => !node.disabled);
+      if (!focusable.length) {
+        event.preventDefault();
+      } else {
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        // 点了图或一句说明之后 activeElement 是 body：这时默认的 Tab 会落到
+        // 遮罩背后的页面上（灯箱是 body 的最后一个节点）。所以「焦点不在层里」
+        // 也算一次环绕，否则 aria-modal 只是一句声明。
+        if (!root.contains(document.activeElement)) {
+          event.preventDefault();
+          (event.shiftKey ? last : first).focus();
+        } else if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+      return;
+    }
+    if (event.key !== "Escape") return;
+    // 灯箱在上层：Esc 先关它，再关弹窗。反过来会让人按一次 Esc 关掉一个
+    // 看不见的弹窗，而眼前的图还开着。
+    if (isPreviewOpen()) {
+      closePreview();
+      return;
+    }
+    closeModal();
   });
 
-  window.addEventListener("hashchange", () => route());
+  window.addEventListener("hashchange", () => {
+    // 路由变了，图还挂在上一个会话的附件上：先关掉，再渲染新页面。
+    closePreview();
+    route();
+  });
 }
 
 async function boot() {
@@ -1674,6 +2178,11 @@ window.oacp = {
   openModal,
   closeModal,
   confirmDialog,
+  // 助手层的 ui_preview：打开灯箱的是页面，不是抽屉 —— 抽屉只传 id，
+  // 会话守卫与「这个 id 属于当前会话」都在 panel.js 那一侧判。
+  openPreview,
+  closePreview,
+  previewItems,
   lang: () => lang,
   panelToken: () => localStorage.getItem(TOKEN_KEY) || "",
   // The assistant removes agents through the same endpoint the page does, so it

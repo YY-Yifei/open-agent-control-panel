@@ -31,6 +31,8 @@ PNG_B64 = base64.b64encode(PNG_BYTES).decode("ascii")
 JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00" * 40
 JPEG_B64 = base64.b64encode(JPEG_BYTES).decode("ascii")
 PDF_BYTES = b"%PDF-1.7 not a picture"
+#: A ZIP container: the panel keeps pictures, text and PDF, and refuses this.
+ZIP_BYTES = b"PK\x03\x04" + b"\x00" * 40
 
 PUSH_METHODS = {"tasks/pushNotificationConfig/set", "CreateTaskPushNotificationConfig"}
 SEND_METHODS = {"message/send", "SendMessage"}
@@ -222,16 +224,79 @@ def test_two_pictures_under_one_sentence_are_both_kept(client, app, fetcher) -> 
 
 def test_a_file_that_is_not_a_picture_leaves_a_chip_not_silence(client, app, fetcher) -> None:
     agent = register(client, fetcher)
-    payload = base64.b64encode(PDF_BYTES).decode("ascii")
-    Agent([file_part(payload, mime="image/png", name="report.pdf")]).install(app)
+    payload = base64.b64encode(ZIP_BYTES).decode("ascii")
+    Agent([file_part(payload, mime="application/zip", name="bundle.zip")]).install(app)
 
     message = last_agent(chat(client, agent["id"]))
 
     [file] = message["attachments"]
     assert file["skipped"] == "unsupported"
-    assert file["name"] == "report.pdf"
+    assert file["name"] == "bundle.zip"
     # A row without bytes must not answer with an empty image.
     assert client.get(f"/api/panel/attachments/{file['id']}").status_code == 404
+
+
+def test_a_pdf_is_kept_and_served_as_a_download(client, app, fetcher) -> None:
+    # P2: a PDF has bytes worth keeping, and the browser already has a reader.
+    # It is never `inline` — that is the one header that would let a stored body
+    # become a document inside this panel's own origin.
+    agent = register(client, fetcher)
+    payload = base64.b64encode(PDF_BYTES).decode("ascii")
+    Agent([file_part(payload, mime="application/pdf", name="report.pdf")]).install(app)
+
+    [file] = last_agent(chat(client, agent["id"]))["attachments"]
+    assert file["skipped"] is None
+    assert file["mime"] == "application/pdf"
+    assert file["name"] == "report.pdf"
+
+    served = client.get(f"/api/panel/attachments/{file['id']}")
+    assert served.status_code == 200
+    assert served.content == PDF_BYTES
+    assert served.headers["content-type"] == "application/pdf"
+    assert served.headers["content-disposition"].startswith("attachment;")
+    assert served.headers["content-security-policy"] == "sandbox"
+    assert served.headers["x-content-type-options"] == "nosniff"
+
+
+def test_text_an_agent_sends_is_stored_and_served_as_plain_text(client, app, fetcher) -> None:
+    # The declared type is ignored in favour of the bytes: `text/markdown` is
+    # stored as `text/plain`, because that is the only type this panel will ever
+    # serve it as. The *name* is kept, because `.md` is the only remaining hint
+    # about which kind of text it is.
+    agent = register(client, fetcher)
+    body = "# 周报\n\n- 完成 A\n- 完成 B\n"
+    payload = base64.b64encode(body.encode("utf-8")).decode("ascii")
+    Agent([file_part(payload, mime="text/markdown", name="week.md")]).install(app)
+
+    [file] = last_agent(chat(client, agent["id"]))["attachments"]
+    assert file["skipped"] is None
+    assert file["mime"] == "text/plain"
+    assert file["name"] == "week.md"
+
+    served = client.get(f"/api/panel/attachments/{file['id']}")
+    assert served.status_code == 200
+    assert served.content.decode("utf-8") == body
+    assert served.headers["content-type"].startswith("text/plain")
+    assert served.headers["content-disposition"].startswith("attachment;")
+    assert served.headers["content-security-policy"] == "sandbox"
+
+
+def test_html_an_agent_sends_is_stored_as_text_not_as_a_document(client, app, fetcher) -> None:
+    # An HTML body is valid UTF-8, so it is kept — as text. Serving it as
+    # `text/html` (or inline) is what would turn an agent's reply into a script
+    # running in this origin. The two headers below are the whole guarantee.
+    agent = register(client, fetcher)
+    body = "<script>window.pwned = 1</script>\n"
+    payload = base64.b64encode(body.encode("utf-8")).decode("ascii")
+    Agent([file_part(payload, mime="text/html", name="evil.html")]).install(app)
+
+    [file] = last_agent(chat(client, agent["id"]))["attachments"]
+    assert file["mime"] == "text/plain"
+
+    served = client.get(f"/api/panel/attachments/{file['id']}")
+    assert served.headers["content-type"].startswith("text/plain")
+    assert served.headers["content-disposition"].startswith("attachment;")
+    assert served.headers["content-security-policy"] == "sandbox"
 
 
 def test_unreadable_base64_is_a_chip_too(client, app, fetcher) -> None:
@@ -526,10 +591,10 @@ def test_two_unnamed_files_the_panel_refuses_are_two_chips() -> None:
     assert oversized_a.reason == media.SKIP_TOO_LARGE
     assert oversized_a.sha256 != oversized_b.sha256
 
-    pdf_a = media.intake(b"%PDF-1.7 one", max_bytes=1024)
-    pdf_b = media.intake(b"%PDF-1.7 two", max_bytes=1024)
-    assert pdf_a.reason == media.SKIP_UNSUPPORTED
-    assert pdf_a.sha256 != pdf_b.sha256
+    zip_a = media.intake(b"PK\x03\x04 one", max_bytes=1024)
+    zip_b = media.intake(b"PK\x03\x04 two", max_bytes=1024)
+    assert zip_a.reason == media.SKIP_UNSUPPORTED
+    assert zip_a.sha256 != zip_b.sha256
 
 
 def test_the_same_refused_bytes_are_still_one_chip() -> None:

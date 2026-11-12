@@ -109,6 +109,60 @@ def test_a_non_image_is_refused_even_when_labelled_as_one() -> None:
     assert caught.value.code == "attachment_unsupported"
 
 
+def test_text_is_decided_by_bytes_not_by_name() -> None:
+    # The four refusals, each about the bytes rather than the label.
+    assert media.sniff_text("周报\n第二行\n".encode("utf-8")) is True
+    assert media.sniff_text(b"plain ascii\n") is True
+    # A PNG renamed notes.txt: NUL is the strongest single signal.
+    assert media.sniff_text(b"\x89PNG\r\n\x1a\n\x00\x00") is False
+    # A PDF is valid ASCII, and still not text.
+    assert media.sniff_text(b"%PDF-1.7 looks like ascii") is False
+    assert media.sniff_text(b"PK\x03\x04zip") is False
+    # GBK is refused rather than transcoded: transcoding is changing the content.
+    assert media.sniff_text("中文".encode("gbk")) is False
+    # ANSI colour codes are legal text: a browser shows them literally in a <pre>.
+    assert media.sniff_text(b"ansi \x1b[31mred\x1b[0m\n") is True
+    # One control character in three bytes is binary that got lucky.
+    assert media.sniff_text(b"a\x01b") is False
+
+
+def test_a_text_file_keeps_its_own_name_and_is_stored_as_plain_text() -> None:
+    payload = base64.b64encode("# 会议记录\n".encode("utf-8")).decode("ascii")
+    prepared = media.prepare(
+        {"mime": "text/markdown", "name": "notes.md", "data": payload}, max_bytes=1024
+    )
+    assert prepared.mime == "text/plain"
+    # `.md` is kept: rewriting it to `.txt` would throw away the only hint about
+    # which kind of text this is.
+    assert prepared.name == "notes.md"
+
+
+def test_a_text_name_is_still_a_label_never_a_location() -> None:
+    payload = base64.b64encode(b"hello\n").decode("ascii")
+    prepared = media.prepare(
+        {"mime": "text/plain", "name": "../../etc/passwd", "data": payload}, max_bytes=1024
+    )
+    assert prepared.name == "passwd"
+
+
+def test_a_pdf_cannot_be_attached_by_a_person() -> None:
+    # The composer offers pictures and text. A PDF arrives from agents (and is
+    # kept there); attaching one is still refused with a stable code.
+    payload = base64.b64encode(b"%PDF-1.7 report").decode("ascii")
+    with pytest.raises(PanelError) as caught:
+        media.prepare(
+            {"mime": "application/pdf", "name": "report.pdf", "data": payload}, max_bytes=1024
+        )
+    assert caught.value.code == "attachment_unsupported"
+
+
+def test_text_labelled_as_an_image_is_a_mismatch_not_a_text_file() -> None:
+    payload = base64.b64encode(b"just words\n").decode("ascii")
+    with pytest.raises(PanelError) as caught:
+        media.prepare({"mime": "image/png", "name": "x.png", "data": payload}, max_bytes=1024)
+    assert caught.value.code == "attachment_type_mismatch"
+
+
 def test_a_file_name_is_a_label_never_a_location() -> None:
     prepared = media.prepare(
         {"mime": "image/png", "name": "../../etc/passwd", "data": PNG_B64}, max_bytes=1024
@@ -126,6 +180,32 @@ def test_an_oversized_image_is_refused_before_it_is_decoded() -> None:
 
 
 # ----------------------------------------------------------- what reaches the wire
+
+
+def test_a_sent_text_file_arrives_as_plain_text(client, app, fetcher) -> None:
+    agent = register(client, fetcher)
+    fake = RecordingAgent().install(app)
+    body = "# 会议记录\n\n决定：周五上线。\n"
+    payload = base64.b64encode(body.encode("utf-8")).decode("ascii")
+
+    session = send(
+        client,
+        agent["id"],
+        {
+            "text": "see attached",
+            "attachments": [{"mime": "text/markdown", "name": "notes.md", "data": payload}],
+        },
+    ).json()["session"]
+
+    parts = fake.message()["parts"]
+    assert parts[1] == {
+        "kind": "file",
+        "file": {"bytes": payload, "mimeType": "text/plain", "name": "notes.md"},
+    }
+    [file] = session["messages"][0]["attachments"]
+    assert file["mime"] == "text/plain"
+    assert file["name"] == "notes.md"
+    assert file["skipped"] is None
 
 
 def test_a_sent_image_arrives_as_a_file_part(client, app, fetcher) -> None:

@@ -80,6 +80,9 @@
   </aside>
 
   <div id="modal-root"></div>
+  <!-- 灯箱自己的根节点：不复用 #modal-root —— openModal 会把挂起的确认当成
+       「已取消」结算，而看一张图不该替用户取消一个待确认的删除。 -->
+  <div id="lightbox-root"></div>
   <div id="toast-root" class="toast-root" aria-live="polite"></div>
   <script type="module" src="/static/app.js"></script>
 </body>

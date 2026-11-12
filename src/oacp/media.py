@@ -1,4 +1,4 @@
-"""Image attachments, in both directions: accept them, check them, describe them.
+"""Attachments, in both directions: accept them, check them, describe them.
 
 Why this is a module and not three lines in ``sessions``: one attachment crosses
 four layers (HTTP body → stored row → wire ``Part`` → rendered bubble) and every
@@ -52,6 +52,54 @@ _MIME_ALIASES: dict[str, str] = {
     "image/pjpeg": "image/jpeg",
     "image/x-png": "image/png",
 }
+
+#: The one type a stored text file is ever served as. A declaration of
+#: ``text/html`` or ``image/svg+xml`` never reaches the database under its own
+#: name: both are script containers, and this panel renders text *as text*.
+TEXT_MIME = "text/plain"
+
+#: Documents the panel keeps but never renders inside its own page. PDF is here
+#: because the browser already has a reader: handing the bytes to it is safer
+#: than putting a plugin boundary inside the panel's document. Outbound a person
+#: cannot attach these — the composer offers pictures and text only.
+DOCUMENT_TYPES: dict[str, str] = {
+    "application/pdf": "pdf",
+}
+
+#: Extension per stored type. Text keeps whatever name it arrived with, so this
+#: is only the fallback for a file that came without one.
+EXTENSIONS: dict[str, str] = {**IMAGE_TYPES, **DOCUMENT_TYPES, TEXT_MIME: "txt"}
+
+#: Formats that are *not* text even when their bytes decode as UTF-8. PDF is the
+#: one that matters: ``%PDF-1.7`` is pure ASCII, so "does it decode?" alone would
+#: store a PDF as a log and show its source in the preview. ZIP covers docx and
+#: friends; OLE covers the older Office files.
+BINARY_PREFIXES: tuple[bytes, ...] = (
+    b"%PDF-",
+    b"PK\x03\x04",
+    b"PK\x05\x06",
+    b"\x1f\x8b",
+    b"\xd0\xcf\x11\xe0",
+    b"\x7fELF",
+    b"\x00asm",
+)
+
+#: How much of a file is inspected for NUL. It is the strongest single signal
+#: that a file is not text, and cheap enough to run on every inbound part.
+NUL_WINDOW = 64 * 1024
+
+#: C0 controls that are *not* legal in text: everything except tab, newline,
+#: form feed, carriage return and ESC. ESC stays because logs carry ANSI colour
+#: codes and a browser renders them literally inside a <pre>. DEL counts as
+#: binary evidence.
+#:
+#: Compiled, and matched at C level: :func:`sniff_text` runs on every inbound
+#: part on *every poll*, before the sha256 dedupe can short-circuit, so a
+#: per-character Python loop over a multi-megabyte document is a real latency
+#: amplifier. The scan is not bounded to a prefix on purpose — character density
+#: is a whole-file property, and a window would let a file whose second half is
+#: binary pass.
+_BAD_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0e-\x1a\x1c-\x1f\x7f]")
 
 #: Longest filename kept. Browsers hand over the local file name, which on some
 #: systems is far longer than anything a sane agent wants to read back.
@@ -116,7 +164,7 @@ class Intake:
 
     @property
     def shown(self) -> bool:
-        """True when this file has bytes a browser can render."""
+        """True when this file has bytes the panel keeps (not a chip)."""
         return self.prepared is not None
 
     @property
@@ -163,6 +211,71 @@ def sniff(data: bytes) -> str | None:
     return None
 
 
+def sniff_document(data: bytes) -> str | None:
+    """Return the type of a document kept but never rendered, or None."""
+    if data.startswith(b"%PDF-"):
+        return "application/pdf"
+    return None
+
+
+#: ``application/*`` spellings that are really text on the wire. They are stored
+#: as :data:`TEXT_MIME`; this tuple only answers "is it worth fetching at all?".
+_TEXTY_APPLICATIONS: tuple[str, ...] = (
+    "application/json",
+    "application/xml",
+    "application/javascript",
+    "application/x-javascript",
+    "application/x-sh",
+    "application/x-yaml",
+    "application/toml",
+    "application/sql",
+)
+
+
+def accepts_document(declared: str) -> bool:
+    """True when a *declared* type is one whose bytes this panel might keep.
+
+    Used by the inbound URL path to decide whether to fetch at all: a URL from an
+    agent that says ``image/png``, ``text/markdown`` or ``application/pdf`` is
+    worth a guarded download, while one that says ``application/zip`` is not —
+    and downloading it would only confirm the label.
+
+    An empty declaration (or ``*/*`` / ``octet-stream``) returns True: no label
+    means the bytes have to decide, which is the same rule the rest of the module
+    follows.
+    """
+    value = str(declared or "").split(";", 1)[0].strip().lower()
+    value = _MIME_ALIASES.get(value, value)
+    if not value or value in {"*/*", "application/octet-stream"}:
+        return True
+    if value.startswith(("image/", "text/")):
+        return True
+    return value in DOCUMENT_TYPES or value in _TEXTY_APPLICATIONS
+
+
+def sniff_text(data: bytes) -> bool:
+    """True when these bytes are text this panel is willing to store and show.
+
+    Four refusals, and every one of them is about the bytes rather than the name:
+
+    * a known binary/document signature — a PDF is valid ASCII but is not text;
+    * NUL in the first :data:`NUL_WINDOW` bytes;
+    * anything that is not strict UTF-8 (UTF-16 and GBK are refused rather than
+      transcoded — transcoding is changing the content);
+    * more than one control character per thousand — bytes that decode but are
+      full of C0 are binary that got lucky with the decoder.
+    """
+    if not data or data.startswith(BINARY_PREFIXES):
+        return False
+    if b"\x00" in data[:NUL_WINDOW]:
+        return False
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return len(_BAD_CONTROLS.findall(text)) * 1000 <= len(text)
+
+
 # ---------------------------------------------------------------------- outbound
 
 
@@ -206,12 +319,30 @@ def prepare(raw: Any, *, max_bytes: int) -> Prepared:
         raise PanelError("attachment_too_large", status=413, max=_megabytes(max_bytes))
 
     mime = sniff(data)
-    if mime is None or mime not in IMAGE_TYPES:
-        # Either not an image at all, or an image type we will not forward
-        # (SVG, BMP, TIFF). Both are "unsupported", and the reason is the bytes.
-        raise PanelError(
-            "attachment_unsupported", status=415, types=", ".join(sorted(IMAGE_TYPES))
+    if mime is None:
+        # Not a picture. Text is the one other thing a person may attach, and it
+        # has to be proven from the bytes: a PNG renamed `notes.txt` must not
+        # arrive as a log, and a PDF must not arrive as its own source.
+        if not sniff_text(data):
+            raise PanelError(
+                "attachment_unsupported",
+                status=415,
+                types=", ".join(sorted(IMAGE_TYPES)) + f", {TEXT_MIME}",
+            )
+        if declared.startswith("image/"):
+            # Labelling text as an image is a bug on the caller's side. Saying so
+            # is cheaper than storing it under a type it is not.
+            raise PanelError(
+                "attachment_type_mismatch", status=415, declared=declared, actual=TEXT_MIME
+            )
+        return Prepared(
+            mime=TEXT_MIME,
+            name=_text_name(raw.get("name")),
+            size=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+            data=data,
         )
+
     if declared and declared != mime:
         # The declaration disagreed with the bytes. The bytes win, and the
         # mismatch is worth surfacing rather than silently correcting: a caller
@@ -265,8 +396,26 @@ def intake(
     if len(data) > max_bytes:
         return _skip(SKIP_TOO_LARGE, declared, name, len(data), source, _hash(data))
 
-    mime = sniff(data)
-    if mime is None or mime not in IMAGE_TYPES:
+    mime = sniff(data) or sniff_document(data)
+    if mime is None:
+        # Text an agent sent is kept like a picture: the whole point of storing
+        # it is that a person can read it. Anything else is a chip with a reason.
+        if sniff_text(data):
+            shown_name = _display_name(name, TEXT_MIME)
+            return Intake(
+                prepared=Prepared(
+                    mime=TEXT_MIME,
+                    name=shown_name,
+                    size=len(data),
+                    sha256=hashlib.sha256(data).hexdigest(),
+                    data=data,
+                ),
+                reason=None,
+                mime=TEXT_MIME,
+                name=shown_name,
+                size=len(data),
+                source=source,
+            )
         return _skip(
             SKIP_UNSUPPORTED,
             declared or "application/octet-stream",
@@ -397,8 +546,18 @@ def _display_name(name: Any, mime: str) -> str:
     text = _sanitize(name)
     if text:
         return text
-    extension = IMAGE_TYPES.get(mime, "bin")
+    extension = EXTENSIONS.get(mime, "bin")
     return f"file.{extension}"
+
+
+def _text_name(name: Any) -> str:
+    """A text file's own name, kept as it is.
+
+    Unlike :func:`_safe_name` there is no extension to force: the bytes already
+    decided it is text, and the name is the only remaining hint about *which*
+    text (`.md`, `.csv`, `.log`). Rewriting it to `.txt` would throw that away.
+    """
+    return _sanitize(name) or f"file.{EXTENSIONS[TEXT_MIME]}"
 
 
 def _safe_name(name: Any, mime: str) -> str:

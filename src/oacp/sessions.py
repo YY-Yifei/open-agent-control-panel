@@ -197,10 +197,16 @@ class SessionService:
             raise PanelError("session_agent_gone", status=409, agent_id=row["agent_id"])
         if prepared and cardmod.accepts_images(agent["card"]) is False:
             # The card declares its inputs and none of them is an image. Sending
-            # anyway would spend a full round trip to be refused, and the refusal
-            # would arrive as a generic agent error instead of as a fact about the
-            # card — which is what the user can actually act on.
-            raise PanelError("agent_no_image_input", status=415, agent_id=row["agent_id"])
+            # one anyway would spend a full round trip to be refused, and the
+            # refusal would arrive as a generic agent error instead of as a fact
+            # about the card — which is what the user can actually act on.
+            #
+            # **Text is not a picture.** A card that declares `["text/plain"]` is
+            # exactly the one a `.txt` should reach; folding the two together made
+            # a staged text file unsendable (415 on send, with no way back once it
+            # is in the composer). So only pictures are refused here.
+            if any(item.mime in media.IMAGE_TYPES for item in prepared):
+                raise PanelError("agent_no_image_input", status=415, agent_id=row["agent_id"])
 
         self._remember(session_id, body, prepared)
         task = self._carry(row, body, prepared)
@@ -664,12 +670,14 @@ class SessionService:
         Nothing about "the agent is already registered" makes its next URL safe.
         """
         label = name or media.name_from_url(uri)
-        lowered = declared.strip().lower()
         # "*/*" 与 octet-stream 都是「我不知道是什么」，和空声明一样，该让字节说话：
         # accepts_images 已经把 "*/*" 读作「可能收图」，两边不能各说各话。
-        if lowered and lowered not in {"*/*", "application/octet-stream"} and not lowered.startswith("image/"):
-            # It already told us it is not a picture; fetching it would just
-            # confirm the type we were given.
+        #
+        # 这道门是「值不值得下载」，不是「收不收」：0.5.0 时目录里只有图片，
+        # 所以凡声明不是 image/* 的都在下载前拒掉了。现在文本与 PDF 也会被存
+        # 下来（预览要用），于是判据变成 media.accepts_document —— ZIP 之类
+        # 仍然在下载前拒：抓回来只会确认一遍它自己给的标签。
+        if not media.accepts_document(declared):
             return media.skip(media.SKIP_UNSUPPORTED, declared=declared, name=label, source=uri)
         if self.fetcher is None:
             return media.skip(media.SKIP_UNREACHABLE, declared=declared, name=label, source=uri)

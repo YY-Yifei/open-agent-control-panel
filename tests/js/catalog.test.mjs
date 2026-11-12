@@ -31,6 +31,10 @@ function fakeHost(overrides = {}) {
       calls.push({ attach: id });
       return `file-${id}.png`;
     },
+    preview: async (id) => {
+      calls.push({ preview: id });
+      return `file-${id}.txt`;
+    },
     clientInfo: () => ({ viewport: "800x600" }),
     confirm: async ({ title }) => {
       calls.push({ confirm: title });
@@ -43,7 +47,7 @@ function fakeHost(overrides = {}) {
 test("every declaration is a legal name with an object schema, and none repeat", () => {
   const { api, ui } = fakeHost();
   const catalog = createCatalog({ api, ui, policy: "delegate" });
-  assert.equal(catalog.declarations.length, 24);
+  assert.equal(catalog.declarations.length, 25);
   const names = catalog.declarations.map((item) => item.name);
   assert.equal(new Set(names).size, names.length, "duplicate function name");
   for (const declaration of catalog.declarations) {
@@ -60,11 +64,46 @@ test("the policy decides what is even declared", () => {
   for (const policy of ["read", "act", "all", "delegate"]) {
     sizes[policy] = createCatalog({ api, ui, policy }).declarations.length;
   }
-  assert.deepEqual(sizes, { read: 17, act: 21, all: 23, delegate: 24 });
+  assert.deepEqual(sizes, { read: 18, act: 22, all: 24, delegate: 25 });
   // The delegate capability is the one that can make one agent drive another.
   const all = createCatalog({ api, ui, policy: "all" }).names;
   assert.ok(!all.includes("panel_send_message"));
   assert.ok(POLICY_TIERS.read.length === 1);
+});
+
+test("ui_preview is a read: looking changes nothing", async () => {
+  const { api, ui, calls } = fakeHost();
+  const catalog = createCatalog({ api, ui, policy: "read" });
+  // Opening a lightbox is the one way a model can *show* something without
+  // touching it: the read policy keeps it, unlike ui_attach.
+  assert.ok(catalog.names.includes("ui_preview"));
+
+  const result = await catalog.execute({
+    name: "ui_preview",
+    arguments: { attachment_id: 7 },
+    deadlineMs: 5000,
+  });
+  assert.deepEqual(calls.find((call) => call.preview), { preview: 7 });
+  assert.equal(result.status, "ok");
+  assert.match(result.parts[0].text, /opened file-7\.txt in the preview/);
+});
+
+test("ui_preview says it failed when the page refuses", async () => {
+  const { api } = fakeHost();
+  const ui = {
+    preview: async () => {
+      throw new Error("that attachment is not in the conversation that is open");
+    },
+  };
+  const catalog = createCatalog({ api, ui, policy: "read" });
+  const result = await catalog.execute({
+    name: "ui_preview",
+    arguments: { attachment_id: 3 },
+    deadlineMs: 5000,
+  });
+  // 失败必须如实回到模型手上：报成「已打开」会让人去找一个根本不存在的视图。
+  assert.equal(result.status, "error");
+  assert.match(result.parts[0].text, /not in the conversation/);
 });
 
 test("ui_attach stays out of the read policy — staging a file is an act", () => {

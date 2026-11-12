@@ -4,6 +4,48 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] — 2026-11-12
+
+### Added
+
+- **Preview an attachment in the panel.** A picture opens in a lightbox at full size; a text
+  file is shown as text; a PDF and anything else get a file card with download and "open in
+  a new tab". The thumbnail is the only gesture — it is a real `<button>`, so Tab, Enter and
+  screen readers work without a second key map. The lightbox has its own root instead of
+  `#modal-root`: opening a preview must not settle a pending delete confirmation as cancelled.
+- Text files (strict UTF-8, no NUL, not a PDF/ZIP) can be attached, sent and received. The
+  bytes decide, never the extension: a PNG renamed `notes.txt` is refused, a log called
+  `README` is accepted. Text is stored as `text/plain`, served as a download, and rendered
+  with `textContent` — an agent's `<script>` shows up as characters, not as code.
+- PDFs an agent sends are kept and downloadable. The panel never renders them: the bytes go
+  to the browser's own reader, outside this origin.
+- **`ui_preview`** (tier `read`): the drawer can open an attachment for the person. It
+  refuses an id that is not in the open conversation — attachment ids are small integers
+  handed out globally, so without that guard a model could walk them. Tier counts are now
+  read 18 / act 22 / all 24 / delegate 25.
+
+### Changed
+
+- `Content-Disposition` is `inline` only for images. Everything else is `attachment` and
+  carries `CSP: sandbox`: `inline` for an arbitrary stored body is the one header that turns
+  a file into a document inside the panel's own origin.
+- A card that declares text input only no longer loses the composer's attach button: text
+  can still be attached and only pictures are refused. Before, a staged `.txt` was accepted
+  by the composer and then rejected with 415 at send time, with no way back.
+- The file picker's `accept` widened to text types, so the files the new copy promises are
+  actually selectable.
+
+### Fixed
+
+- Evicting a cached attachment (or changing the panel token) left its object URL alive
+  forever, because the cache's promise resolved to a record and the revoke call still
+  expected a URL string.
+- "Open in a new tab" allocated a fresh object URL per click; it now reuses one per record,
+  says so when the popup blocker eats the tab, and tells a failed load apart from a loading
+  one. A picture that cannot be decoded no longer reports "no bytes".
+- Text or PDF parts an agent pointed at by URL were refused before the download: the
+  pre-fetch gate still assumed every attachment was a picture.
+
 ## [0.7.0] — 2026-11-12
 
 ### Added

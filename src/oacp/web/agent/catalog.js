@@ -315,6 +315,23 @@ export function createCatalog({ api, ui, policy = "act" } = {}) {
     {
       tier: TIER_READ,
       declaration: {
+        name: "ui_preview",
+        description:
+          "把会话里的一个附件打开给用户看：图片放大、文本显示内容、PDF 与其他文件给下载入口。不发送、不改任何数据。附件 id 从 panel_get_session 的 attachments 取，不许编造。",
+        timeoutMs: 15000,
+        parameters: object({ attachment_id: { type: "integer", minimum: 1 } }, ["attachment_id"]),
+      },
+      run: async ({ attachment_id }) => {
+        // No `markDispatched`: opening a view has no persistent effect, same as
+        // `ui_open`. The call returns only after the page has actually mounted
+        // it, so "opened" is not an optimistic guess.
+        const name = await ui.preview(attachment_id);
+        return `opened ${name} in the preview; nothing was sent or changed`;
+      },
+    },
+    {
+      tier: TIER_READ,
+      declaration: {
         name: "ui_modal",
         description: "用弹窗展示较长的内容（比 toast 适合长文本）。",
         timeoutMs: 5000,

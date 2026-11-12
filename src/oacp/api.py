@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from . import __version__
 from .adp import card as cardmod
 from .adp.service import RegistryError
+from . import media
 from .errors import PanelError
 from .sessions import SessionService
 from .tasks import TaskService
@@ -486,12 +487,22 @@ def create_session(
 
 @router.get("/attachments/{attachment_id}")
 def get_attachment(request: Request, attachment_id: int) -> Response:
-    """Serve one image this panel stored, whichever direction it arrived from.
+    """Serve one attachment this panel stored, whichever direction it arrived from.
 
-    The bytes are the panel's own copy of a picture — one a person attached, or one
-    an agent sent back. The type is the one sniffed when the bytes were accepted,
-    and the answer carries ``nosniff``: a stored blob must never be able to talk
-    the browser into treating it as anything but the picture it was checked to be.
+    The bytes are the panel's own copy — a picture or a text file a person
+    attached, or one an agent sent back. The type is the one sniffed when the
+    bytes were accepted, and the answer carries ``nosniff``: a stored blob must
+    never be able to talk the browser into treating it as anything but what it
+    was checked to be.
+
+    **Only a picture is ``inline``.** For everything else — text, PDF, any other
+    file an agent sent — the answer is ``attachment``, because ``inline`` is the
+    single header that lets a stored body become a *document* in this origin.
+    Text is displayed by the page with ``textContent``, never by the browser
+    rendering it as HTML; a PDF is handed to the browser's own reader as a
+    download. Non-image answers also carry ``CSP: sandbox``, so even a file that
+    somehow did render would sit in an opaque origin with no access to this
+    panel's storage or tokens.
 
     A row whose ``skipped`` is set has no bytes — it exists so the conversation can
     say *why* a file is not on screen. Serving it would mean answering with an
@@ -505,16 +516,28 @@ def get_attachment(request: Request, attachment_id: int) -> Response:
         ).fetchone()
     if row is None or row["skipped"]:
         raise PanelError("attachment_not_found", status=404)
-    return Response(
-        content=bytes(row["data"]),
-        media_type=row["mime"],
-        headers={
-            "content-disposition": f'inline; filename="{_header_name(row["name"])}"',
-            "x-content-type-options": "nosniff",
-            # A row is immutable: this id always means these bytes.
-            "cache-control": "private, max-age=31536000, immutable",
-        },
-    )
+    mime = str(row["mime"] or "application/octet-stream")
+    # The same allowlist the writer uses, not an ``image/`` prefix: that prefix
+    # would also admit ``image/svg+xml`` — a script container — and serve it
+    # inline without the sandbox the non-image branch adds. Today no such row can
+    # exist, but this endpoint should re-assert that invariant rather than depend
+    # on a set of callers it does not control.
+    inline = mime in media.IMAGE_TYPES
+    headers = {
+        "content-disposition": (
+            f'{"inline" if inline else "attachment"}; '
+            f'filename="{_header_name(row["name"])}"'
+        ),
+        "x-content-type-options": "nosniff",
+        # A row is immutable: this id always means these bytes.
+        "cache-control": "private, max-age=31536000, immutable",
+    }
+    if not inline:
+        # Opaque origin for anything that is not a picture: a sandboxed document
+        # cannot read this panel's storage, and it cannot run as this origin even
+        # if a browser ignores the disposition.
+        headers["content-security-policy"] = "sandbox"
+    return Response(content=bytes(row["data"]), media_type=mime, headers=headers)
 
 
 @router.get("/sessions/{session_id}")
