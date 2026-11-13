@@ -12,8 +12,12 @@ import {
   bytesToBase64,
   classify,
   decodeText,
+  fileLabel,
+  fileMeta,
   formatBytes,
+  isMarkdown,
   looksBinary,
+  previewView,
   truncateText,
   typeLabel,
 } from "../../src/oacp/web/preview.js";
@@ -177,4 +181,46 @@ test("typeLabel: known types are named, unknown ones are shown, not guessed", ()
   assert.equal(typeLabel("text/plain; charset=utf-8"), "TXT");
   assert.equal(typeLabel("application/x-weird"), "APPLICATION/X-WEIRD");
   assert.equal(typeLabel(""), "FILE");
+});
+
+test("isMarkdown: the name is the only evidence there is", () => {
+  // 服务端把 md 归一成 text/plain（media.prepare 只放行图片/PDF），所以合并
+  // 进库里的 mime 从来不会说自己是 markdown —— 判据只能落在名字上。
+  assert.equal(isMarkdown({ name: "README.md", mime: "text/plain" }), true);
+  assert.equal(isMarkdown({ name: "docs/guide.MARKDOWN" }), true);
+  assert.equal(isMarkdown({ name: "notes.md " }), true);
+  // 名字里带 md 但不是后缀：不因为「看着像」就渲染。
+  assert.equal(isMarkdown({ name: "readme.md.txt" }), false);
+  assert.equal(isMarkdown({ name: "md" }), false);
+  assert.equal(isMarkdown({ name: "markdown.js" }), false);
+  assert.equal(isMarkdown({ name: "mdown" }), false);
+  assert.equal(isMarkdown({}), false);
+  assert.equal(isMarkdown(null), false);
+});
+
+test("previewView: markdown opens rendered, everything else opens as source", () => {
+  assert.equal(previewView({ name: "README.md", mime: "text/plain" }), "rendered");
+  assert.equal(previewView({ name: "notes.txt", mime: "text/plain" }), "source");
+  // 改名成 .md 的 PNG：字节说了算。classify 判它是图片，就不该走渲染分支 ——
+  // 否则一份二进制会被当 Markdown 解释，屏幕上是一团噪声。
+  assert.equal(previewView({ name: "shot.md", mime: "image/png" }), "source");
+  // 没有字节的附件没有视图可言。
+  assert.equal(previewView({ name: "a.md", mime: "text/plain", skipped: "too_large" }), "source");
+});
+
+test("fileLabel: the composer chip and the card say the same thing", () => {
+  // 同一个文件在输入框旁与发送之后必须是同一个称呼（评审第 4 轮）。
+  assert.equal(fileLabel({ name: "README.md", mime: "text/plain" }), "Markdown");
+  assert.equal(fileLabel({ name: "notes.txt", mime: "text/plain" }), "TXT");
+  assert.equal(fileLabel({ name: "shot.png", mime: "image/png" }), "IMAGE/PNG");
+  // 改名成 .md 的 PNG 仍然是图片：字节优先，称呼不能跟着名字走。
+  assert.equal(fileLabel({ name: "shot.md", mime: "image/png" }), "IMAGE/PNG");
+});
+
+test("fileMeta: a .md file is labelled Markdown, not TXT", () => {
+  // 说法必须和做法一致：我们按 Markdown 渲染它，就不能在附件条上标 TXT。
+  assert.equal(fileMeta({ name: "README.md", mime: "text/plain", size: 2048 }), "Markdown · 2 KB");
+  assert.equal(fileMeta({ name: "notes.txt", mime: "text/plain", size: 0 }), "TXT · 0 B");
+  // 图片仍然只看 mime：名字里带 .md 的 PNG 是图片，不是文档。
+  assert.equal(fileMeta({ name: "shot.md", mime: "image/png", size: 1024 }), "IMAGE/PNG · 1 KB");
 });

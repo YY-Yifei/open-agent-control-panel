@@ -108,6 +108,19 @@ def test_code_blocks_keep_their_content_verbatim() -> None:
     assert one("```py\nprint(1)") == '<pre><code class="lang-py">print(1)</code></pre>'
     # 块里的 * 与 # 是字面量。
     assert one("```\n*a* #b\n```") == "<pre><code>*a* #b</code></pre>"
+    # 多行代码块（2026-11-13 实拍发现）：收尾正则里的 `$` 在 m 下只匹配行尾，
+    # 曾让第二行掉出代码块、变成一段普通段落。单行用例永远测不出它。
+    assert one("```py\na = 1\nb = 2\n```") == '<pre><code class="lang-py">a = 1\nb = 2</code></pre>'
+    # 未闭合的围栏（被截断的输出）：整段都在块里，不是只剩第一行。
+    assert one("```py\na = 1\nb = 2") == '<pre><code class="lang-py">a = 1\nb = 2</code></pre>'
+    # 代码块之后的内容仍然按块级语法解析：修 bug 不能把后面的段落吃掉。
+    assert one("```py\na = 1\n```\n\n段落") == '<pre><code class="lang-py">a = 1</code></pre><p>段落</p>'
+    # 空围栏：既没有语言也没有内容，渲染成空串（而不是一个空 <pre>）。
+    assert one("```\n```") == ""
+    # 两个代码块之间的段落也必须还在：懒惰匹配不能贪到下一个围栏之外。
+    assert one("```\n1\n```\n\ntext\n\n```\n2\n```") == (
+        "<pre><code>1</code></pre><p>text</p><pre><code>2</code></pre>"
+    )
 
 
 # ------------------------------------------------------------------- 链接
@@ -186,13 +199,25 @@ def test_reply_html_is_never_live_markup(source: str) -> None:
 # ------------------------------------------------------------ 前端接线回归
 
 
-def test_only_agent_replies_are_rendered_as_markdown() -> None:
+def test_only_agent_replies_and_markdown_files_are_rendered() -> None:
     """用户自己的输入必须留在纯文本。
 
     否则人打一句「# 标题」会莫名其妙变成大标题，而错误文案本来就是服务端
     拼好的整句，过一遍 Markdown 只会改坏它。
+
+    第二处渲染点是附件灯箱（2026-11-13 起）：一份 **Markdown 文档**按渲染结果打开。
+    判据是 `previewView`（名字像 md **且** 字节是文本），不是「这段文本里
+    有 `#`」。护栏因此从「只准出现一次」变成「两处都写在条件表达式的分支
+    上」—— 渲染仍然是 opt-in，而不是默认。
     """
     app = (WEB / "app.js").read_text(encoding="utf-8")
     assert 'import { renderMarkdown } from "./md.js";' in app
     assert 'role === "agent" ? renderMarkdown(message.text) : esc(message.text)' in app
-    assert app.count("renderMarkdown(") == 1
+    assert app.count("renderMarkdown(") == 2
+    # 第一处：只有 agent 的角色分支；第二处：只有判定为 Markdown 文档时。
+    assert app.count("renderMarkdown(message.text)") == 1
+    # 判据算一次、两个决定（是否渲染 / 用哪种视图）都从它出发，不许各算一遍。
+    assert "const view = previewView(file);" in app
+    assert 'view === "rendered" ? renderMarkdown(part.text) : ""' in app
+    # 加了渲染视图，原文视图也不能退化：非 md 文本仍然只经 textContent。
+    assert "pre.textContent = part.text" in app

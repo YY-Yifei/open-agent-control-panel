@@ -19,10 +19,11 @@ import {
   bytesToBase64,
   classify,
   decodeText,
+  fileLabel,
   fileMeta,
   formatBytes,
+  previewView,
   truncateText,
-  typeLabel,
 } from "./preview.js";
 
 const API = "/api/panel";
@@ -93,6 +94,8 @@ const DICT = {
     "preview.broken": "这个附件打不开，可能已损坏。",
     "preview.unauthorized": "需要面板口令才能查看这个附件。",
     "preview.textTruncated": "仅显示前 {shown} 行（共 {lines} 行 / {total} 字符），下载可看全文。",
+    "preview.source": "源码",
+    "preview.rendered": "渲染",
     "preview.imageMeta": "{width}×{height}，{size}",
     "preview.pdfHint": "PDF 交给浏览器自己的阅读器打开，面板不在这里渲染它。",
     "preview.otherHint": "这类文件面板不渲染内容，可以下载或在新标签打开。",
@@ -230,6 +233,8 @@ const DICT = {
     "preview.broken": "This attachment could not be opened — it may be damaged.",
     "preview.unauthorized": "This attachment needs the panel token.",
     "preview.textTruncated": "Showing the first {shown} of {lines} lines ({total} characters). Download for the whole file.",
+    "preview.source": "Source",
+    "preview.rendered": "Rendered",
     "preview.imageMeta": "{width}×{height}, {size}",
     "preview.pdfHint": "A PDF goes to the browser's own reader; the panel does not render it.",
     "preview.otherHint": "The panel does not render this type — download it or open it in a new tab.",
@@ -719,7 +724,7 @@ function renderAttachments() {
       // 的破图（浏览器会给它画一个带边框的空白方块）。
       const face = item.preview
         ? `<img src="${esc(item.preview)}" alt="${esc(item.name)}" />`
-        : `<span class="chip-file">${esc(typeLabel(item.mime))}</span>`;
+        : `<span class="chip-file">${esc(fileLabel(item))}</span>`;
       return `<figure class="chip" title="${esc(item.name)}">
         ${face}
         <button type="button" data-detach="${index}" aria-label="${esc(t("attach.remove"))}">×</button>
@@ -1163,6 +1168,12 @@ const LIGHTBOX = {
   token: 0,
   record: null,
   file: null,
+  // 文本附件的两种视图。`part` 是 truncateText() 的结果（原文 + 截断信息），
+  // `html` 是渲染结果（非 md 为空串）。存下来是为了切视图时不重解码、不把
+  // 20 万字符再过一遍正则。
+  part: null,
+  html: "",
+  view: "source",
   // 加载失败与还在加载是两种状态：都显示「正在读取」会让人一直等一个不会来的图。
   failed: false,
 };
@@ -1185,12 +1196,19 @@ function previewItems() {
 
 function lightboxShell(file) {
   const meta = fileMeta(file);
+  // Markdown 给一个「源码 / 渲染」切换：默认按渲染打开（人要读的是文档，不是
+  // 它的标记），但原文必须够得着 —— 预览里最要紧的一条权限是「能核对」。
+  // 文案说的是「切过去会看到什么」，由 syncViewButton 维护。
+  const toggle =
+    previewView(file) === "rendered"
+      ? `<button class="btn ghost" type="button" data-lightbox-view="1" disabled>${esc(t("preview.source"))}</button>`
+      : "";
   return `<div class="lightbox-backdrop">
     <figure class="lightbox" role="dialog" aria-modal="true" aria-label="${esc(t("preview.title"))}">
       <header class="lightbox-head">
         <span class="lightbox-name" title="${esc(file.name)}">${esc(file.name)}</span>
         <span class="lightbox-meta">${esc(meta)}</span>
-        <span class="lightbox-actions">
+        <span class="lightbox-actions">${toggle}
           <button class="btn ghost" type="button" data-lightbox-download="${esc(file.id)}">${esc(t("preview.download"))}</button>
           <button class="btn ghost" type="button" data-lightbox-open="${esc(file.id)}">${esc(t("preview.openTab"))}</button>
           <button class="link lightbox-close" type="button" data-lightbox-close="1" aria-label="${esc(t("preview.close"))}">✕</button>
@@ -1206,6 +1224,10 @@ function lightboxNote(body, text) {
   note.className = "lightbox-note";
   note.textContent = text;
   body.replaceChildren(note);
+  // 所有「没有内容」的路径都从这里出去（取字节失败、解码失败、没有字节）。
+  // 头部那颗切换按钮是按文件名造的，这时它后面没有任何视图 —— 不摘掉就是一颗
+  // 点了没反应的按钮。
+  syncViewButton();
 }
 
 /**
@@ -1231,6 +1253,9 @@ async function openPreview(items, index) {
   LIGHTBOX.record = null;
   LIGHTBOX.file = file;
   LIGHTBOX.failed = false;
+  LIGHTBOX.part = null;
+  LIGHTBOX.html = "";
+  LIGHTBOX.view = "source";
   // 打开前记住焦点，关闭时还回去：键盘用户不该被扔回页面顶部。
   if (!LIGHTBOX.opener) LIGHTBOX.opener = document.activeElement;
   document.body.classList.add("lightbox-open");
@@ -1261,7 +1286,15 @@ async function openPreview(items, index) {
         lightboxNote(body, t("preview.broken"));
         return;
       }
-      renderTextPreview(body, truncateText(decoded));
+      const part = truncateText(decoded);
+      // 渲染一次、存起来：切视图不该让同一份文本再过一遍正则。渲染与否是
+      // preview.js 的判据（可单测），这里只管画。
+      // 判据算一次：`html` 非空与「视图是 rendered」是同一条规则的两种说法，
+      // 各自再调用一次 previewView 只会让它们有机会漂开。
+      const view = previewView(file);
+      LIGHTBOX.part = part;
+      LIGHTBOX.html = view === "rendered" ? renderMarkdown(part.text) : "";
+      showTextPreview(body, part, view);
       return;
     }
     if (kind === "image") {
@@ -1288,23 +1321,85 @@ async function openPreview(items, index) {
   }
 }
 
-function renderTextPreview(body, part) {
-  const pre = document.createElement("pre");
-  pre.className = "lightbox-text";
-  // 只经 textContent：附件内容永远不是 HTML。用 innerHTML 就等于让 agent 的
-  // 回复在这个 origin 里执行（而且它手里还有面板口令）。
-  pre.textContent = part.text;
-  body.replaceChildren(pre);
-  if (part.truncated) {
-    const note = document.createElement("p");
-    note.className = "lightbox-note";
-    note.textContent = t("preview.textTruncated", {
-      shown: part.shownLines,
-      lines: part.lines,
-      total: part.total,
-    });
-    body.appendChild(note);
+/**
+ * 文本附件的两种读法：源码（字节原样）与渲染（Markdown）。
+ *
+ * 渲染是**视图**，不是转换：`part.text` 一个字都没变，切回去仍然是同一份字节。
+ * 两种视图共用同一条截断说明 —— 截断是字节层面的事实，跟怎么读无关。
+ */
+function showTextPreview(body, part, view) {
+  const html = view === "rendered" ? LIGHTBOX.html : "";
+  // 空文档（只有空白的 .md）渲染出来是一块空白：与其让人以为加载失败，不如
+  // 退回源码 —— 它至少还说明「这个文件里只有空白」。
+  LIGHTBOX.view = html ? "rendered" : "source";
+  const note = part.truncated ? truncatedNote(part) : null;
+  if (html) {
+    const doc = document.createElement("div");
+    // `.md` 复用气泡那套排版（仓库里唯一的 Markdown 容器类），`.lightbox-md`
+    // 只管灯箱自己的留白与行宽。
+    doc.className = "lightbox-md md";
+    // 全项目只有 md.js 拼 HTML，它先整体转义、再匹配语法、地址走白名单。
+    // 附件内容一律按不可信输入处理 —— 这一行与消息气泡那一行是同一个信任级别。
+    doc.innerHTML = html;
+    // 说明放进**同一个**容器：渲染视图的正文限宽 76ch 居中，说明若留在外面就
+    // 会横跨整个灯箱，于是「读之前先看这一行」和它描述的那份文档分处两个栏宽。
+    // 用 :has() 也能只对齐这一种情况，但那是较新的选择器，这个包没有转译步骤。
+    if (note) doc.prepend(note);
+    body.replaceChildren(doc);
+  } else {
+    const pre = document.createElement("pre");
+    pre.className = "lightbox-text";
+    // 只经 textContent：附件内容永远不是 HTML。用 innerHTML 就等于让 agent 的
+    // 回复在这个 origin 里执行（而且它手里还有面板口令）。
+    pre.textContent = part.text;
+    body.replaceChildren(...(note ? [note, pre] : [pre]));
   }
+  syncViewButton();
+}
+
+/**
+ * 「已截断」那一行。它永远排在内容**之上**：一份 20 万字符的文档，把说明挂在
+ * 末尾等于没有说明 —— 读者从顶上看下去，那份文档「看起来是完整的」，而唯一说
+ * 实话的那行字在第 5000 行之后。截断这件事必须在读之前就知道。
+ */
+function truncatedNote(part) {
+  const note = document.createElement("p");
+  note.className = "lightbox-note preview-truncated";
+  note.textContent = t("preview.textTruncated", {
+    shown: part.shownLines,
+    lines: part.lines,
+    total: part.total,
+  });
+  return note;
+}
+
+/** 切换按钮上的字是「切过去会看到什么」，不是「现在是什么」。 */
+function syncViewButton() {
+  const button = $("#lightbox-root")?.querySelector("[data-lightbox-view]");
+  if (!button) return;
+  // 没有第二种视图（纯空白 / 非 Markdown）就把它摘掉：留一颗点了没反应的
+  // 按钮，比没有按钮更让人怀疑页面坏了。用 remove 而不是 hidden —— `.btn`
+  // 有自己的 display，`[hidden]` 未必压得住。
+  if (!LIGHTBOX.html) {
+    button.remove();
+    return;
+  }
+  // 内容到位之前它是 disabled 的（`lightboxShell` 里就带着这个属性）：一份大
+  // 文本要 fetch + arrayBuffer + 解码，那几秒里点一颗「看起来能用」的按钮、
+  // 却什么都不发生，比灰着更让人怀疑页面坏了。
+  button.disabled = false;
+  button.textContent = t(LIGHTBOX.view === "rendered" ? "preview.source" : "preview.rendered");
+}
+
+function togglePreviewView() {
+  const body = $("#lightbox-root")?.querySelector(".lightbox-body");
+  if (!body || !LIGHTBOX.part || !LIGHTBOX.html) return;
+  // `.lightbox-body` 是滚动容器，而 `replaceChildren` 会把 scrollTop 夹回 0。
+  // 切视图的用途就是「同一处原文/渲染对照」—— 每次都被扔回顶部，等于每切一次
+  // 都要重新滚一遍长文档。两种视图行高不同，位置只是近似，但比回到顶部有用得多。
+  const top = body.scrollTop;
+  showTextPreview(body, LIGHTBOX.part, LIGHTBOX.view === "rendered" ? "source" : "rendered");
+  body.scrollTop = top;
 }
 
 function renderImagePreview(body, file, url, token) {
@@ -1363,6 +1458,9 @@ function closePreview() {
   LIGHTBOX.record = null;
   LIGHTBOX.file = null;
   LIGHTBOX.failed = false;
+  LIGHTBOX.part = null;
+  LIGHTBOX.html = "";
+  LIGHTBOX.view = "source";
   root.innerHTML = "";
   document.body.classList.remove("lightbox-open");
   const opener = LIGHTBOX.opener;
@@ -2065,6 +2163,11 @@ function bindDom() {
     const newTab = event.target.closest("[data-lightbox-open]");
     if (newTab) {
       openAttachmentTab(newTab.dataset.lightboxOpen);
+      return;
+    }
+    // 只切视图，不重取字节：切换按钮永远不触发网络请求。
+    if (event.target.closest("[data-lightbox-view]")) {
+      togglePreviewView();
       return;
     }
     const close = event.target.closest("[data-close]");

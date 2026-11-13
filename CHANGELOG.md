@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **A Markdown attachment opens rendered.** A `.md` / `.markdown` file used to be shown as raw
+  source like any other text; the lightbox now opens it as a document — headings, tables,
+  fenced code, quotes, links — with the original bytes one click away behind a "Source"
+  toggle. Rendering is a view, not a conversion: switching back shows the same bytes.
+  The decision is a predicate rather than a guess (name ends in `.md` **and** the bytes are
+  text), so a PNG renamed `shot.md` still opens as a picture, and a `.txt` full of `#` is
+  still text. Truncation is stated **above** the content — a note at the end of a
+  200k-character document is not a note — and the toggle starts disabled until the bytes
+  land, so it is never a click that silently does nothing.
+- `fileLabel` (web): one source for how an attachment's type is named, so the staged chip in
+  the composer and the card after sending agree (`Markdown`, not `TXT`).
+
+### Fixed
+
+- A fenced code block rendered only its **first line**; the rest fell out of the block as an
+  ordinary paragraph. The terminator used `$`, which under the `m` flag matches end of
+  *line*, so the lazy body stopped at the first newline — multi-line code in agent replies
+  was broken the same way, invisibly, because every existing test used a one-line fence. It
+  now ends at its own closing fence or at end of input.
+- The composer chip labelled a `.md` file `TXT` while the panel rendered that same file as
+  Markdown.
+
 ## [0.8.0] — 2026-11-12
 
 ### Added

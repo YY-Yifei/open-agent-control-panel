@@ -989,6 +989,37 @@ body.lightbox-open {
   overflow-wrap: anywhere;
 }
 
+/* 渲染视图：排版全部来自 `.md`（气泡那一套），这里只管灯箱自己的尺度。
+   灯箱比气泡宽得多 —— 沿用它 17px 的标题会缩成一团，而一行 1100px 的正文
+   读不下去，所以限宽并按比例放大标题。 */
+.lightbox-md {
+  max-width: 76ch;
+  margin: 0 auto;
+  padding: 18px 20px;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.lightbox-md h1 { font-size: 24px; }
+.lightbox-md h2 { font-size: 20px; }
+.lightbox-md h3 { font-size: 17px; }
+.lightbox-md h4,
+.lightbox-md h5,
+.lightbox-md h6 { font-size: 15px; }
+
+/* `.md pre` 的底色是 var(--bg)，而灯箱自己的底色也是 var(--bg)：不换色的话，
+   渲染视图里的代码块只剩一圈 1px 边框（浅色主题下几乎看不出来，深色主题里
+   也被压平）。气泡是 --bg-soft 上的 --bg，这里正好相反。 */
+.lightbox-md pre { background: var(--bg-soft); }
+
+/* 截断说明是「先读它、再读文件」的一行，所以它在内容之上：给一条分隔线，
+   免得它看起来像文档自己的第一段。 */
+.preview-truncated {
+  border-bottom: 1px solid var(--line);
+}
+
 .lightbox-note {
   margin: 0;
   padding: 14px;

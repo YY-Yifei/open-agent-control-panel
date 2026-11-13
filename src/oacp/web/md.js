@@ -254,8 +254,12 @@ export function renderMarkdown(source) {
 
   // 围栏代码块：先整块摘出来。未闭合的围栏也照样吃掉 —— agent 输出被截断时，
   // 把剩下的 ``` 原样吐在气泡里比少一个闭合更难看。
+  // 收尾条件里那个 `$` 开了 `m` 之后是**行尾**，不是输入末尾 —— 懒惰的
+  // `[\s\S]*?` 于是在代码块的第一行末尾就收手，多行代码块只剩第一行在框里，
+  // 其余掉成普通段落（实拍发现：README 里的 ```python 块只显示了 `def hello():`）。
+  // 未闭合的围栏要吃到输入末尾，那里用 (?!\[\s\S])：它在且仅在输入末尾成立。
   const fenced = raw.replace(
-    /^ {0,3}```([^\n`]*)\n?([\s\S]*?)(?:^ {0,3}```[ \t]*$|$)/gm,
+    /^ {0,3}```([^\n`]*)\n?([\s\S]*?)(?:^ {0,3}```[ \t]*$|(?![\s\S]))/gm,
     (_all, info, body) => {
       const language = String(info).trim().split(/\s+/)[0];
       const cls = language ? ` class="lang-${escapeHtml(language)}"` : "";

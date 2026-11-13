@@ -78,6 +78,52 @@ export function classify(file) {
   return "file";
 }
 
+/**
+ * 这份附件的名字是不是 Markdown —— 只看名字。
+ *
+ * 为什么不能看 mime：服务端把一切非图片/PDF 的文本都归一成 `text/plain`
+ * （media.prepare），`text/markdown` 从来不会写进库里。名字是唯一的剩余线索，
+ * 而名字是不可信的：叫 `README.md` 的文件里完全可以是 PNG 字节。字节由
+ * `classify` 负责，两者合起来的规则是「classify 说是文本，且这里说是 md」——
+ * 见 `previewView`。
+ *
+ * @param {{name?: string}|null|undefined} file
+ * @returns {boolean}
+ */
+export function isMarkdown(file) {
+  const name = String((file && file.name) || "").trim();
+  // 只认这两个真实存在的后缀，大小写不敏感：Windows 上的 `README.MD` 与
+  // macOS 上的 `README.md` 是同一份文件。
+  return /\.(md|markdown)$/i.test(name);
+}
+
+/**
+ * 这是一份 Markdown **文档**吗：名字像 md，**并且**字节是文本。
+ *
+ * 两个条件缺一不可，所以只在这一个地方定义：
+ *   - 只看名字，一份叫 `shot.md` 的 PNG 会被当成文档渲染成一团噪声；
+ *   - 只看字节，每一份文本都会被「渲染」，而 `.txt` 里的 `#` 不该变成标题。
+ *
+ * @param {{mime?: string, name?: string, skipped?: string|null}|null|undefined} file
+ * @returns {boolean}
+ */
+export function isMarkdownDocument(file) {
+  return classify(file) === "text" && isMarkdown(file);
+}
+
+/**
+ * 一个文本附件该用哪种视图打开：`rendered`（Markdown）还是 `source`（原文）。
+ *
+ * 这是**判据**，放在这里而不是灯箱里，是为了它能被单测覆盖 —— 「md 默认看
+ * 渲染结果」是一条产品决定，不该只活在一个画 DOM 的函数里。
+ *
+ * @param {{mime?: string, name?: string, skipped?: string|null}|null|undefined} file
+ * @returns {"rendered"|"source"}
+ */
+export function previewView(file) {
+  return isMarkdownDocument(file) ? "rendered" : "source";
+}
+
 function toBytes(input) {
   if (input instanceof Uint8Array) return input;
   if (input instanceof ArrayBuffer) return new Uint8Array(input);
@@ -300,9 +346,28 @@ export function typeLabel(mime) {
  * 三处各写一遍的时候，改一次格式要改三次，漏一处就是两个地方对同一份文件
  * 说两个数。
  *
- * @param {{mime?: string, size?: number}} file
+ * 标签先问名字、再问 mime：`.md` 一律存成 `text/plain`（服务端不肯留
+ * `text/markdown`），只看 mime 的话，一份 README 会被标成 `TXT` —— 而我
+ * 们明明已经按 Markdown 渲染它了。说法和做法必须一致。名字后面还要跟上
+ * 字节的判定（`isMarkdownDocument`），否则一份叫 `shot.md` 的 PNG 会被标成
+ * Markdown，而那是一个比 TXT 更误导的谎言。
+ *
+ * @param {{mime?: string, name?: string, size?: number}} file
  * @returns {string}
  */
 export function fileMeta(file) {
-  return `${typeLabel(file && file.mime)} · ${formatBytes(file && file.size)}`;
+  return `${fileLabel(file)} · ${formatBytes(file && file.size)}`;
+}
+
+/**
+ * 一份附件在界面上叫什么类型 —— **唯一**的称呼来源。
+ *
+ * 暂存条（输入框旁）与附件卡/灯箱头都必须走这里：同一个 `.md` 不能一边标
+ * `TXT`、一边标 `Markdown`。名字先于 mime，因为服务端只存 `text/plain`。
+ *
+ * @param {{mime?: string, name?: string, skipped?: string|null}|null|undefined} file
+ * @returns {string}
+ */
+export function fileLabel(file) {
+  return isMarkdownDocument(file) ? typeLabel("text/markdown") : typeLabel(file && file.mime);
 }
