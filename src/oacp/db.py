@@ -19,7 +19,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class MigrationError(RuntimeError):
@@ -221,68 +221,129 @@ def _widen(connection: sqlite3.Connection) -> None:
 
 
 def _rekey_agents(connection: sqlite3.Connection, previous: int) -> None:
-    """Re-derive ids from the stored URL (schema 4 → 5).
+    """Re-derive ids from ``(host, card name)`` (schema 7 -> 8).
 
-    Schema 4 keyed an entry by ``sha256(card name)``; ADP §4.1 keys it by
-    ``sha256(normalised url)``. A file written by 0.3.0 therefore has to be
-    re-keyed once, or every stored entry would look unregistered and its URL —
-    still unique — would be unregisterable. Conversations and tasks point at the
-    agent id, so they are re-pointed in the same pass.
+    Every release before this one keyed an entry by ``sha256(normalised url)``. That
+    made a port change a *new agent*: an operator restarting a local agent on another
+    port got a new id, and the conversations pointing at the old one became
+    unreachable. Schema 8 keys on the host without its port plus the card's name, so
+    the same agent coming back on a new port is the same entry.
 
-    The name rule was a local invention: the published contract says two URLs
-    serving one card are two entries, and it does not let a registry decide that
-    a rename is a different agent. Schema 4 existed for one release; this pass
-    takes those files back to the rule every other release has used.
+    Two things make this pass harder than the URL one it replaces.
 
-    The old ``id`` was a name hash and the new one is a URL hash, so two rows can only
-    collide here by accident (ADP §10's 64-bit warning) — never legitimately: ``url`` is
-    UNIQUE. A collision therefore aborts the pass instead of merging, because merging
-    would delete one of two real entries and §10 says to stop rather than guess.
+    **Several rows can land on one id.** That is not a collision, it is the point: a
+    file written across several port changes holds several rows for one agent. §10
+    says a collision must stop rather than merge, and merging here would also throw
+    away a row's manage token, so nothing is deleted. The group is ordered by the
+    row's own attributes — a live one first, then the most recent success, then the
+    url as a tie-break — and the first member takes the derived id while the rest
+    take ``<id>_2``, ``<id>_3``, … . They stay addressable and deletable; they are
+    simply no longer the entry a registration resolves to.
 
-    Each statement autocommits (``isolation_level=None``), which is why the pass
-    has to be idempotent: an interrupted run leaves ``user_version`` at 4 and the
-    next start finishes the job without moving anything twice.
+    **The ordering must not depend on ``id``**, because this pass rewrites ids and so
+    has to be idempotent. The writes themselves run in one explicit transaction, so an
+    interruption rolls the whole pass back and leaves ``user_version`` at 7 — the next
+    start recomputes the same mapping from the same attributes. Without it, a crash
+    between a row's id change and its conversations' re-point would leave sessions
+    pointing at an id that no longer exists, and a rerun could not repair that: the row
+    already sits at its target id and is no longer part of the move.
+
+    Two *different* groups deriving one id are a real collision (the 64-bit caveat in
+    §4.1). That aborts the pass before anything is written, which keeps §10's meaning
+    for the accidental case.
+
+    Conversations and tasks point at the agent id, so they move with it. A dangling
+    reference — an entry deleted while its conversations stayed — keeps the old id:
+    re-keying it would point it at an unrelated agent.
     """
-    # ``5`` and not ``SCHEMA_VERSION``: this pass takes a *schema 4* file to
-    # schema 5. Later versions keep the same derivation, so a 5 file must not be
-    # walked again — the check has to name the boundary it guards.
-    if previous >= 5:
+    if previous >= 8:
         return
 
-    from .net import derive_id  # local: ``net`` must stay ignorant of storage
+    from .net import derive_id, name_key, path_of  # local: ``net`` stays storage-free
     from .util import iso
 
-    rows = connection.execute("SELECT id, url FROM agents").fetchall()
-    moved = False
+    rows = connection.execute(
+        "SELECT id, url, host, card, status, last_ok_at FROM agents"
+    ).fetchall()
+    if not rows:
+        return
+
+    def _name(row: sqlite3.Row) -> str:
+        try:
+            payload = json.loads(row["card"])
+        except (TypeError, ValueError):
+            return ""
+        return str(payload.get("name") or "") if isinstance(payload, dict) else ""
+
+    groups: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
     for row in rows:
-        old_id = row["id"]
-        new_id = derive_id(row["url"])
-        if new_id == old_id:
-            continue
-        moved = True
+        # Folded exactly as ``derive_id`` folds it: a stored host differing only in
+        # case must join its own group instead of deriving the same id in a second
+        # one, which would read as a collision and abort the pass. The path is part of
+        # the group for the same reason it is part of the key.
+        groups.setdefault(
+            (row["host"].casefold(), path_of(row["url"]), name_key(_name(row))), []
+        ).append(row)
 
-        survivor = connection.execute(
-            "SELECT url FROM agents WHERE id = ?", (new_id,)
-        ).fetchone()
-        if survivor is not None:
-            # ADP §10: the merge judgement is the url itself, never the id. ``agents.url``
-            # is UNIQUE and has been stored normalised since 0.2, so a *different* row
-            # already holding ``new_id`` can only be a 64-bit collision of the
-            # RECOMMENDED derivation — merging it would silently drop a real entry.
-            # Stop instead, leaving ``user_version`` at 4 for the next start.
+    mapping: dict[str, str] = {}
+    claimed: dict[str, tuple[str, str]] = {}
+    for (host, path, _folded), members in groups.items():
+        ordered = sorted(members, key=lambda item: item["url"])
+        ordered.sort(key=lambda item: item["last_ok_at"], reverse=True)
+        ordered.sort(key=lambda item: item["status"] != "ok")
+        base = derive_id(host, path, _name(ordered[0]))
+        if base in claimed:
+            first = claimed[base]
             raise MigrationError(
-                "cannot re-key agents: two different urls derive the same id "
-                f"({survivor['url']!r} and {row['url']!r} -> {new_id!r}); "
-                "nothing was merged — resolve the collision or start a fresh database"
+                "cannot re-key agents: two different hosts and names derive the same "
+                f"id ({first[0]!r} / {first[1]!r} and {host!r} / {_name(ordered[0])!r} "
+                f"-> {base!r}); nothing was merged — resolve the collision or start a "
+                "fresh database"
             )
-        connection.execute("UPDATE agents SET id = ? WHERE id = ?", (new_id, old_id))
-        # Repointing before or after the agents row does not matter: neither table
-        # declares a foreign key, and both orders leave the same result.
-        connection.execute("UPDATE sessions SET agent_id = ? WHERE agent_id = ?", (new_id, old_id))
-        connection.execute("UPDATE tasks SET agent_id = ? WHERE agent_id = ?", (new_id, old_id))
+        claimed[base] = (host, _name(ordered[0]))
+        for index, row in enumerate(ordered):
+            mapping[row["id"]] = base if index == 0 else f"{base}_{index + 1}"
 
-    if moved:
+    moving = {old: new for old, new in mapping.items() if old != new}
+    if not moving:
+        return
+
+    # Two passes. A target id may currently belong to another row in this same pass,
+    # so every moving row parks under an id that cannot collide (``~`` is not allowed
+    # in a contract id) before any of them takes its final one.
+    parked = {old_id: f"~tmp~{index}" for index, old_id in enumerate(moving)}
+    # Dependants need parking of their own, for a different reason: nothing makes
+    # ``sessions.agent_id`` unique, so re-pointing one is a sweep by value, and one
+    # row's target id can be another row's source id. Sweeping in place would drag a
+    # conversation that was just re-pointed onto an unrelated agent — silently, and in
+    # a way no rerun can repair.
+    seats = {old_id: f"~seat~{index}" for index, old_id in enumerate(moving)}
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for old_id, temporary in parked.items():
+            connection.execute("UPDATE agents SET id = ? WHERE id = ?", (temporary, old_id))
+        for old_id, seat in seats.items():
+            connection.execute(
+                "UPDATE sessions SET agent_id = ? WHERE agent_id = ?", (seat, old_id)
+            )
+            connection.execute("UPDATE tasks SET agent_id = ? WHERE agent_id = ?", (seat, old_id))
+        for old_id, new_id in moving.items():
+            connection.execute("UPDATE agents SET id = ? WHERE id = ?", (new_id, parked[old_id]))
+        for old_id, new_id in moving.items():
+            connection.execute(
+                "UPDATE sessions SET agent_id = ? WHERE agent_id = ?", (new_id, seats[old_id])
+            )
+            connection.execute(
+                "UPDATE tasks SET agent_id = ? WHERE agent_id = ?", (new_id, seats[old_id])
+            )
         connection.execute(
             "INSERT INTO registrations (ip, host, at, outcome) VALUES (?, NULL, ?, ?)",
             ("migration", iso(), "rekeyed"),
         )
+        connection.execute("COMMIT")
+    except Exception:
+        try:
+            connection.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise

@@ -240,39 +240,72 @@ Records follow the contract exactly: `cardHash` is `sha256(JCS(card))`, `checked
 every attempt, `lastOkAt` only on success, and `changedAt`/`prevHash` are always present
 (nullable) so clients need one branch, not two.
 
-### Identity is the URL; the id is only a handle
+### Identity is the host, the path and the card name; the id is only a handle
 
 ADP §4.1 leaves the id's *algorithm* to the implementation and fixes four properties instead:
 URL-safe (`^[A-Za-z0-9_-]{1,64}$`), stable within an entry, at most one entry per url, and
-opaque to consumers. This registry picks the RECOMMENDED derivation — `a_` + the first 16 hex
-characters of `sha256(normalised url)` — because it makes "one url, one row" structural
-(concurrent registrations land on the same id, with no uniqueness table) and any
-implementation can recompute it. Normalisation is deliberately minimal — lower-case scheme and
-host, drop a default `:443`, upper-case percent escapes — so
-`HTTPS://Geo.Example.com:443/Card.json` and `https://geo.example.com/Card.json` are one entry,
-while `…/Card.json` and `…/Card.json/` are two. Nothing else is rewritten: no trailing slash,
-no `..` collapsing, no query sorting.
+opaque to consumers. This registry keys an entry on the agent's **host, the path it is served
+at, and its card name**, deriving `a_` + the first 16 hex characters of
+`sha256(host \n path \n name)`. Names are folded first — NFC, whitespace collapsed,
+case-folded — so a cosmetic edit is not a different agent.
+
+The **port is not in the key**, and that is the point. A locally-run agent restarts on another
+port several times a day; keyed by URL, every restart was a *new agent*, with the conversations
+pointing at the old one suddenly unreachable. Keyed by host, path and name, the agent that comes
+back is the same entry, with its id, its token and its conversations.
+
+The **path stays** because it is what separates two agents on one shared hostname. Behind a
+reverse proxy a registry sees one host and many paths: the port discriminates nothing there and
+the path always does. Folding paths together would let one agent's registration move another's
+entry — and, with it, another's conversations — onto a different agent.
+
+All four §4.1 properties still hold: one url normalises to exactly one `(host, path, name)`, so
+`url -> id` is still a function and "at most one entry per url" is untouched. What changed is the
+converse, which the contract never required: one id may now cover several urls — one agent seen
+on successive ports — and the registry resolves that by treating a re-registration under a new
+url as the same entry moving.
+
+Normalisation of the URL is unchanged and still minimal — lower-case scheme and host, drop a
+default `:443`, upper-case percent escapes — so `HTTPS://Geo.Example.com:443/Card.json` and
+`https://geo.example.com/Card.json` are one entry, while `…/Card.json` and `…/Card.json/` are
+two. Nothing else is rewritten: no trailing slash, no `..` collapsing, no query sorting.
 
 | Situation | Result |
 |---|---|
 | Same URL, spelled differently | `200`, one entry |
 | Same URL, same spelling | `200`, the stored record, token never rotated |
-| Same card on two URLs | `201`, **two** entries — the URL is the key, not the name |
-| Renamed card at the same URL | the next probe follows it: `changedAt`/`prevHash` move, the id does not |
+| Same card on two **hosts**, or at two **paths** | `201`, **two** entries |
+| Same host, path and name, new **port** | `200`, the entry **moves**: id, `firstSeenAt` and token stay |
+| Renamed card at a stable URL | `200`, `changedAt`/`prevHash` move; the id does **not** |
 
-The id says nothing about *who* an agent is, and nothing may be read out of it — no url, no
-timestamp, no ordering, no length. ADP is explicit that identity comes from the A2A card's
-signature, and a registry that cannot prove ownership has no business minting it. The same url
-gets a different id at another registry, so ids are not a cross-registry correlation key. The
-corollary for this panel: conversations follow the entry, not the name — an agent that comes
-back on a different URL comes back as a new entry, with no sessions attached.
+Three costs, stated rather than hidden:
 
-A database written by 0.3.0 is re-keyed once, on open (schema 4 → 5): ids are recomputed from
-each entry's stored URL and `sessions.agent_id` / `tasks.agent_id` are re-pointed. Entries that
-happened to publish one name stay separate, because the URL — not the name — is what they are.
-Should two rows ever derive the same id (§4.1's 64-bit caveat), the pass stops and refuses to
-merge: §10 says the judgement is the url, never the id, and the alternative is losing a real
-entry.
+* **A repeat registration costs a fetch.** The name lives in the card, so the entry cannot be
+  located without retrieving it; before, storage alone answered. Re-registering an agent that
+  is *offline* therefore fails like any other unreachable URL.
+* **Within one host and path the name decides.** Two differently-named agents there are two
+  entries; two identically-named ones are one, and the second address moves the entry.
+* **A move requires the old address to be dead.** Registering the same name on a new port moves
+  the entry only once the previous url has stopped answering — a restart leaves it dead, which is
+  the case this exists for. While the old address still serves that card, the answer is
+  `409 AGENT_STILL_AT_OLD_URL`: that is a second agent with the same name, not a move.
+
+An id is a handle that stays put: it is derived once, when the entry is born, and never
+recomputed. A rename updates the card and leaves the id — and the conversations — alone, which
+is why a renamed agent's id still spells its first name's digest. The id says nothing about
+*who* an agent is, and nothing may be read out of it — no url, no host, no timestamp, no
+ordering. ADP is explicit that identity comes from the A2A card's signature, and a registry that
+cannot prove ownership has no business minting it. The same url gets a different id at another
+registry, so ids are not a cross-registry correlation key.
+
+A database written by any release before 0.9 is re-keyed once, on open (schema 7 → 8): ids are
+recomputed from each entry's stored host and card name, and `sessions.agent_id` /
+`tasks.agent_id` are re-pointed. Rows for one agent across several ports — exactly what a file
+written over several restarts holds — cannot all take the same id, and merging would throw away
+a manage token, so nothing is deleted: the most recently successful row takes the derived id
+and the others take `<id>_2`, `<id>_3`, … . Should two rows from *different* hosts and names
+derive one id (§4.1's 64-bit caveat), the pass stops and refuses to merge: §10 says the
+judgement is the row, never the id, and the alternative is losing a real entry.
 
 Panel endpoints (not part of ADP). The conversation surface is what the UI uses; the
 `tasks` rows underneath are kept for automation and debugging:

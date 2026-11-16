@@ -89,11 +89,27 @@ class RegistryService:
     # ------------------------------------------------------------------ writing
 
     def register(self, url: str, *, client_ip: str = "unknown") -> Registration:
-        """Fetch, validate and store an agent, idempotently.
+        """Fetch, validate and store an agent, keyed on ``(host, card name)``.
 
-        The id is derived from the normalised URL (ADP §4.1), so a repeat
-        registration is answerable from storage alone: the stored record comes
-        back untouched and the manage token is never rotated.
+        The id no longer comes from the URL, so the card has to be fetched *before*
+        the entry can be located: a repeat registration now costs one round trip
+        instead of zero. That is the price of the key, paid on purpose — the id is
+        what every conversation points at, and it has to survive a restart on a new
+        port. An agent that is offline can therefore no longer confirm a repeat
+        registration; it fails the fetch like any other unreachable URL.
+
+        Four outcomes, and the difference between the last three is the whole point:
+
+        * ``(host, name)`` is new -> 201, a fresh entry with a manage token;
+        * it exists under the **same** url -> 200, storage untouched (a repeat
+          registration must not rotate the token or move any timestamp);
+        * it exists under a **different** url -> 200, the entry **moves**: url, card
+          and hashes are replaced while the id, ``first_seen_at`` and the manage
+          token stay. This is what makes a port change cost nothing;
+        * the url is already held by a **different** id -> 200, the entry
+          **adopts** the new card: the card is replaced while the id,
+          ``first_seen_at`` and the manage token stay. The id keeps spelling the
+          old name's digest, because a handle is stable within an entry.
         """
         try:
             normalized = net.normalize_url(url, allow_http=self.settings.allow_insecure_cards)
@@ -103,17 +119,43 @@ class RegistryService:
         ip = client_ip or "unknown"
         self._assert_ip_budget(ip)
         host = net.host_of(normalized)
-        agent_id = net.derive_id(normalized)
-
-        existing = self._load(agent_id)
-        if existing is not None:
-            self._assert_same_url(existing, normalized)
-            with self.db.connect() as connection:
-                self._record_registration(connection, ip, host, iso(), "existing")
-            return Registration(record=self._record(existing), manage_token=None, created=False)
 
         document = self._fetch_card(normalized)
         self._assert_card(document.payload)
+        name = cardmod.card_summary(document.payload)["name"]
+        agent_id = net.derive_id(host, net.path_of(normalized), name)
+
+        existing = self._load(agent_id)
+        if existing is not None:
+            if existing["url"] == normalized:
+                # The id matches and so does the address — but that proves the key is
+                # the same, not that the *stored card is current*. A card renamed
+                # A -> B -> A derives this entry's original id again, and treating the
+                # match as proof would answer 200 with the stale "B" card while the
+                # caller holds the "A" document it just fetched and validated.
+                # ``_adopt_name`` follows it: an unchanged digest records "existing"
+                # and moves no timestamp, a changed one replaces the card.
+                return self._adopt_name(existing, document, ip)
+            return self._move(existing, normalized, document, ip)
+
+        # A renamed card at a stable address: the url has always belonged to this
+        # entry, and the id it now derives is consequently new. Looking the url up
+        # here keeps the ordinary case off the IntegrityError path below — a renamed
+        # entry would otherwise re-enter it on every single repeat registration.
+        renamed = self._load_by_url(normalized)
+        if renamed is not None:
+            return self._adopt_name(renamed, document, ip)
+
+        # An entry that was renamed keeps the id it was born with, so neither lookup
+        # above finds it once it also changes address. Searching by the name it stored
+        # last is the only thing that does — and without it the agent splits in two: a
+        # dead entry under the old id and a live one under the new, with the history
+        # stranded on the first. That is the exact failure this change exists to
+        # remove, arriving by another door.
+        adopted = self._load_by_name(host, net.path_of(normalized), name)
+        if adopted is not None:
+            return self._move(adopted, normalized, document, ip)
+
         now = iso()
         token = new_token()
         try:
@@ -143,17 +185,243 @@ class RegistryService:
                     "SELECT * FROM agents WHERE id = ?", (agent_id,)
                 ).fetchone()
         except sqlite3.IntegrityError:
-            # A concurrent request registered the same URL first; the id is
-            # derived from the URL, so both callers mean the same entry.
+            # Either a concurrent request inserted this (host, name) first, or the
+            # url belongs to an existing entry whose card has since been renamed.
+            # ``agents.url`` is UNIQUE, so the second case surfaces here and not one
+            # line earlier — and it must be resolved, not raised: the address is the
+            # same agent, only its name (and therefore its id) changed.
             row = self._load(agent_id)
-            if row is None:
+            if row is not None:
+                if row["url"] != normalized:
+                    return self._move(row, normalized, document, ip)
+                return self._adopt_name(row, document, ip)
+            renamed = self._load_by_url(normalized)
+            if renamed is None:
                 raise
-            self._assert_same_url(row, normalized)
-            with self.db.connect() as connection:
-                self._record_registration(connection, ip, host, iso(), "existing")
-            return Registration(record=self._record(row), manage_token=None, created=False)
+            return self._adopt_name(renamed, document, ip)
 
         return Registration(record=self._record(row), manage_token=token, created=True)
+
+    def _move(
+        self,
+        row: sqlite3.Row,
+        normalized: str,
+        document: Any,
+        ip: str,
+    ) -> Registration:
+        """Point an existing entry at a new url — the port changed, the agent did not.
+
+        The id, ``first_seen_at`` and the manage token are kept: the entry is the same
+        one, and its conversations keep pointing at it. ``changed_at`` moves only when
+        the card actually changed — a restart on a new port usually serves
+        byte-identical bytes, and reporting "changed from X to X" would put the entry
+        into every ``changedSince`` result.
+
+        What this gives up is address ownership *within one host*, **across ports and
+        paths**: a party able to serve a card with the same name from the same hostname
+        can repoint an existing entry. That is the deliberate price of making a port
+        change harmless, and it is why the key stops at the host — a shared or
+        multi-tenant hostname wants ports back in the key.
+
+        One condition narrows it to almost nothing: the entry's **current** url must
+        have stopped answering. A restart on another port leaves the old port dead,
+        which is exactly the case this rule exists for; a neighbour serving a same-name
+        card from the same host leaves the old address alive, and is refused. The cost
+        is one probe, on this path only.
+
+        One thing this path must *not* do is trust the id on its own. An id match
+        says the derivation produced the same digest, and a rename or a move keeps
+        both host and path, so the (host, path) behind the stored row has to be the
+        one just derived. A digest collision is the only way it is not — and
+        answering one with a move would hand this entry's id, manage token and
+        conversations to whoever registered the colliding address (§10: never
+        merge).
+        """
+        host = net.host_of(normalized)
+        if net.host_of(row["url"]) != host or net.path_of(row["url"]) != net.path_of(
+            normalized
+        ):
+            raise RegistryError(
+                500,
+                "ID_COLLISION",
+                f"the id for {normalized!r} is already held by {row['url']!r}",
+            )
+
+        holder = self._load_by_url(normalized)
+        if holder is not None and holder["id"] != row["id"]:
+            # Two entries on one host now claim the same name and the same address.
+            # Refusing is the only honest answer: silently repointing would drop the
+            # row that already owns the url (``agents.url`` is UNIQUE), and merging
+            # would destroy a real entry (§10).
+            raise RegistryError(
+                409,
+                "URL_TAKEN",
+                f"{normalized!r} already belongs to another entry ({holder['id']})",
+            )
+
+        if self._still_serving(row):
+            raise RegistryError(
+                409,
+                "AGENT_STILL_AT_OLD_URL",
+                f"{row['url']!r} still serves a card, so this is a second agent with the "
+                f"same name rather than a move; delete that entry before registering "
+                f"{normalized!r}",
+            )
+
+        now = iso()
+        digest = card_hash(document.payload)
+        with self.db.connect() as connection:
+            # Only the UPDATE is wrapped: it is the one statement whose failure means
+            # "somebody else owns this url". A ``registrations`` constraint error, if one
+            # is ever added, must not surface as a misleading URL_TAKEN.
+            try:
+                if digest == row["card_hash"]:
+                    connection.execute(
+                        """
+                        UPDATE agents
+                           SET url = ?, host = ?, checked_at = ?, last_ok_at = ?,
+                               failures = 0, status = 'ok'
+                         WHERE id = ?
+                        """,
+                        (normalized, host, now, now, row["id"]),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE agents
+                           SET url = ?, host = ?, card = ?, card_hash = ?, prev_hash = ?,
+                               changed_at = ?, checked_at = ?, last_ok_at = ?,
+                               failures = 0, status = 'ok'
+                         WHERE id = ?
+                        """,
+                        (
+                            normalized,
+                            host,
+                            json_dumps(document.payload),
+                            digest,
+                            row["card_hash"],
+                            now,
+                            now,
+                            now,
+                            row["id"],
+                        ),
+                    )
+            except sqlite3.IntegrityError as exc:
+                # The lookups above and this UPDATE run on different connections, so a
+                # concurrent registration can take the url in between. ``agents.url`` is
+                # UNIQUE and is the only constraint this statement can violate, so the
+                # race means precisely what the explicit check above says.
+                raise RegistryError(
+                    409, "URL_TAKEN", f"{normalized!r} is already taken"
+                ) from exc
+
+            fresh = connection.execute(
+                "SELECT * FROM agents WHERE id = ?", (row["id"],)
+            ).fetchone()
+            if fresh is None:
+                # A concurrent delete removed the entry between the UPDATE and this read.
+                # Nothing autocommits a transaction around the two, so it is possible.
+                raise RegistryError(404, "NOT_FOUND", f"no agent with id {row['id']}")
+            if fresh["url"] != normalized:
+                # A concurrent registration moved this same entry to another address
+                # between our lookups and this write. Answering 200 would tell the
+                # caller its url was registered when another one won.
+                raise RegistryError(409, "URL_TAKEN", f"{normalized!r} is already taken")
+            self._record_registration(connection, ip, host, now, "moved")
+        return Registration(record=self._record(fresh), manage_token=None, created=False)
+
+    def _still_serving(self, row: sqlite3.Row) -> bool:
+        """Whether *this entry's own agent* still answers at its current url.
+
+        Not "does the address answer": a shared host can serve anything there, and an
+        unrelated JSON endpoint would otherwise block a legitimate move with advice to
+        delete the entry — the one action this rule exists to avoid. Only a card whose
+        folded name matches what this entry stored counts as still being there.
+
+        A failed fetch is the ordinary answer here, not an error: the port the agent
+        used to be on is gone, which is precisely the case a move is for.
+        """
+        try:
+            document = self._fetch_card(row["url"])
+        except (FetchError, RegistryError):
+            return False
+        try:
+            stored = json.loads(row["card"])
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(stored, dict) or not isinstance(document.payload, dict):
+            return False
+        served = cardmod.card_summary(document.payload)["name"]
+        previous = cardmod.card_summary(stored)["name"]
+        return net.name_key(served) == net.name_key(previous)
+
+    def _adopt_name(
+        self,
+        row: sqlite3.Row,
+        document: Any,
+        ip: str,
+    ) -> Registration:
+        """A stable address whose card was renamed: keep the entry, take the new card.
+
+        The url already belongs to this entry, so the agent did not move — it only
+        changed what it calls itself. The derived id for the new name is a *different*
+        id, and it is deliberately not adopted here: an id is a handle that stays
+        stable within an entry (§4.1), not a function of the current content.
+        Re-keying would re-point every conversation for a cosmetic edit, which is
+        exactly the fragility this whole change exists to remove.
+
+        Two consequences, both visible and intended: after a rename the id still
+        spells the old name's digest, and a *second* entry for the new name cannot
+        appear at this address, because ``agents.url`` is UNIQUE.
+        """
+        now = iso()
+        digest = card_hash(document.payload)
+        served = cardmod.card_summary(document.payload)["name"]
+        try:
+            previous = cardmod.card_summary(json.loads(row["card"]))["name"]
+        except (TypeError, ValueError, KeyError):
+            previous = served
+        # This method now serves the same-url path too, where a changed digest
+        # usually means the card was edited rather than renamed. The audit log is
+        # the one place the difference is visible, so record it honestly.
+        changed = "renamed" if net.name_key(served) != net.name_key(previous) else "changed"
+        with self.db.connect() as connection:
+            if digest == row["card_hash"]:
+                # Every repeat registration of a renamed agent arrives here (the
+                # derived id never matches the stored one), so an unchanged card must
+                # not claim a change from X to X — and, like the same-url path in
+                # ``register``, a repeat moves no timestamp at all, not even
+                # ``checked_at``. One rule for "nothing changed", whichever door the
+                # request came through.
+                outcome = "existing"
+            else:
+                connection.execute(
+                    """
+                    UPDATE agents
+                       SET card = ?, card_hash = ?, prev_hash = ?, changed_at = ?,
+                           checked_at = ?, last_ok_at = ?, failures = 0, status = 'ok'
+                     WHERE id = ?
+                    """,
+                    (
+                        json_dumps(document.payload),
+                        digest,
+                        row["card_hash"],
+                        now,
+                        now,
+                        now,
+                        row["id"],
+                    ),
+                )
+                outcome = changed
+            fresh = connection.execute(
+                "SELECT * FROM agents WHERE id = ?", (row["id"],)
+            ).fetchone()
+            if fresh is None:
+                # A concurrent delete removed the entry; nothing holds a transaction
+                # across the UPDATE and this read.
+                raise RegistryError(404, "NOT_FOUND", f"no agent with id {row['id']}")
+            self._record_registration(connection, ip, row["host"], now, outcome)
+        return Registration(record=self._record(fresh), manage_token=None, created=False)
 
     def delete(self, agent_id: str, token: str | None) -> None:
         """Hard-delete an entry; only the first registrant's token is accepted."""
@@ -390,22 +658,42 @@ class RegistryService:
                 "SELECT * FROM agents WHERE id = ?", (agent_id,)
             ).fetchone()
 
-    @staticmethod
-    def _assert_same_url(row: sqlite3.Row, normalized: str) -> None:
-        """Never answer for one url with another url's record (ADP §4.1 / §10).
+    def _load_by_name(self, host: str, path: str, name: str) -> sqlite3.Row | None:
+        """The entry at this ``(host, path)`` whose *stored* card carries this name.
 
-        The id is a handle for one entry, not an identity. ``url`` is UNIQUE, so a
-        row holding this id under a *different* url can only be a collision of the
-        RECOMMENDED 64-bit derivation. Returning that row would hand one registrant
-        another agent's card, and silently reusing its token would be worse; §10's
-        rule — stop, never merge — applies to the live path too.
+        The id cannot answer this: an entry keeps the id it was born with, so after a
+        rename ``derive_id(host, path, name)`` points at nothing. The path is part of
+        the match for exactly the reason it is part of the key — an agent served from
+        another path on the same host is a *different* agent, and matching it here would
+        hand one agent's entry, token and conversations to another.
         """
-        if row["url"] != normalized:
-            raise RegistryError(
-                500,
-                "ID_COLLISION",
-                f"the id for this url is already held by {row['url']!r}",
-            )
+        wanted = net.name_key(name)
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM agents WHERE host = ? ORDER BY last_ok_at DESC", (host,)
+            ).fetchall()
+        for row in rows:
+            if net.path_of(row["url"]) != path:
+                continue
+            try:
+                payload = json.loads(row["card"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict) and net.name_key(payload.get("name") or "") == wanted:
+                return row
+        return None
+
+    def _load_by_url(self, normalized: str) -> sqlite3.Row | None:
+        """Find the entry holding this url, whatever id it currently has.
+
+        ``agents.url`` is UNIQUE, so this identifies at most one row. It is how a
+        renamed card is recognised: the address is unchanged, the derived id is new,
+        and only the row that already owns the address can explain the difference.
+        """
+        with self.db.connect() as connection:
+            return connection.execute(
+                "SELECT * FROM agents WHERE url = ?", (normalized,)
+            ).fetchone()
 
     def _fetch_card(self, url: str) -> Any:
         try:

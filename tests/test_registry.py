@@ -53,8 +53,9 @@ def test_registration_is_idempotent_and_returns_one_token(client, fetcher) -> No
     assert second.status_code == 200
     assert "manageToken" not in second.json()
     assert second.json()["id"] == created["id"]
-    # The id is derived from the URL, so storage answers a repeat without a fetch.
-    assert fetcher.calls.count(CARD_URL) == 1
+    # The id is derived from (host, card name), so the name is only knowable by
+    # fetching: a repeat costs one round trip where it used to cost none.
+    assert fetcher.calls.count(CARD_URL) == 2
     assert second.json()["changedAt"] is None
 
 

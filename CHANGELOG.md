@@ -20,6 +20,41 @@ All notable changes to this project are documented here. The format follows
 - `fileLabel` (web): one source for how an attachment's type is named, so the staged chip in
   the composer and the card after sending agree (`Markdown`, not `TXT`).
 
+### Changed
+
+- **An agent is now identified by its host, its path and its card name — not by its URL.**
+  The port is not part of the key, so restarting an agent on another port is the same agent:
+  the id, the manage token and `firstSeenAt` stay, and the conversations that pointed at the
+  entry keep pointing at it. Previously every port change minted a new id and silently orphaned
+  the conversations attached to the old one.
+
+  The path is part of the key, because it is what separates two agents on one shared hostname;
+  dropping it too would let one agent's registration move another's entry and conversations.
+  Re-registering under a new url **moves** the entry (`outcome="moved"`), but only once the old
+  url has stopped answering — while it still serves that card the answer is
+  `409 AGENT_STILL_AT_OLD_URL`, which is a second agent with the same name rather than a move.
+  A renamed card at a stable address **keeps** its id (`outcome="renamed"`), because §4.1 calls
+  an id a handle that is stable within an entry, not a function of the current card — so a
+  rename does not re-point a conversation either. A rename that comes *back* to the original
+  name is followed like any other card change (`outcome="renamed"`), not answered with the
+  stale document the entry still held.
+
+  The id is only a 64-bit digest, so two different `(host, path)` can in principle mint the
+  same one. Registration never reads an id match as "the same agent": the `(host, path)` the
+  id was derived from is checked too, and a mismatch answers `500 ID_COLLISION` instead of
+  re-pointing the entry — §10's rule (stop, never merge) at runtime, because repointing would
+  hand one agent's id, manage token and conversations to another.
+
+  Two consequences worth naming: a repeat registration now costs one fetch (the name is only
+  knowable from the card), so re-registering an *offline* agent fails; and within one host and
+  path the card name decides, so two identically-named agents there are one entry.
+
+  Existing databases are re-keyed once on open (schema 7 → 8). Rows for one agent across
+  several ports cannot all take the same id; none are merged or dropped — the most recently
+  successful takes the derived id, the rest take `<id>_2`, `<id>_3`, … and stay deletable.
+  **Breaking for anything outside the panel**: every id changes, so stored
+  `/v1/agents/{id}` urls stop resolving.
+
 ### Fixed
 
 - A fenced code block rendered only its **first line**; the rest fell out of the block as an

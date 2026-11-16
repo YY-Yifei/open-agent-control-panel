@@ -16,6 +16,7 @@ import hashlib
 import ipaddress
 import re
 import socket
+import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 
 MAX_URL_LENGTH = 2048
@@ -168,23 +169,57 @@ def _upper_percent(text: str) -> str:
     return _PERCENT.sub(lambda match: match.group(0).upper(), text)
 
 
-def derive_id(normalized_url: str) -> str:
-    """``a_`` + the first 16 hex characters of ``sha256(normalised url)``.
+def name_key(name: str) -> str:
+    """Fold a card's name into the form the id is keyed on.
 
-    This is the RECOMMENDED derivation of ADP §4.1, not a rule: §4.1 leaves the
-    algorithm to the implementation and fixes four properties instead (URL-safe,
-    stable within an entry, at most one entry per url, opaque to consumers). We pick
-    this one because it makes "one url, one row" structural — concurrent
-    registrations land on the same id with no uniqueness table — and because any
-    implementation can recompute it. The price is 64 bits, which is why the schema
-    4 → 5 migration refuses to merge two rows that collide (§10).
+    A name is a display string, so ``"Geo  Agent"`` and ``"geo agent"`` are one
+    agent: collapsing whitespace and case-folding keeps a cosmetic edit from
+    creating a second entry — and, with it, a second conversation list.
 
-    Consumers MUST NOT parse it: it is a handle for one entry, not an identity. The
-    A2A signature says who an agent is, and two registries may give one url
-    different ids, so it must never be a cross-registry correlation key.
+    NFC comes first because case-folding does not normalise: a card resaved as
+    ``"Cafe\u0301"`` instead of ``"Caf\u00e9"`` is the *same* name spelled one
+    codepoint differently, and hashing the raw bytes would treat it as a new agent.
     """
-    digest = hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()
-    return "a_" + digest[:16]
+    return " ".join(unicodedata.normalize("NFC", str(name)).split()).casefold()
+
+
+def path_of(url: str) -> str:
+    """The path of a url — the part of an address a port change does not touch."""
+    return urlsplit(url).path or "/"
+
+
+def derive_id(host: str, path: str, name: str) -> str:
+    """``a_`` + the first 16 hex characters of ``sha256(host \\n path \\n name_key(name))``.
+
+    The port is not in the key, and that is the whole point: an agent restarted on
+    another port keeps its id, and therefore keeps the conversations pointing at it.
+    Something started locally on 127.0.0.1 and restarted on another port is one agent,
+    not one per port.
+
+    The **path stays**. It is what separates two agents living on one multi-tenant
+    hostname — behind a reverse proxy a registry sees one host and many paths, where
+    the port is rarely a discriminator and the path always is. Folding paths together
+    would let one agent's registration move another's entry, and its conversations,
+    onto a different agent. One host, one path, one name, one entry.
+
+    ADP §4.1 fixes four properties and leaves the algorithm to us: URL-safe, stable
+    within an entry, at most one entry per url, opaque to consumers. This derivation
+    satisfies all four — ``url -> id`` stays a function, because one url normalises to
+    exactly one ``(host, path, name)``. What it gives up is the converse, which the
+    contract never required: one id may cover *several* urls (one agent on successive
+    ports), and the registry resolves that by treating a re-registration under a new
+    url as the same entry moving.
+
+    The price is 64 bits, which is why the schema 7 -> 8 migration refuses to merge two
+    rows that collide (§10). The other price is that a **rename is a different id**:
+    the name is part of the key, so editing a card's name changes what a later
+    registration derives — although the entry keeps the id it was born with, because a
+    handle is stable within an entry.
+
+    Consumers MUST NOT parse it: it is a handle for one entry, not an identity.
+    """
+    key = f"{host.casefold()}\n{path}\n{name_key(name)}"
+    return "a_" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
 
 
 def host_and_port(url: str) -> tuple[str, int]:
