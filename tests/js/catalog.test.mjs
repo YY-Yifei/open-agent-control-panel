@@ -36,6 +36,22 @@ function fakeHost(overrides = {}) {
       return `file-${id}.txt`;
     },
     clientInfo: () => ({ viewport: "800x600" }),
+    // 布局接缝。默认返回一个「什么都正常」的快照；`overrides.layout` 可以换成
+    // 一个夹过值的版本，`null` 表示这个宿主根本没有布局（其它宿主确实没有）。
+    layout: (patch) => {
+      calls.push({ layout: patch });
+      if (overrides.layout === null) return null;
+      if (overrides.layout) return overrides.layout(patch);
+      return {
+        side: 268,
+        drawer: 400,
+        reading: "comfortable",
+        readingWidth: 760,
+        docked: true,
+        adjusted: [],
+        wanted: { side: 268, drawer: 400, reading: "comfortable", docked: true },
+      };
+    },
     confirm: async ({ title }) => {
       calls.push({ confirm: title });
       return overrides.approve;
@@ -47,7 +63,7 @@ function fakeHost(overrides = {}) {
 test("every declaration is a legal name with an object schema, and none repeat", () => {
   const { api, ui } = fakeHost();
   const catalog = createCatalog({ api, ui, policy: "delegate" });
-  assert.equal(catalog.declarations.length, 25);
+  assert.equal(catalog.declarations.length, 26);
   const names = catalog.declarations.map((item) => item.name);
   assert.equal(new Set(names).size, names.length, "duplicate function name");
   for (const declaration of catalog.declarations) {
@@ -64,11 +80,132 @@ test("the policy decides what is even declared", () => {
   for (const policy of ["read", "act", "all", "delegate"]) {
     sizes[policy] = createCatalog({ api, ui, policy }).declarations.length;
   }
-  assert.deepEqual(sizes, { read: 18, act: 22, all: 24, delegate: 25 });
+  assert.deepEqual(sizes, { read: 19, act: 23, all: 25, delegate: 26 });
   // The delegate capability is the one that can make one agent drive another.
   const all = createCatalog({ api, ui, policy: "all" }).names;
   assert.ok(!all.includes("panel_send_message"));
   assert.ok(POLICY_TIERS.read.length === 1);
+});
+
+test("ui_layout reports what the page actually did, including what it clamped", async () => {
+  const { api, ui } = fakeHost({
+    layout: () => ({
+      side: 480,
+      drawer: 340,
+      reading: "wide",
+      readingWidth: 1100,
+      docked: false,
+      adjusted: ["drawer 400px → 340px", "docked → overlay (the window is too narrow to dock)"],
+      wanted: { side: 480, drawer: 400, reading: "wide", docked: true },
+    }),
+  });
+  const catalog = createCatalog({ api, ui, policy: "read" });
+
+  // 布局是 read 档：`--agent-policy read` 下也要拿得到（它不动数据）。
+  assert.ok(catalog.names.includes("ui_layout"));
+
+  const result = await catalog.execute({ name: "ui_layout", arguments: {}, deadlineMs: 5000 });
+  assert.equal(result.status, "ok");
+  const text = result.parts[0].text;
+  assert.match(text, /reading=wide/);
+  assert.match(text, /sidebar=480px/);
+  assert.match(text, /overlay/);
+  // 夹过的值必须说出来：模型要 400 拿到 340，若回它「drawer=400」，
+  // 它下一句话就是错的。
+  assert.match(text, /adjusted: drawer 400px → 340px/);
+});
+
+test("ui_layout: out-of-range widths and unknown presets never reach the body", async () => {
+  const { api, ui, calls } = fakeHost();
+  const catalog = createCatalog({ api, ui, policy: "read" });
+  // schema 的 min/max 就是 layout.js 的边界（不是第二份数字），所以这里同时
+  // 在钉「两边是同一个来源」：模型不可能请求一个控制器收不到的宽度。
+  for (const args of [{ drawer: 700 }, { drawer: 300 }, { sidebar: 100 }, { sidebar: 481 }, { reading: "narrow" }]) {
+    const result = await catalog.execute({ name: "ui_layout", arguments: args, deadlineMs: 5000 });
+    assert.equal(result.reason, "ARGUMENTS_INVALID", JSON.stringify(args));
+  }
+  assert.equal(calls.find((item) => item.layout), undefined, "被拒的调用不该碰过布局");
+});
+
+test("ui_layout says a 'full' column fills the area instead of 'nullpx'", async () => {
+  const { api, ui } = fakeHost({
+    layout: () => ({
+      side: 268,
+      drawer: 400,
+      reading: "full",
+      readingWidth: null,
+      docked: true,
+      adjusted: [],
+      wanted: { side: 268, drawer: 400, reading: "full", docked: true },
+    }),
+  });
+  const catalog = createCatalog({ api, ui, policy: "read" });
+  const result = await catalog.execute({ name: "ui_layout", arguments: {}, deadlineMs: 5000 });
+  assert.equal(result.status, "ok");
+  assert.match(result.parts[0].text, /fills the main area/);
+  // `nullpx` 就是这条分支曾经会吐出来的东西。
+  assert.doesNotMatch(result.parts[0].text, /nullpx/);
+});
+
+test("ui_layout refuses reset-with-fields and set-without-fields", async () => {
+  const { api, ui, calls } = fakeHost();
+  const catalog = createCatalog({ api, ui, policy: "read" });
+
+  // 复位是「全部还原」，带字段一定是模型理解错了：静默丢掉字段等于告诉它
+  // 「复位 + reading=wide」两件事都做了。
+  const withFields = await catalog.execute({
+    name: "ui_layout",
+    arguments: { action: "reset", reading: "wide" },
+    deadlineMs: 5000,
+  });
+  assert.equal(withFields.status, "error");
+  assert.match(withFields.parts[0].text, /reset ignores the other fields/);
+
+  // set 但一个字段都没给：别的宿主只会回现状，不会抛 —— 所以判在这里。
+  const empty = await catalog.execute({ name: "ui_layout", arguments: { action: "set" }, deadlineMs: 5000 });
+  assert.equal(empty.status, "error");
+  assert.match(empty.parts[0].text, /needs at least one of/);
+
+  assert.equal(calls.find((item) => item.layout), undefined, "两次拒绝都不该碰过布局");
+});
+
+test("ui_layout: fields without an action mean set, not a silent no-op", async () => {
+  const { api, ui, calls } = fakeHost();
+  const catalog = createCatalog({ api, ui, policy: "read" });
+  const result = await catalog.execute({
+    name: "ui_layout",
+    arguments: { reading: "wide" },
+    deadlineMs: 5000,
+  });
+  assert.equal(result.status, "ok");
+  const call = calls.find((item) => item.layout);
+  assert.equal(call.layout.action, "set", "只带字段就该当成 set，否则模型什么也改不了");
+  assert.equal(call.layout.reading, "wide");
+});
+
+test("ui_layout refuses to look like it honoured a field it was told to ignore", async () => {
+  const { api, ui, calls } = fakeHost();
+  const catalog = createCatalog({ api, ui, policy: "read" });
+  const result = await catalog.execute({
+    name: "ui_layout",
+    arguments: { action: "get", reading: "wide" },
+    deadlineMs: 5000,
+  });
+  assert.equal(result.status, "error");
+  assert.match(result.parts[0].text, /action=get only reads/);
+  assert.equal(calls.find((item) => item.layout), undefined, "报错了就不该已经动过布局");
+});
+
+test("ui_layout says the page has no layout instead of failing with a TypeError", async () => {
+  const { api, ui } = fakeHost({ layout: null });
+  const catalog = createCatalog({ api, ui, policy: "read" });
+  const result = await catalog.execute({ name: "ui_layout", arguments: {}, deadlineMs: 5000 });
+  assert.equal(result.status, "error");
+  // 「这个页面没有布局」必须是**说人话**的文案。`reason` 在有错误文案时一律是
+  // EXECUTION_FAILED（这个目录的统一约定），所以判据在文案上：不能是
+  // TypeError 那句 `ui.layout is not a function`。
+  assert.match(result.parts[0].text, /this page has no layout to read/);
+  assert.doesNotMatch(result.parts[0].text, /is not a function/);
 });
 
 test("ui_preview is a read: looking changes nothing", async () => {

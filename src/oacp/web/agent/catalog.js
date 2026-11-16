@@ -17,6 +17,11 @@
  * hallucinate-call a name it never saw.
  */
 
+// 布局的边界与档位只定义一次，在 layout.js。schema 里的 minimum/maximum
+// 就是它们的直读 —— 两处各写一份数字，迟早会出现「控制器收 480、schema 却
+// 拒了 480」这种只有模型会撞上的错位。
+import { DRAWER, READING_NAMES, READING_PRESETS, SIDEBAR } from "../layout.js";
+
 /** Result text larger than this is cut before it reaches the model. */
 export const MAX_RESULT_CHARS = 4000;
 
@@ -222,6 +227,82 @@ export function createCatalog({ api, ui, policy = "act" } = {}) {
       run: async ({ lang }) => {
         ui.setLang(lang);
         return `lang=${lang}`;
+      },
+    },
+    {
+      tier: TIER_READ,
+      declaration: {
+        name: "ui_layout",
+        description:
+          "查看或调整面板的布局：对话栏宽度档位、左栏宽度、助手栏宽度、助手是否停靠在右侧。用户说「太窄」「挡住了」「看不全」，或你要把表格 / 代码 / 长内容给用户看清楚时用它。只改外观，不动任何数据。",
+        timeoutMs: 5000,
+        parameters: object({
+          action: {
+            type: "string",
+            enum: ["get", "set", "reset"],
+            description:
+              "get=只读当前布局（不带其它字段时的默认）；set=按其余字段调整（只带字段、不传 action 也按 set）；reset=全部恢复默认（不与其它字段同用）",
+          },
+          reading: {
+            type: "string",
+            enum: READING_NAMES,
+            description: `对话栏：comfortable=${READING_PRESETS.comfortable} 读字（默认）；wide=${READING_PRESETS.wide}，表格与代码更好看；full=占满主区，看 diff 与宽表`,
+          },
+          sidebar: { type: "integer", minimum: SIDEBAR.min, maximum: SIDEBAR.max, description: "左栏宽度（像素）" },
+          drawer: { type: "integer", minimum: DRAWER.min, maximum: DRAWER.max, description: "助手栏宽度（像素）" },
+          docked: {
+            type: "boolean",
+            description: "true=助手栏停靠在右侧、对话让位（默认）；false=浮层盖住对话",
+          },
+        }, []),
+      },
+      run: async ({ action, reading, sidebar, drawer, docked }) => {
+        // 只带字段、不给 action：当成 set。模型很容易照着字段描述直接写
+        // `ui_layout({"reading":"wide"})`，而「什么都没发生、却拿到一个成功回报」
+        // 是这一轮最不能留的形状。反过来，action=get 同时带字段要显式报错 ——
+        // 不能让那些字段看起来生效了。
+        const named = [reading, sidebar, drawer, docked].some((value) => value !== undefined);
+        if (action === "get" && named) {
+          throw new Error("action=get only reads: drop the fields, or use action=set");
+        }
+        // reset 是「全部复位」，其余字段根本到不了控制器（宿主直接 return
+        // layout.reset()）。不拦住的话「复位 + reading=wide」会被当成两件事
+        // 都做了，而模型会照着一个没生效的 reading 往下说。
+        if (action === "reset" && named) {
+          throw new Error("action=reset ignores the other fields: drop them, or use action=set");
+        }
+        // set 空转也要在这里挡：别的宿主只会把现状回给你，不会抛。
+        if (action === "set" && !named) {
+          throw new Error("action=set needs at least one of reading / sidebar / drawer / docked");
+        }
+        const mode = action || (named ? "set" : "get");
+        // 守卫接缝本身：`ui` 是注入的，别的宿主（测试、live_client）未必有 layout。
+        // 不检查的话这里抛的是 TypeError，模型收到 EXECUTION_FAILED —— 「这个页面
+        // 没有布局」和「工具坏了」是两件需要说得很不一样的事。
+        const state =
+          typeof ui.layout === "function" ? ui.layout({ action: mode, reading, sidebar, drawer, docked }) : null;
+        if (!state) {
+          throw new Error(mode === "get" ? "this page has no layout to read" : "this page has no layout to change");
+        }
+        // `readingWidth` 是 CSS 的 max-width（**上限**），不是渲染出来的列宽：
+        // 停靠时真正的列是 min(档位, 主区宽度)，1280px 窗口开抽屉时只有 576。
+        // 说成 "1100px" 会让模型把一个它没量过的数字转述给用户 —— 和 adjusted
+        // 那条「夹过的值必须说出来」是同一条规矩。
+        const column = state.readingWidth === null ? "fills the main area" : `up to ${state.readingWidth}px`;
+        const lines = [
+          `reading=${state.reading} (conversation column ${column})`,
+          `sidebar=${state.side}px`,
+          `drawer=${state.drawer}px ${state.docked ? "docked — the conversation makes room" : "overlay — it covers the conversation"}`,
+        ];
+        // A clamped value is reported, never hidden: a narrow window turns 400 into
+        // 340, and answering "drawer=400" would make the model's next sentence
+        // wrong. The same goes for a dock the window cannot afford.
+        //
+        // Values outside the schema's min/max never reach this body — they are
+        // rejected as ARGUMENTS_INVALID first. That is deliberate: the model should
+        // not have to probe for the range, and a rejected call is honest.
+        if (state.adjusted && state.adjusted.length) lines.push(`adjusted: ${state.adjusted.join("; ")}`);
+        return lines.join("\n");
       },
     },
     {

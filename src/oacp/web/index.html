@@ -8,8 +8,10 @@
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
+  <!-- 助手抽屉放在 .app 里面：停靠时它是 flex 的第三列，主区自动让位。
+       浮层模式下 position:fixed 让它照样贴右边缘，布局不受这个位置影响。 -->
   <div class="app">
-    <aside class="side">
+    <aside class="side" id="side">
       <div class="side-top">
         <a class="brand" href="#/">智能体面板</a>
         <span class="version" id="version"></span>
@@ -42,6 +44,12 @@
       </div>
     </aside>
 
+    <!-- 分隔条：一个可以拖、也可以按方向键的缝。`role="separator"` 是它
+         该有的语义 —— 它调的是两栏之间的比例，不是一个滑块。 -->
+    <div class="splitter" id="split-side" role="separator" tabindex="0"
+         aria-orientation="vertical" aria-controls="side"
+         aria-label="调整侧栏宽度" data-i18n-aria="splitter.side"></div>
+
     <main class="main">
       <header class="top" id="top"></header>
       <div class="chat" id="chat" aria-live="polite"></div>
@@ -57,27 +65,35 @@
         <input id="attach-input" type="file" multiple hidden />
       </form>
     </main>
-  </div>
 
-  <aside class="agent-drawer" id="agent-drawer" hidden aria-label="内置助手" data-i18n-aria="agent.drawer" role="dialog" aria-modal="false">
-    <header class="agent-head">
-      <span class="agent-dot" id="agent-dot" data-state="offline"></span>
-      <strong><span id="agent-title" data-i18n="agent.title">助手</span><span id="agent-model"></span></strong>
-      <span class="agent-hint" id="agent-hint"></span>
-      <button class="link" id="agent-stop" type="button" data-i18n="agent.stop" hidden>停止</button>
-      <button class="link" id="agent-clear" type="button" data-i18n="agent.clear">清空</button>
-      <button class="link" id="agent-close" type="button" aria-label="关闭" data-i18n-aria="agent.close">✕</button>
-    </header>
-    <div class="agent-log" id="agent-log" aria-live="polite"></div>
-    <!-- 输入区复用主对话的 composer 类：同一个边框、同一套自增高高度、同一个发送按钮。
-         助手不接收图片，所以这里没有附件按钮 —— 点了没反应的按钮比没有更糟。 -->
-    <form class="composer agent-compose" id="agent-form">
-      <div class="composer-inner">
-        <textarea id="agent-input" rows="1" aria-label="内置助手输入框" data-i18n-aria="agent.input" data-i18n-ph="agent.placeholder" placeholder="问我面板里的事，或让我操作界面"></textarea>
-        <button class="btn primary" id="agent-send" type="submit" data-i18n="send">发送</button>
-      </div>
-    </form>
-  </aside>
+    <div class="splitter" id="split-drawer" role="separator" tabindex="0"
+         aria-orientation="vertical" aria-controls="agent-drawer"
+         aria-label="调整助手栏宽度" data-i18n-aria="splitter.drawer" hidden></div>
+
+    <aside class="agent-drawer" id="agent-drawer" hidden aria-label="内置助手" data-i18n-aria="agent.drawer" role="dialog" aria-modal="false">
+      <header class="agent-head">
+        <span class="agent-dot" id="agent-dot" data-state="offline"></span>
+        <strong><span id="agent-title" data-i18n="agent.title">助手</span><span id="agent-model"></span></strong>
+        <span class="agent-hint" id="agent-hint"></span>
+        <button class="link" id="agent-stop" type="button" data-i18n="agent.stop" hidden>停止</button>
+        <!-- 停靠开关：它是「助手挡住了正文」的唯一出口，所以放在助手自己的头上。 -->
+        <button class="link" id="agent-dock" type="button" data-act="dock"
+                aria-pressed="false" title="停靠" data-i18n-title="dock.hint"
+                data-i18n="dock.toggle">停靠</button>
+        <button class="link" id="agent-clear" type="button" data-i18n="agent.clear">清空</button>
+        <button class="link" id="agent-close" type="button" aria-label="关闭" data-i18n-aria="agent.close">✕</button>
+      </header>
+      <div class="agent-log" id="agent-log" aria-live="polite"></div>
+      <!-- 输入区复用主对话的 composer 类：同一个边框、同一套自增高高度、同一个发送按钮。
+           助手不接收图片，所以这里没有附件按钮 —— 点了没反应的按钮比没有更糟。 -->
+      <form class="composer agent-compose" id="agent-form">
+        <div class="composer-inner">
+          <textarea id="agent-input" rows="1" aria-label="内置助手输入框" data-i18n-aria="agent.input" data-i18n-ph="agent.placeholder" placeholder="问我面板里的事，或让我操作界面"></textarea>
+          <button class="btn primary" id="agent-send" type="submit" data-i18n="send">发送</button>
+        </div>
+      </form>
+    </aside>
+  </div>
 
   <div id="modal-root"></div>
   <!-- 灯箱自己的根节点：不复用 #modal-root —— openModal 会把挂起的确认当成

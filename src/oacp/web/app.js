@@ -25,6 +25,9 @@ import {
   previewView,
   truncateText,
 } from "./preview.js";
+// 布局的旋钮、持久化与拖拽全在 layout.js：页面与内置助手共用同一条写入口，
+// 于是「模型说改了」与「人看见的」不会分成两套。
+import { READING_DEFAULT, READING_NAMES, createLayout } from "./layout.js";
 
 const API = "/api/panel";
 const TOKEN_KEY = "oacp.token";
@@ -165,6 +168,15 @@ const DICT = {
     "time.hours": "{n} 小时前",
     "agent.title": "助手",
     "agent.drawer": "内置助手",
+    "splitter.side": "调整侧栏宽度",
+    "splitter.drawer": "调整助手栏宽度",
+    "reading.group": "对话栏宽度",
+    "reading.comfortable": "舒适",
+    "reading.wide": "宽",
+    "reading.full": "满",
+    "dock.toggle": "停靠",
+    "dock.hint": "停靠时对话让位；浮层时盖在对话上",
+    "dock.toolnarrow": "窗口太窄，停靠不下 —— 先把窗口放宽，或把左栏调窄",
     "agent.close": "关闭",
     "agent.input": "内置助手输入框",
     "agent.online": "在线",
@@ -304,6 +316,15 @@ const DICT = {
     "time.hours": "{n} h ago",
     "agent.title": "Assistant",
     "agent.drawer": "Assistant panel",
+    "splitter.side": "Resize the sidebar",
+    "splitter.drawer": "Resize the assistant panel",
+    "reading.group": "Conversation width",
+    "reading.comfortable": "Comfort",
+    "reading.wide": "Wide",
+    "reading.full": "Full",
+    "dock.toggle": "Dock",
+    "dock.hint": "Docked: the conversation makes room. Floating: it covers the conversation",
+    "dock.toolnarrow": "Too narrow to dock — widen the window, or narrow the sidebar",
     "agent.close": "Close",
     "agent.input": "Message to the assistant",
     "agent.online": "online",
@@ -431,6 +452,12 @@ async function api(path, options = {}) {
 }
 
 /* ------------------------------------------------------------------ 状态 */
+
+/**
+ * 布局控制器。`wanted`（人要的，落盘）与 `applied`（这个视口下做到的）
+ * 是两层 —— 在小窗口里打开一次页面，不该把人选的 480px 永久压成 320px。
+ */
+let layout = null;
 
 const state = {
   agents: [],
@@ -575,6 +602,14 @@ function renderSessions() {
 
 function renderTop() {
   const top = $("#top");
+  // 轮询每来一条消息就会重画整块顶栏，而三段控件是里面唯一的可聚焦元素 ——
+  // 不还原的话，正在用 Tab/方向键切宽度的人会在下一块流式消息到达时被打断，
+  // 焦点掉到 body。
+  const focusBefore = document.activeElement;
+  const restore =
+    focusBefore && focusBefore.dataset && focusBefore.dataset.act === "reading" && top.contains(focusBefore)
+      ? focusBefore.dataset.value
+      : null;
   const agent = currentAgent();
   if (!agent) {
     top.innerHTML = "";
@@ -592,6 +627,15 @@ function renderTop() {
     session && session.state === "working"
       ? `<button class="btn sm" data-act="stop" type="button">${esc(t("stop"))}</button>`
       : "";
+  // 三档由人自己切。没有这个控件，模型能改而人不能 —— 那正是这个仓库
+  // 最不该出现的形状（能力只活在模型那一边）。
+  // 回落到 layout.js 的默认值，不写字面量：`READING_NAMES[0]` 恰好是
+  // "comfortable" 只是顺序上的巧合，改一次顺序就会静默变成一个都没按下的控件。
+  const reading = layout ? layout.state.reading : READING_DEFAULT;
+  const preset = (name) =>
+    `<button class="seg" data-act="reading" data-value="${name}" type="button"` +
+    ` aria-pressed="${reading === name}">${esc(t(`reading.${name}`))}</button>`;
+  const readingControl = `<div class="segmented" role="group" aria-label="${esc(t("reading.group"))}">${READING_NAMES.map(preset).join("")}</div>`;
   top.innerHTML = `
     <div class="agent-head">
       <div class="agent-line">
@@ -602,10 +646,41 @@ function renderTop() {
       ${crumb}
     </div>
     <div class="top-actions">
+      ${readingControl}
       ${stop}
       <button class="btn sm ghost" data-act="info" type="button">${esc(t("info"))}</button>
       <button class="btn sm ghost" data-act="remove-agent" type="button">${esc(t("remove"))}</button>
     </div>`;
+  if (restore) {
+    const again = top.querySelector(`[data-act="reading"][data-value="${restore}"]`);
+    if (again) again.focus({ preventScroll: true });
+  }
+}
+
+/**
+ * 把布局的真实状态写回那几个控件。
+ *
+ * 拖拽时每帧都会触发一次（rAF），所以这里只做两次查询，不重渲染任何东西。
+ */
+function paintLayoutControls() {
+  if (!layout) return;
+  // 不叫 `state`：这个文件里 `state` 是整个应用的会话/智能体状态，遮蔽它
+  // 之后，任何以后想读 `state.session` 的人都会静默拿到布局快照。
+  const now = layout.state;
+  document.querySelectorAll('[data-act="reading"]').forEach((node) => {
+    node.setAttribute("aria-pressed", String(node.dataset.value === now.reading));
+  });
+  const dock = $("#agent-dock");
+  if (dock) {
+    dock.setAttribute("aria-pressed", String(now.docked));
+    // 窗口装不下停靠时，让它看起来「能点、点了没反应」比禁用更糟。
+    const stuck = !now.dockable;
+    dock.setAttribute("aria-disabled", String(stuck));
+    const key = stuck ? "dock.toolnarrow" : "dock.hint";
+    // 两个都写：`dataset.i18nTitle` 让下一次切语言能跟着翻译，`title` 让现在生效。
+    dock.dataset.i18nTitle = key;
+    dock.title = t(key);
+  }
 }
 
 function emptyState(title, hint) {
@@ -1775,8 +1850,26 @@ function startPolling() {
 
 /* ------------------------------------------------------------------ 动作 */
 
-async function handleAction(action) {
+async function handleAction(action, element) {
   switch (action) {
+    case "reading": {
+      // 被人手改过的 DOM 不该把异常抛到控制台：先挡掉明显的非档位值。
+      const name = element && element.dataset ? element.dataset.value : "";
+      if (!layout || !READING_NAMES.includes(name)) return undefined;
+      layout.apply({ reading: name });
+      return undefined;
+    }
+    case "dock": {
+      // 按**看得见的**状态翻转，不是按 wanted。窗口太窄时装不下，applied 一直
+      // 是「浮层」而 wanted 还是「要停靠」—— 那时按 wanted 翻会干出这种事：
+      // 点一下把偏好改成「不要停靠」，屏幕上一点变化都没有，再点一下还是没有。
+      // 装不下的情况已经 aria-disabled，这里再挡一次。
+      if (!layout) return undefined;
+      const now = layout.state;
+      if (!now.dockable) return undefined;
+      layout.apply({ docked: !now.docked });
+      return undefined;
+    }
     case "rename":
       return openRenameDialog();
     case "delete-session":
@@ -2194,7 +2287,9 @@ function bindDom() {
       return;
     }
     const action = event.target.closest("[data-act]");
-    if (action) handleAction(action.dataset.act);
+    // 元素本身也要传下去：`data-act="reading"` 的三个按钮靠 `data-value`
+    // 区分档位，只传动作名等于把参数丢了。
+    if (action) handleAction(action.dataset.act, action);
   });
 
   document.addEventListener("keydown", (event) => {
@@ -2246,6 +2341,15 @@ function bindDom() {
 }
 
 async function boot() {
+  // 先定布局再画第一屏：CSS 默认值与默认布局相同，所以只有「存过非默认值」
+  // 的页面才会因为顺序而闪一下，而这里一步不差地在下一次 paint 之前就绪。
+  layout = createLayout({ doc: document, win: window });
+  layout.bind();
+  layout.refresh();
+  layout.subscribe(paintLayoutControls);
+  // subscribe 不会回放当前状态，所以第一屏的按钮状态要在这儿落一次 ——
+  // 否则 `#agent-dock` 一直停在 HTML 里的 aria-pressed="false"，明明默认是停靠。
+  paintLayoutControls();
   applyLang();
   try {
     const storedTheme = localStorage.getItem(THEME_KEY);
@@ -2277,6 +2381,48 @@ window.oacp = {
   addFiles,
   setLang,
   setTheme: applyTheme,
+  /**
+   * 布局：模型与人共用同一条写入口（layout.apply → CSS 变量 → localStorage）。
+   * `action` 只决定「读 / 写 / 复位」，写法本身只有一份 —— 两条路迟早会
+   * 分叉成「模型以为改了、页面没变」。
+   */
+  setLayout: (patch = {}) => {
+    const request = patch && typeof patch === "object" ? patch : {};
+    if (!layout) return null;
+    const fields = ["reading", "sidebar", "drawer", "docked"].filter((key) => request[key] !== undefined);
+    const action = request.action === undefined ? (fields.length ? "set" : "get") : request.action;
+    if (action === "reset") {
+      // 复位会把每个旋钮都还原，所以带上其它字段一定是模型理解错了：
+      // 静默丢掉那些字段，等于告诉它「复位 + reading=wide」两件事都做了。
+      if (fields.length) {
+        throw new Error(`layout reset: drop ${fields.join(" / ")} — reset restores every knob`);
+      }
+      return layout.reset();
+    }
+    if (action === "get") {
+      if (fields.length) throw new Error("layout get only reads: drop the fields, or use action=set");
+      return layout.state;
+    }
+    if (action !== "set") {
+      // 未知动作以前会掉进「返回现状」—— 调用方拿到一个长得像成功的快照，
+      // 其实什么都没发生。和 apply() 拒绝陌生字段是同一条规矩。
+      throw new Error(`layout: unknown action ${String(action)} (expected get / set / reset)`);
+    }
+    // **显式**翻译模型那边的字段名。这里绝不能用 `...rest` 透传：
+    // `ui_layout` 声明的是 `sidebar`，控制器内部叫 `side`，透传等于把每一次
+    // 「把左栏调宽」静默丢掉（这个 bug 真的发生过，e2e 抓到的）。
+    const next = {};
+    if (request.reading !== undefined) next.reading = request.reading;
+    if (request.sidebar !== undefined) next.side = request.sidebar;
+    if (request.drawer !== undefined) next.drawer = request.drawer;
+    if (request.docked !== undefined) next.docked = request.docked;
+    if (!Object.keys(next).length) {
+      throw new Error("layout set: name at least one of reading / sidebar / drawer / docked");
+    }
+    return layout.apply(next);
+  },
+  // 读状态走 `setLayout({ action: "get" })`，不单开一条出口 —— 少一个
+  // 「没人调用、也没人测」的公共表面。
   renderAll,
   openModal,
   closeModal,

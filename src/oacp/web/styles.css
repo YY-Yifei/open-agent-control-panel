@@ -28,6 +28,17 @@
   --radius: 8px;
   --font: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* 布局的三个旋钮。都是**默认值**，不写 JS 时页面与从前一模一样；
+     真正的值由 layout.js 写在 <html> 上（唯一写入口）。
+       左栏     200~480，人拖
+       对话栏   760 / 1100 / 不加盖，三档
+       助手栏   320~640，人拖 */
+  --side-w: 268px;
+  --reading-w: 760px;
+  --drawer-w: 400px;
+  /* 段落、列表、标题的阅读线宽。与「舒适」档同数：宽档变宽的只有表格与代码。 */
+  --reading-prose: 760px;
 }
 
 :root[data-theme="dark"] {
@@ -92,7 +103,7 @@ a { color: inherit; text-decoration: none; }
 /* ------------------------------------------------------------------ 侧栏 */
 
 .side {
-  width: 268px;
+  width: var(--side-w);
   flex: none;
   display: flex;
   flex-direction: column;
@@ -309,7 +320,7 @@ a { color: inherit; text-decoration: none; }
 .msg {
   display: flex;
   flex-direction: column;
-  max-width: 760px;
+  max-width: var(--reading-w);
   margin: 0 auto 12px;
 }
 
@@ -385,7 +396,7 @@ a { color: inherit; text-decoration: none; }
   display: flex;
   align-items: flex-end;
   gap: 8px;
-  max-width: 760px;
+  max-width: var(--reading-w);
   margin: 0 auto;
 }
 
@@ -587,6 +598,17 @@ a { color: inherit; text-decoration: none; }
 @media (max-width: 760px) {
   .app { flex-direction: column; }
 
+  /* 上下堆叠之后，横向拖拽条没有意义（它的 aria-orientation 也由
+     layout.js 同步成 horizontal + aria-disabled）。 */
+  .splitter { display: none; }
+
+  /* 顶栏本来就窄，三档控件在这里只会挤掉会话标题；窄屏的对话栏已经是
+     整个窗口宽，没有「变宽」可调。
+     必须带上级选择器：`.segmented` 的基础规则（display:inline-flex）写在
+     这个媒体查询**后面**，媒体查询又不加特异性 —— 只写 `.segmented` 的话
+     这条永远输给后面那条，控件在窄屏上照样露出来。 */
+  .top-actions .segmented { display: none; }
+
   .side {
     width: 100%;
     max-height: 42vh;
@@ -614,6 +636,30 @@ a { color: inherit; text-decoration: none; }
 
 .md p {
   margin: 0 0 8px;
+}
+
+/* 把列拉到 1100（甚至占满）时，段落不能跟着变长：一行 150 个字符比 760px
+   的列更难受。所以**宽只给宽内容** —— `.md pre` / `.md table` / 图不设上限，
+   文字停在这条阅读线上。「舒适」档下这条不起作用（气泡本来就只有 88% × 760），
+   于是既有排版一个字都不变。 */
+.md p,
+.md ul,
+.md ol,
+.md blockquote,
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+  max-width: var(--reading-prose);
+}
+
+/* 用户消息与错误气泡**不带** `.md`（它们是 pre-wrap 的纯文本），所以上面那一组
+   选择器管不到。宽档下一条长粘贴会一路拉到 88% × 1100 ≈ 970 —— 正是上面那条
+   注释说要避免的「一行 150 个字符」。所以纯文本气泡也压到同一条阅读线上。 */
+.bubble:not(.md) {
+  max-width: min(88%, var(--reading-prose));
 }
 
 .md h1,
@@ -729,7 +775,7 @@ a { color: inherit; text-decoration: none; }
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  max-width: 760px;
+  max-width: var(--reading-w);
   margin: 0 auto 10px;
 }
 
@@ -1048,7 +1094,7 @@ body.lightbox-open {
   top: 0;
   right: 0;
   bottom: 0;
-  width: 400px;
+  width: var(--drawer-w);
   max-width: 92vw;
   display: flex;
   flex-direction: column;
@@ -1060,6 +1106,98 @@ body.lightbox-open {
      drawer cannot be answered — the model then waits out its budget for
      nothing. Toasts the drawer itself raises have the same problem. */
   z-index: 15;
+}
+
+/* 停靠：助手栏变成 flex 的第三列，主区自动让位，对话重新居中。
+   默认就是这个状态 —— 「太窄」与「被盖住」是同一个抱怨的两面：
+   1600 以下的窗口里，浮层盖掉的正是正文。
+   能不能停靠由 layout.js 的 canDock() 算（不给 CSS 再写一个断点，
+   两处断点迟早会不一致）。 */
+.app.drawer-docked .agent-drawer {
+  position: static;
+  width: var(--drawer-w);
+  max-width: none;
+  flex: none;
+  box-shadow: none;
+  z-index: auto;
+}
+
+/* 三档宽度是一个分段控件，不是滑块：「拖到 1087px」这种自由不带来价值，
+   反而让人每次都在调。 */
+.segmented {
+  display: inline-flex;
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.seg {
+  padding: 5px 9px;
+  border: 0;
+  background: var(--bg);
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.seg + .seg { border-left: 1px solid var(--line); }
+.seg:hover { background: var(--bg-hover); }
+.seg[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.seg:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* 停靠中时按钮亮起来 —— 和 .seg 一样用 aria-pressed 表达状态，
+   而不是换一段看不见的文案。 */
+/* `.link` 本身的颜色就是 var(--accent) —— 只写下面那条等于什么都没变，
+   肉眼完全看不出停靠与浮层的区别，而这是「助手挡住正文」的唯一出口。
+   所以先把常态压成 muted，让 accent 真正表示「停靠中」。 */
+#agent-dock { color: var(--muted); }
+#agent-dock[aria-pressed="true"] { color: var(--accent); }
+#agent-dock[aria-disabled="true"] { color: var(--muted); opacity: .55; cursor: default; }
+
+/* 一条可以拖的缝。视觉 4px、命中区 11px（::before 外扩）—— 视觉上要细，
+   手上要容易抓。负外边距让它不占布局宽度，否则拖动时会多出 4px 的抖动。 */
+.splitter {
+  position: relative;
+  flex: none;
+  width: 4px;
+  margin: 0 -2px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  /* 触屏上 pointermove 必须拿到事件，而不是滚动页面。 */
+  touch-action: none;
+  cursor: col-resize;
+  /* 必须低于抽屉的 15：浮层模式下抽屉可以盖住左栏那条缝（900px 窗口 +
+     640px 助手栏就会），而 `::before` 把命中区撑到 12px —— 一条看不见的
+     条带会吞掉本该落在抽屉上的点击。停靠模式下抽屉是 static（z-index auto），
+     这条缝照样盖得住，所以拖拽不受影响。 */
+  z-index: 10;
+}
+
+.splitter::before {
+  content: "";
+  position: absolute;
+  inset: 0 -4px;
+}
+
+.splitter:hover,
+.splitter.dragging,
+.splitter:focus-visible {
+  background: var(--accent);
+}
+
+.splitter:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 拖动中：整页换成拖拽光标，并且不许选中文字 —— 否则一次横向拖动会
+   在历史消息上拉出一片蓝色。 */
+body.resizing {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .agent-head {

@@ -65,6 +65,50 @@ All notable changes to this project are documented here. The format follows
 - The composer chip labelled a `.md` file `TXT` while the panel rendered that same file as
   Markdown.
 
+## [0.9.0] — 2026-11-16
+
+### Added
+
+- **The layout belongs to the reader, not to the stylesheet.** The conversation column was a
+  fixed 760px whatever the window: on a 2560-wide screen 1496px of the main area (65%) was
+  margin, and the side panel's 268px could not be changed. The column now has three widths —
+  comfortable (760, for reading), wide (1100, for tables and code) and fill (for diffs and
+  wide tables) — chosen from a segmented control in the top bar; the side panel (200–480) and
+  the assistant drawer (320–640) have splitters. Every value is a CSS variable (`--side-w`,
+  `--reading-w`, `--drawer-w`, `--reading-prose`) written from one place, so a drag repaints
+  without re-rendering anything.
+- The splitters work without a mouse: 4px visible but an 11px hit area, Pointer Events with
+  pointer capture (a drag survives leaving the window), `←`/`→` by 16px, `Shift` by 64,
+  `Home`/`End` for the limits, double-click to reset, and `role="separator"` carrying
+  `aria-valuenow`/`min`/`max`. Below 760px they disappear instead of pretending to be
+  draggable.
+- **The assistant drawer docks.** It used to be a fixed 400px overlay that covered the
+  conversation — 274px of the text at 1280, more than a third of it — in exactly the situation
+  where the drawer earns its keep (reading code next to the agent). Docked, it is a third
+  column: the main area yields and the conversation re-centres. A toggle on the drawer
+  switches back to overlay, and it says why instead of going dead when the window cannot
+  afford a dock (under 1100px it stays an overlay, under 720px full screen, as before).
+- **`ui_layout`** (tier `read`): the model reads and changes the same three knobs —
+  `action=get|set|reset`, `reading`, `sidebar`, `drawer`, `docked`. Its bounds come from
+  `layout.js`, the same source the splitters clamp with, so the schema cannot accept a value
+  the controller would then refuse. A clamped value is reported (`adjusted: drawer 400 → 340`)
+  rather than hidden, because the model's next sentence is built on the number it got back.
+  `get` with fields, and `reset` with fields, are rejected instead of silently ignored — a
+  success report for work that did not happen is the worst shape this round could leave.
+  Tier counts are now read 19 / act 23 / all 25 / delegate 26.
+
+### Changed
+
+- Widening the column does not lengthen the lines. Paragraphs, list items and headings stop at
+  the 760px reading line (`--reading-prose`) even in the fill column, while `pre`, `table` and
+  `img` use the whole width — the split the Markdown lightbox already made, now applied to the
+  conversation too.
+- The layout is remembered per browser (`localStorage["oacp.layout.v1"]`) and read back
+  clamped: a value saved on a 2560 screen must not blow the page up on a 1280 one, and a
+  corrupt entry falls back to the defaults instead of rendering a broken page.
+- People and the model write through the same entry (`window.oacp.setLayout`), so there is no
+  path where one moves the layout the other cannot see.
+
 ## [0.8.0] — 2026-11-12
 
 ### Added

@@ -203,20 +203,24 @@ stateless 下每轮必须自带 `history`。存浏览器，后端零改动，**v
 
 ---
 
-## 4. 能力目录（声明 24 + 隐藏 1）
+## 4. 能力目录（声明 25 + 隐藏 1）
 
 命名全部合协议正则 `^[a-z][a-z0-9_]{0,63}$`。
 
 > 2026-11-12 增补 `ui_attach`（act 档，配合 Ctrl+V 粘贴截图），故为 23 声明。
 > 同日再增补 `ui_preview`（read 档，附件预览），故为 24 声明。
+> 2026-11-16 增补 `ui_layout`（read 档，柔性布局：对话栏三档 + 左右栏可拖 + 停靠），
+> 故为 25 声明。它不是「新能力」而是**补一个只活在人的手势里的能力** ——
+> 拖侧栏以前只有手能做，模型永远做不到（见 §4.5 第 2 条）。
 > §3 D6 里记的 22 是**首版决策的原始记录**，保留原样，不回改写历史。
 
-### 4.1 前端原生（11 个：10 read + 1 act）—— 只有浏览器能做
+### 4.1 前端原生（12 个：11 read + 1 act）—— 只有浏览器能做
 
 | function | 参数 | 做什么 |
 |---|---|---|
 | `ui_theme` | `theme: light\|dark\|auto` | 切主题（写 `data-theme` + `localStorage`） |
 | `ui_lang` | `lang: zh\|en` | 切界面语言（复用现有 `setLang`） |
+| `ui_layout` | `action: get\|set\|reset`, `reading: comfortable\|wide\|full`, `sidebar: 200~480`, `drawer: 320~640`, `docked: bool` | **布局**：对话栏 760 / 1100 / 占满，左栏与助手栏可拖，助手停靠（挤主区）或浮层（盖主区）。返回值里的 `adjusted=` 说明「你要 900px，实际 480px」—— 模型必须照着**实际**值说话 |
 | `ui_notify` | `title, body` | **系统通知**（Notification API；未授权则请求一次；被拒回 `NOTIFICATION_DENIED`） |
 | `ui_toast` | `text, level: ok\|warn\|error` | 页内提示（复用现有 `toast`） |
 | `ui_open` | `kind: agent\|session, id` | 路由跳转（走现有 `go()`） |
@@ -226,6 +230,22 @@ stateless 下每轮必须自带 `history`。存浏览器，后端零改动，**v
 | `ui_attach` | `attachment_id` | **把会话里已有的图放进输入框**（不发送）。**act 档**：`--agent-policy read` 下不声明 —— 它比「读」多走一步。字节不出浏览器，也不经模型 |
 | `ui_modal` | `title, body` | 用面板现有 modal 展示长文本（比 toast 适合长内容，JEV 0.83） |
 | `ui_client_info` | — | 视口、时区、语言、主题、当前路由、`navigator.onLine`，以及 `composer=`（草稿字数 + 待发附件张数；`closed` = 当前页面没有输入框）。**只给长度与张数，不给正文** |
+
+`ui_layout` 为什么是 **read 档**（它确实会写 localStorage）：本仓库的 read 档
+police 的一直是「**会不会动数据**」，不是「会不会动像素」—— `ui_theme` 写
+`data-theme` 与 localStorage、`ui_lang` 写语言、`ui_draft` 写输入框，全都在 read 档。
+布局同属「外观」，没有可丢的东西，且**可逆**：双击分隔条复位，或 `action=reset`。
+把它放进 act 反而会让 `--agent-policy read` 的承诺变得前后不一（同一个用户偏好，
+主题能改、布局不能改）。真正该被档位拦住的是 `ui_attach`（搬字节）与 destroy。
+
+两条实现纪律，写在这里以便以后不重犯：
+
+- **`wanted` 与 `applied` 是两层。** `wanted` 是人的选择，落 `localStorage`；
+  `applied` 是当前视口下真正做到的。窗口小的时候夹的是 `applied` —— 如果把夹过的
+  结果存起来，在小窗口打开一次页面就会把人选的 480px 永久压成 320px。
+- **停靠由 `canDock(viewport, side)` 算，不给 CSS 再写一个断点。** 两处断点
+  （一个在 CSS、一个在 JS）迟早会不一致，而那种不一致的表现是「拖到某个宽度，
+  抽屉突然盖住正文」。
 
 ### 4.2 经面板 REST（13 个声明）—— 前端 fetch 后端
 
@@ -270,8 +290,8 @@ stateless 下每轮必须自带 `history`。存浏览器，后端零改动，**v
 | `panel_send_message` | 不是删掉，是**默认不声明**（§4.3） | 0 行，改策略 |
 
 `--agent-policy` 决定**声明期就减面**：`read` 策略下，act 与 destroy 根本不出现在
-declare 里。四档：`read`（10+8=18）/ `act`（+4=22，默认；3 个 `panel_*` + 1 个 `ui_attach`）/
-`all`（+2=24）/ `delegate`（+1=25，首版不默认声明）。
+declare 里。四档：`read`（11+8=19）/ `act`（+4=23，默认；3 个 `panel_*` + 1 个 `ui_attach`）/
+`all`（+2=25）/ `delegate`（+1=26，首版不默认声明）。
 
 ### 4.5 准入判据：一个页面功能该不该也成为一个 function
 
@@ -510,10 +530,10 @@ declare 后服务端收到的函数名集合 == 目录、收到 invoke 能执行
 
 其余用例：
 
-1. `test_catalog_schema_shapes`（Node）：24 个 `parameters` 都是 `type:object`，
+1. `test_catalog_schema_shapes`（Node）：25 个 `parameters` 都是 `type:object`，
    名字合 `^[a-z][a-z0-9_]{0,63}$`，**无重复**。
-2. `test_policy_hides_write_functions`：`--agent-policy read` 时 declare 里只有 18 个；
-   `act` 22 个；`all` 24 个；`delegate` 25 个。
+2. `test_policy_hides_write_functions`：`--agent-policy read` 时 declare 里只有 19 个；
+   `act` 23 个；`all` 25 个；`delegate` 26 个。
 3. `test_confirm_gate_denies`：人取消 → 服务端看到 `rejected/denied`，会话仍存在。
 4. `test_ws_down_hides_entry`：配置关闭时 `GET /api/panel/agent` 返回 `enabled:false`，
    且页面不实例化连接。
