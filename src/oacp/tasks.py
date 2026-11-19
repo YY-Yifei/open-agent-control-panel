@@ -25,6 +25,16 @@ LOCAL_ERROR_STATE = "error"
 LOCAL_REPLY_STATE = "replied"
 PAGE_LIMIT = 50
 
+#: A status line is a sentence, not an essay. Clipping here keeps the
+#: "正在处理…" bubble from being dragged into a layout that scrolls sideways,
+#: and keeps a chatty agent from writing kilobytes into one column.
+MAX_PROGRESS = 200
+
+#: The states in which ``status.message`` describes *work in progress*. Every
+#: other state ends the turn, and a finished task must not keep a "generating…"
+#: line next to it.
+PROGRESS_STATES = frozenset({"submitted", "working"})
+
 #: Where each non-terminal state sits on the one-way ladder a task climbs. Used
 #: only by the push guard: a callback that arrives late must not drag the ledger
 #: backwards. Terminal states are handled before this table is consulted, so a
@@ -278,8 +288,22 @@ class TaskService:
         current = str(row["state"] or "unknown")
         incoming = str(view["state"] or "unknown")
         previous = json_loads(row["response_json"], None)
-        text = (view.get("text") or view.get("statusText") or "").strip()
-        seen = (_latest_text(previous) or "").strip()
+        # Compared field by field, now that the status line is no longer part of
+        # ``text``: an agent that reports progress only in ``status.message``
+        # would otherwise look identical on every delivery and be dropped as a
+        # duplicate — freezing the one thing that actually changed. Artefact
+        # text and the status line are read off the *merged* view for the same
+        # reason ``_merge_task`` exists: a status-only callback that omits
+        # ``artifacts`` must not look like "the answer changed".
+        merged = _merge_task(previous, payload)
+        # One interpretation per snapshot: ``interpret_result`` re-renders every
+        # artefact part, and a callback can carry a long answer.
+        merged_reading = _reading(merged)
+        seen_reading = _reading(previous)
+        text = merged_reading["artifactText"].strip()
+        seen = seen_reading["artifactText"].strip()
+        progress = truncate(merged_reading["statusText"], MAX_PROGRESS)
+        seen_progress = truncate(seen_reading["statusText"], MAX_PROGRESS)
         # A callback that carries a picture and no words has empty text. Asking
         # only about text would call it a duplicate of the previous empty-text
         # snapshot and drop the picture on the floor — so the files it carries are
@@ -290,10 +314,9 @@ class TaskService:
         # exists to tolerate) would otherwise look like "the media changed" on
         # every retry, because the payload's signature is empty and the stored one
         # is not — so a retried delivery would never register as a duplicate.
-        merged = _merge_task(previous, payload)
         media = cardmod.result_media_signature(merged)
         seen_media = cardmod.result_media_signature(previous)
-        fresh = text != seen or media != seen_media
+        fresh = text != seen or media != seen_media or progress != seen_progress
 
         if not _outranks(incoming, current) and incoming != current:
             # A late delivery that would move the task backwards. It is not news
@@ -328,6 +351,7 @@ class TaskService:
                         row["id"],
                     ),
                 )
+                self._record_progress(connection, row["id"], incoming, progress, now)
             self._event(
                 connection,
                 row["id"],
@@ -337,6 +361,9 @@ class TaskService:
                     "state": incoming,
                     "kept": current,
                     "text": truncate(text, 500),
+                    # A status-only delivery has no artefact text; without this the
+                    # audit trail could not say what the agent actually reported.
+                    "progress": truncate(progress, 500),
                 },
             )
 
@@ -596,6 +623,12 @@ class TaskService:
                     task_id,
                 ),
             )
+            # ``view`` is this payload, already interpreted once above; asking
+            # ``_status_text`` for it would render every artefact a second time,
+            # for the whole life of a turn the UI polls every 1.5 s.
+            self._record_progress(
+                connection, task_id, state, truncate(view.get("statusText"), MAX_PROGRESS), now
+            )
             self._event(
                 connection,
                 task_id,
@@ -626,6 +659,9 @@ class TaskService:
                 """,
                 (state or LOCAL_ERROR_STATE, message, now, message_count, task_id),
             )
+            self._record_progress(
+                connection, task_id, state or LOCAL_ERROR_STATE, "", now
+            )
             self._event(connection, task_id, now, "error", {"error": message})
         return self.get(task_id)
 
@@ -642,8 +678,50 @@ class TaskService:
             (task_id, at, kind, json_dumps(payload)),
         )
 
+    def _record_progress(
+        self,
+        connection: sqlite3.Connection,
+        task_id: str,
+        state: str,
+        status_text: str,
+        now: str,
+    ) -> None:
+        """Keep the "what is it doing" line current, and drop it when the turn ends.
+
+        A running task that reports nothing new keeps the line it already had: an
+        agent that omits ``status.message`` on one snapshot has not gone back to
+        having no progress, and blanking the bubble would make it flicker. Every
+        state that is not "still running" clears it instead — a completed task
+        with a stale "generating…" beside it is worse than no line at all.
+
+        ``progress_at`` only moves when the text does, so "how long has it been
+        saying this" stays answerable.
+        """
+        if state in PROGRESS_STATES:
+            if status_text:
+                connection.execute(
+                    """
+                    UPDATE tasks
+                       SET progress_text = ?,
+                           progress_at = CASE
+                               WHEN COALESCE(progress_text, '') = ? THEN progress_at
+                               ELSE ?
+                           END
+                     WHERE id = ?
+                    """,
+                    (status_text, status_text, now, task_id),
+                )
+            return
+        connection.execute(
+            "UPDATE tasks SET progress_text = NULL, progress_at = NULL WHERE id = ?",
+            (task_id,),
+        )
+
     def _view(self, row: sqlite3.Row, *, detail: bool = False) -> dict[str, Any]:
         response = json_loads(row["response_json"], None)
+        # One interpretation per row: ``interpret_result`` re-renders every
+        # artefact part, and ``list_tasks`` can page 200 rows.
+        reading = _reading(response)
         view: dict[str, Any] = {
             "id": row["id"],
             "agentId": row["agent_id"],
@@ -660,7 +738,17 @@ class TaskService:
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
             "syncedAt": row["synced_at"],
-            "text": _latest_text(response),
+            # Three readings of one stored snapshot, kept apart on purpose:
+            # ``text`` is what the ledger shows (artefacts, falling back to the
+            # status line for agents that never emit artefacts), ``artifactText``
+            # is only ever the answer, and ``statusText`` is only ever progress.
+            # The conversation decides per state which of the last two it shows;
+            # ``statusText`` is unclipped because it can become that answer.
+            "text": reading["text"],
+            "artifactText": reading["artifactText"],
+            "statusText": reading["statusText"],
+            "progressText": row["progress_text"],
+            "progressAt": row["progress_at"],
             "artifactCount": _artifact_count(response),
             "pushState": row["push_state"],
             "pushCount": int(row["push_count"] or 0),
@@ -736,16 +824,44 @@ def _merge_task(previous: Any, payload: dict[str, Any]) -> dict[str, Any]:
         merged["artifacts"] = previous["artifacts"]
     status = merged.get("status") if isinstance(merged.get("status"), dict) else {}
     old_status = previous.get("status") if isinstance(previous.get("status"), dict) else {}
-    if not status.get("message") and old_status.get("message"):
+    # A status line is *progress* while the task runs, and progress must never
+    # become the answer. Crossing from a running state into a terminal one
+    # without a message of its own means the agent said nothing new — not that
+    # "reading index.html" was the reply. Carrying it here would hand it to
+    # ``sessions._spoken``, which promotes a finished turn's status when there is
+    # no artefact text.
+    # A status line describes the state it was reported in, so it is only
+    # carried while that state is unchanged. Carrying it across a change hands it
+    # to ``sessions._spoken``, which speaks a *settled* turn's status as a
+    # message: a running "reading index.html" would surface as the waiting turn's
+    # question, and a carried question as the finished answer. Continuity of the
+    # running line itself is ``_record_progress``'s job, and it keeps the stored
+    # line when a snapshot reports nothing new.
+    dropped = cardmod.normalize_state(old_status.get("state")) != cardmod.normalize_state(
+        status.get("state")
+    )
+    if not status.get("message") and old_status.get("message") and not dropped:
         merged["status"] = dict(status, message=old_status["message"])
     return merged
 
 
-def _latest_text(response: Any) -> str:
+def _reading(response: Any) -> dict[str, str]:
+    """One stored snapshot, read three ways.
+
+    ``text`` is what the ledger shows (the answer, falling back to the status
+    line for agents that never emit artefacts); ``artifactText`` is only ever the
+    answer; ``statusText`` is only ever the status line — unclipped, because a
+    finished turn with no artefacts promotes it to the answer itself.
+
+    One call, one ``interpret_result``: it re-renders every artefact part, and
+    ``list_tasks`` can page 200 rows.
+    """
     if not isinstance(response, dict):
-        return ""
-    view = cardmod.interpret_result(response)
-    return view.get("text") or view.get("statusText") or ""
+        return {"text": "", "artifactText": "", "statusText": ""}
+    parsed = cardmod.interpret_result(response)
+    answer = str(parsed.get("text") or "")
+    status = str(parsed.get("statusText") or "").strip()
+    return {"text": answer or status, "artifactText": answer, "statusText": status}
 
 
 def _artifact_count(response: Any) -> int:

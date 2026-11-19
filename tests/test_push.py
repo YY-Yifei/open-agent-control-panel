@@ -47,6 +47,14 @@ def task_payload(
     return payload
 
 
+def status_payload(state: str = "working", text: str = "") -> dict[str, Any]:
+    """A status-only task: ``status.message`` and no artefacts at all."""
+    status: dict[str, Any] = {"state": state}
+    if text:
+        status["message"] = {"role": "agent", "parts": [{"kind": "text", "text": text}]}
+    return {"kind": "task", "id": "task-1", "contextId": "ctx-1", "status": status}
+
+
 def make_transport(
     recorded: list[dict[str, Any]],
     *,
@@ -198,13 +206,73 @@ def test_callback_without_artifacts_keeps_the_text_we_have(client, app, fetcher)
     token = token_of(app, task["id"])
 
     callback(client, token, task_payload(state="working", text="halfway"))
-    # A bare status update: no artifacts, no status message.
+    # A bare status update: no artifacts, no status message. Nothing in it is
+    # news — the answer it omitted is already stored, and the merge is what keeps
+    # it there. This used to read "applied" only because the *payload* was empty
+    # of text; judged against what actually gets stored, it is a repeat.
     bare = {"id": "task-1", "contextId": "ctx-1", "status": {"state": "working"}}
-    assert callback(client, token, bare).json()["status"] == "applied"
+    assert callback(client, token, bare).json()["status"] == "duplicate"
+    # The same shape carrying a state change *is* news, and still merges.
+    done = {"id": "task-1", "contextId": "ctx-1", "status": {"state": "completed"}}
+    assert callback(client, token, done).json()["status"] == "applied"
 
     detail = client.get(f"/api/panel/tasks/{task['id']}").json()["task"]
     assert detail["text"] == "halfway", "a sloppy callback must not erase the answer"
     assert detail["artifactCount"] == 1
+
+
+def test_a_status_only_callback_is_news(client, app, fetcher) -> None:
+    _agent, task, _recorded = prepare(client, app, fetcher)
+    token = token_of(app, task["id"])
+
+    first = callback(client, token, status_payload(text="reading index.html"))
+    second = callback(client, token, status_payload(text="writing styles.css"))
+    again = callback(client, token, status_payload(text="writing styles.css"))
+
+    # 状态行不参与 `text` 的比较，所以它自己就是一条「变了」的证据：
+    # 否则一个只在 status.message 里报进度的 agent 每次都会被判重复。
+    assert [item.json()["status"] for item in (first, second, again)] == [
+        "applied",
+        "applied",
+        "duplicate",
+    ]
+
+    detail = client.get(f"/api/panel/tasks/{task['id']}").json()["task"]
+    assert detail["progressText"] == "writing styles.css"
+    assert detail["statusText"] == "writing styles.css"
+    assert detail["text"] == "still working", "the answer the callback omitted survives"
+
+
+def test_progress_never_becomes_the_final_answer(client, app, fetcher) -> None:
+    _agent, task, _recorded = prepare(client, app, fetcher)
+    token = token_of(app, task["id"])
+
+    callback(client, token, status_payload(text="reading index.html"))
+    # A terminal callback that says nothing of its own: the last progress line is
+    # not the answer, and must not be carried into the finished task.
+    callback(
+        client,
+        token,
+        {"kind": "task", "id": "task-1", "contextId": "ctx-1", "status": {"state": "completed"}},
+    )
+
+    detail = client.get(f"/api/panel/tasks/{task['id']}").json()["task"]
+    assert detail["state"] == "completed"
+    assert detail["statusText"] == "", "progress must not survive as the answer"
+    assert detail["progressText"] is None
+
+
+def test_a_finished_callback_drops_the_progress_line(client, app, fetcher) -> None:
+    _agent, task, _recorded = prepare(client, app, fetcher)
+    token = token_of(app, task["id"])
+
+    callback(client, token, status_payload(text="reading index.html"))
+    callback(client, token, status_payload(state="completed", text="all done"))
+
+    detail = client.get(f"/api/panel/tasks/{task['id']}").json()["task"]
+    assert detail["state"] == "completed"
+    assert detail["progressText"] is None
+    assert detail["progressAt"] is None
 
 
 # --------------------------------------------------------------------- idempotency

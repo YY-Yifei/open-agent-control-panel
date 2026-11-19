@@ -19,9 +19,28 @@ All notable changes to this project are documented here. The format follows
   land, so it is never a click that silently does nothing.
 - `fileLabel` (web): one source for how an attachment's type is named, so the staged chip in
   the composer and the card after sending agree (`Markdown`, not `TXT`).
+- **`pytest` now runs the browser suite.** `tests/js/*.test.mjs` existed but nothing executed
+  them — CI only called `pytest`, so a JS-only regression shipped green. `tests/test_js.py`
+  shells out to `node --test` (skipping on a machine without node) and replays node's own
+  output when an assertion fails.
 
 ### Changed
 
+- **A running agent's progress is a status line now, not a chat message.** A2A's
+  `status.message` used to be folded into the answer text, so an agent that narrated its steps
+  filled the conversation with bubbles that were not answers. It now replaces the "working…"
+  line in place (`正在处理…` → `reading index.html`), and the transcript grows only when the
+  agent actually says something. The line lives on the task (`progress_text` / `progress_at`,
+  schema 9), so every route — the send's own result, a `GetTask` poll, a push callback — writes
+  the same truth; a snapshot that omits the status keeps the line it had instead of blanking it,
+  and the line is dropped the moment the turn stops being "working".
+  Two states still speak it, on purpose: `input-required` (that sentence *is* the question the
+  operator has to answer) and a finished turn with no artefacts at all (many agents put the
+  whole answer in `status.message`; dropping it would leave a blank conversation beside a
+  completed task). Push deduplication now compares artefact text, media and the status line
+  separately — a callback that only reports progress is news, and a callback that repeats what
+  is already stored is a `duplicate` (it used to be `applied` merely because the payload
+  itself carried no text).
 - **An agent is now identified by its host, its path and its card name — not by its URL.**
   The port is not part of the key, so restarting an agent on another port is the same agent:
   the id, the manage token and `firstSeenAt` stay, and the conversations that pointed at the

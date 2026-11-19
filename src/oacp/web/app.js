@@ -28,6 +28,10 @@ import {
 // 布局的旋钮、持久化与拖拽全在 layout.js：页面与内置助手共用同一条写入口，
 // 于是「模型说改了」与「人看见的」不会分成两套。
 import { READING_DEFAULT, READING_NAMES, createLayout } from "./layout.js";
+// 转义只有一份：页面与测试都从这里取，抄一份就等于没测。
+import { esc } from "./html.js";
+// 待定气泡：进度（A2A 的 status.message）只替换那一行，不进对话流。
+import { fillPending, pendingNode, progressKey } from "./progress.js";
 
 const API = "/api/panel";
 const TOKEN_KEY = "oacp.token";
@@ -368,16 +372,6 @@ function stateLabel(code) {
 /* ------------------------------------------------------------------ 工具 */
 
 const $ = (selector) => document.querySelector(selector);
-
-function esc(value) {
-  return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-  })[ch]);
-}
 
 function fmtTime(value) {
   const date = new Date(value);
@@ -721,7 +715,9 @@ function renderChat() {
     </div>`;
   });
   if (session && session.state === "working") {
-    rows.push(`<div class="msg pending"><div class="pending">${esc(t("pending"))}</div></div>`);
+    // `progress.text` 是 agent 这一拍正在做什么；没有就退回「正在处理…」。
+    // 它是状态而不是回答 —— 所以留在这一个气泡里替换，绝不进上面的消息列表。
+    rows.push(pendingNode(session.progress, t("pending")));
   }
   const nearBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 120;
   chat.innerHTML = rows.join("");
@@ -730,6 +726,24 @@ function renderChat() {
   hydrateAttachments(chat, () => {
     if (nearBottom) chat.scrollTop = chat.scrollHeight;
   });
+}
+
+/**
+ * 只换掉「正在处理…」那一块。
+ *
+ * 进度可能每 1.5 秒换一句话。为此整段 `renderChat()` 是不行的：它会把整份历史
+ * 重新 Markdown 渲染一遍、每张图重新解码一次，而且 `innerHTML` 一换、`scrollTop`
+ * 归零，正在往上翻历史的人会被拽回底部。变化的只有一个节点，就只动这一个。
+ */
+function renderPending() {
+  const chat = $("#chat");
+  if (!chat || !state.session) return;
+  const line = chat.querySelector(".msg.pending > .pending");
+  // 没有可更新的气泡：整段重画也建不出它 —— 没有消息时 renderChat 会提前返回
+  // 去显示空状态。真正「刚进入 working」的那一拍走的是 advanced 分支，那时已经
+  // 整段重画过了，所以这里安静地不动就是对的。
+  if (!line) return;
+  fillPending(line, state.session.progress, t("pending"));
 }
 
 // 一条附件要么是张图（src 由 hydrateAttachments 后填），要么是一枚说明为什么
@@ -1823,15 +1837,20 @@ function startPolling() {
       misses = 0;
       if (!state.session || state.session.id !== id) return;
       const previous = state.session;
-      const changed =
+      const advanced =
         data.session.messages.length !== previous.messages.length ||
         data.session.state !== previous.state;
+      // 进度不是消息 —— 它变化的时候消息条数与状态都没动，所以必须单独比一次，
+      // 否则气泡会一直停在这一轮的第一句进度上，直到任务结束。
+      const moved = progressKey(data.session) !== progressKey(previous);
       state.session = data.session;
-      if (changed) {
+      if (advanced) {
         renderTop();
         renderChat();
         renderComposer();
         await refreshSessions();
+      } else if (moved) {
+        renderPending();
       }
     } catch (error) {
       if (++misses >= 3) return; // 连续失败就停下，用户可以手动刷新页面

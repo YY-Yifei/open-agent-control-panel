@@ -13,18 +13,12 @@
  * 输出是字符串，由调用方写进 innerHTML；本项目只有本文件拼 HTML。
  */
 
-const ESCAPES = {
-  "&": "&amp;",
-  "<": "&lt;",
-  ">": "&gt;",
-  '"': "&quot;",
-  "'": "&#39;",
-};
+// 转义只有一份，在 html.js：`app.js` 的模板字符串与这里共用同一张字符表。
+// 这个文件曾经自带一份 —— 两张表迟早有一张漏掉一个字符，而漏掉的那个就是口子。
+import { esc } from "./html.js";
 
 /** 把任意文本变成可以安全落进 HTML 的文本。 */
-export function escapeHtml(value) {
-  return String(value ?? "").replace(/[&<>"']/g, (ch) => ESCAPES[ch]);
-}
+export const escapeHtml = esc;
 
 /**
  * 地址白名单：只放行 http(s)、mailto 与站内相对地址。

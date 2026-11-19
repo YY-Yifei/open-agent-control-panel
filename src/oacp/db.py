@@ -19,7 +19,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class MigrationError(RuntimeError):
@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     push_registered_at TEXT,
     push_count      INTEGER NOT NULL DEFAULT 0,
     last_push_at    TEXT,
+    progress_text   TEXT,
+    progress_at     TEXT,
     session_id      TEXT
 );
 
@@ -154,6 +156,10 @@ _ADDED_TASK_COLUMNS: tuple[tuple[str, str], ...] = (
     ("push_count", "INTEGER NOT NULL DEFAULT 0"),
     ("last_push_at", "TEXT"),
     ("session_id", "TEXT"),
+    # Schema 9: the running turn's ``status.message``. It used to be folded into
+    # the answer text, which turned every progress report into a chat bubble.
+    ("progress_text", "TEXT"),
+    ("progress_at", "TEXT"),
 )
 
 

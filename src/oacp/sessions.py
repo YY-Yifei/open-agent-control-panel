@@ -72,6 +72,12 @@ _STATE: dict[str, str] = {
 #: which is what gives a conversation its continuity.
 _OPEN = {WORKING, WAITING}
 
+#: States in which the agent has stopped — it finished, or it is asking. Only
+#: these may speak their ``status.message`` as a message; anything else is still
+#: reporting progress. ``idle`` is deliberately absent: every spelling we do not
+#: recognise lands there, and such a turn may well be running.
+_SETTLED = frozenset({WAITING, DONE, FAILED, CANCELED})
+
 PAGE_LIMIT = 100
 MAX_TITLE = 80
 
@@ -315,7 +321,9 @@ class SessionService:
                 """,
                 (session_id,),
             ).fetchall()
-        return self._view(row, messages, files)
+        view = self._view(row, messages, files)
+        view["progress"] = self._progress(row)
+        return view
 
     def list_sessions(
         self,
@@ -445,7 +453,10 @@ class SessionService:
         conversation showed nothing.
         """
         state = state_of(task.get("state"))
-        text = str(task.get("text") or "").strip()
+        # ``artifactText`` is the answer and nothing else; the fallback to
+        # ``text`` only matters for a caller that built the dict by hand.
+        text = str(task.get("artifactText", task.get("text")) or "").strip()
+        status_text = str(task.get("statusText") or "").strip()
         error = str(task.get("error") or "").strip()
         task_id = task.get("id")
         if "response" not in task and task_id:
@@ -475,10 +486,12 @@ class SessionService:
                 changed = self._append_unique(
                     connection, session_id, "error", error, task_id, FAILED, []
                 )
-            elif text or files:
-                changed = self._append_unique(
-                    connection, session_id, "agent", text, task_id, state, files
-                )
+            else:
+                spoken = _spoken(text, status_text, state)
+                if spoken or files:
+                    changed = self._append_unique(
+                        connection, session_id, "agent", spoken, task_id, state, files
+                    )
             if changed or row["state"] != state:
                 connection.execute(
                     "UPDATE sessions SET state = ?, updated_at = ? WHERE id = ?",
@@ -551,7 +564,22 @@ class SessionService:
             params.append(task_id)
         query += " ORDER BY id DESC LIMIT 1"
         previous = connection.execute(query, params).fetchone()
-        if previous is not None and previous["text"] == text:
+        if previous is not None and _extends(previous["text"], text, state):
+            # The last bubble already says the answer, and this snapshot only adds
+            # the question to it (a working turn appends the bare answer; the
+            # waiting turn then composes ``answer + "\n\n" + question``).
+            # Extending that message in place is what keeps the answer from being
+            # printed twice — the duplicate-bubble problem this change exists to
+            # remove.
+            connection.execute(
+                "UPDATE session_messages SET text = ?, state = ? WHERE id = ?",
+                (text, state, previous["id"]),
+            )
+            if files:
+                self._store_media(connection, session_id, previous["id"], files)
+            return True
+
+        if previous is not None and _repeats(previous["text"], text):
             # `files` already had every identity of this turn filtered out by
             # :meth:`_inbound`, so "no files left" is exactly the repeat case. The
             # old comparison (previous row's identities == files) could never hold:
@@ -796,6 +824,25 @@ class SessionService:
             raise SessionNotFound(session_id)
         return row
 
+    def _progress(self, row: sqlite3.Row) -> dict[str, Any] | None:
+        """The running turn's progress line, or ``None``.
+
+        Read off the task row rather than a session column: the task is where
+        every route writes it (send, poll, callback), so there is exactly one
+        truth for "what is it doing right now". Only a *working* conversation
+        has one — a finished turn has nothing to report.
+        """
+        if row["state"] != WORKING or not row["task_id"]:
+            return None
+        with self.db.connect() as connection:
+            task = connection.execute(
+                "SELECT progress_text, progress_at FROM tasks WHERE id = ?",
+                (row["task_id"],),
+            ).fetchone()
+        if task is None or not task["progress_text"]:
+            return None
+        return {"text": task["progress_text"], "at": task["progress_at"]}
+
     def _view(
         self,
         row: sqlite3.Row,
@@ -844,6 +891,60 @@ class SessionService:
         view = self._view(row)
         view["lastText"] = truncate(row["last_text"], 120) if row["last_text"] else ""
         return view
+
+
+def _repeats(previous: str, text: str) -> bool:
+    """True when the last message of this turn already says ``text``.
+
+    Two shapes count: the identical line, and the waiting-turn bubble that put an
+    answer and its question together (``text + "\\n\\n" + question``). Without the
+    second, a turn that stops to ask something and *then* finishes would show the
+    same answer twice — once glued to the question, once on its own — which is
+    the duplicate-bubble problem this whole change exists to remove.
+    """
+    if not text:
+        return previous == text
+    return previous == text or previous.startswith(f"{text}\n\n")
+
+
+def _extends(previous: str, text: str, state: str | None = None) -> bool:
+    """True when a *waiting* snapshot is the last message plus its question.
+
+    Restricted to ``waiting`` on purpose: that is the only state where
+    :func:`_spoken` glues a status line onto the answer. Artifacts accumulate
+    across snapshots *and across turns of one open task*, so the same shape also
+    turns up for an ordinary later answer — extending in place then would move
+    the new answer above the user message that caused it, and lose turn one.
+    """
+    return state == WAITING and bool(previous) and text.startswith(f"{previous}\n\n")
+
+
+def _spoken(text: str, status: str, state: str) -> str:
+    """What the agent's message for one snapshot should say.
+
+    A running agent's ``status.message`` is progress, and progress belongs in the
+    "正在处理…" line rather than in the transcript: an agent that narrates every
+    step used to fill the conversation with bubbles that are not answers.
+
+    Two states still speak it, for two different reasons:
+
+    * ``waiting`` — the agent stopped to ask something, and that sentence *is*
+      the question the operator has to answer;
+    * any finished turn with no artefact text — many agents put the whole answer
+      in ``status.message`` and never emit an artifact, so dropping it would
+      leave a blank conversation beside a completed task.
+
+    A waiting turn that has both puts the question after the answer in one
+    bubble. Two messages from one snapshot would defeat the "compare with the
+    last message" dedupe and re-append both on every poll.
+    """
+    if not status or state == WORKING:
+        return text
+    if not text:
+        return status if state in _SETTLED else text
+    if state == WAITING:
+        return f"{text}\n\n{status}"
+    return text
 
 
 def _wire(item: media.Prepared) -> dict[str, Any]:

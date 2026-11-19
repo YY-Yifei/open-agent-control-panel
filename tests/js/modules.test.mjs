@@ -42,6 +42,8 @@ const WEB = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "src", "oa
 const SHIPPED = [
   "app.js",
   "md.js",
+  "progress.js",
+  "html.js",
   "agent/panel.js",
   "agent/client.js",
   "agent/wire.js",
