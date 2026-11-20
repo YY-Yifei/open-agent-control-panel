@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-11-20
+
 ### Added
 
 - **A Markdown attachment opens rendered.** A `.md` / `.markdown` file used to be shown as raw
