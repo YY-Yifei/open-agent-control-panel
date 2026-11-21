@@ -182,6 +182,33 @@ export function validateArguments(schema, value) {
   return problems;
 }
 
+/**
+ * Turn an inspection tool's `ok:false` body into a failure the caller can act on.
+ *
+ * The server answers 200 with `ok:false` so the hint is not mangled on the way
+ * out (an error response is clipped to 600 characters). What it must never do is
+ * reach the model looking like a result: a statement that failed, or a map that
+ * was never produced, has to arrive as a failure — otherwise the model reports a
+ * non-answer as truth and the operator's log reads `· ok` for a query that never
+ * ran. The hint itself is short, so it survives the error path intact.
+ *
+ * `SQL_TIMEOUT` gets its own reason: a statement that overran its budget is
+ * syntactically fine, and a model told "SQL_FAILED" will try to fix the SQL
+ * instead of narrowing it.
+ */
+function inspectionText(data, reason, fallback) {
+  const text = (data && data.text) || "";
+  if (data && data.ok === false) {
+    // The fallback belongs to the failure branch only: using it on success turned
+    // an empty 2xx body into the literal "SQL_ERROR", and made the callers'
+    // `|| "(empty)"` unreachable.
+    const failure = new Error(text || fallback);
+    failure.reason = /^SQL_TIMEOUT\b/.test(text) ? "SQL_TIMEOUT" : reason;
+    throw failure;
+  }
+  return text;
+}
+
 // ------------------------------------------------------------------- catalog
 
 /**
@@ -690,6 +717,103 @@ export function createCatalog({ api, ui, policy = "act" } = {}) {
             .filter(Boolean)
             .join("\n"),
         );
+      },
+    },
+
+    // ------------------------------------------------------ panel: inspect
+    //
+    // Everything above answers "give me this thing by id". These two answer
+    // questions those cannot express, because their shape is not known in
+    // advance: "which agent fails most", "how did the failure rate move this
+    // week", "which host registered and never ran a task". A prebuilt endpoint
+    // per question would only ever cover the questions someone already asked.
+    //
+    // So: a map (`panel_db_schema`) and a key (`panel_db_query`). Both are `read`
+    // in the strict sense — the server opens the file with `mode=ro` and
+    // `PRAGMA query_only`, so a write fails inside SQLite rather than by
+    // convention.
+    //
+    // Credentials are **refused**, not redacted, and the check is on what the
+    // statement *reads* rather than what its columns are called: SQLite's
+    // authorizer reports every column a statement references, so
+    // `SELECT push_token AS t`, `substr(push_token,1,20)` and
+    // `WHERE manage_token = 'guess'` are all caught.
+    //
+    // Refusing is the only honest option. Masking every cell still leaves the row
+    // count, the ordering and whether a WHERE matched visible — an oracle a caller
+    // can walk one comparison at a time until the token falls out. The cost is that
+    // `SELECT *` fails where it used to be (misleadingly) masked; the note in the
+    // error says which column to project instead.
+    //
+    // The arithmetic is deliberately not here. A model that can run one SELECT
+    // can build any summary; a model handed six fixed reports can only read
+    // those six.
+    {
+      tier: TIER_READ,
+      declaration: {
+        name: "panel_db_schema",
+        description:
+          "面板数据库的结构：表、列名与类型、主键、索引、行数、各枚举列的实际取值、哪些列敏感。" +
+          "要写 SQL 之前先调它确认列名——写在 panel_db_query 里的列名必须来自这里。",
+        timeoutMs: 15000,
+        parameters: object({
+          table: {
+            type: "string",
+            minLength: 1,
+            maxLength: 60,
+            description: "只看一张表的细节（类型 / 索引 / 取值）；不传则列出所有表",
+          },
+        }, []),
+      },
+      run: async ({ table }) => {
+        const query = table ? `?table=${encodeURIComponent(table)}` : "";
+        const data = await api(`/api/panel/db/schema${query}`);
+        // `no such table: task` is an answer the model must act on, not a map it
+        // should read as truth — so it fails, like a bad statement does.
+        return clip(inspectionText(data, "SCHEMA_FAILED", "SCHEMA_ERROR") || "(empty)");
+      },
+    },
+    {
+      tier: TIER_READ,
+      declaration: {
+        name: "panel_db_query",
+        description:
+          "对面板数据库跑一条只读 SQL（SELECT / WITH / PRAGMA），返回表格。多个问题就多次调用。" +
+          "聚合、分组、排序都写在 SQL 里（count(*) / avg / GROUP BY / ORDER BY）。" +
+          "写之前用 panel_db_schema 确认列名。" +
+          "结果是一次一页的：首行的「N rows of M」若不等，说明还有更多行，加 WHERE 或在 SQL 里聚合。" +
+          "panel_db_schema 里标了 † 的列是凭据列：这类列不可读——" +
+          "SELECT / WHERE / ORDER BY / substr 里一旦出现，整条语句会被**拒绝**（不是打码返回），" +
+          "因为连行数都会泄露它。所以别 SELECT *，显式列出要看的列。" +
+          "语句写错时会返回 error（reason=SQL_FAILED），正文是以 SQL_ERROR: 开头的说明和 hint，照 hint 改。",
+        timeoutMs: 20000,
+        parameters: object({
+          sql: { type: "string", minLength: 1, maxLength: 4000 },
+          limit: {
+            type: "integer",
+            minimum: 1,
+            maximum: 500,
+            description: "最多返回多少行，默认 100。宽结果会被自动减行以适配答复长度，首行会写「N rows of M」",
+          },
+        }, ["sql"]),
+      },
+      run: async ({ sql, limit }) => {
+        // The server answers 200 with `ok:false` for a statement that ran and
+        // failed, because the useful part is the hint ("no such column: agentname
+        // — did you mean agent_name?"). That flat body must not reach the model as
+        // a success: the caller would take it for a result, and the operator
+        // watching the log would see `· ok` for a query that never ran. So it is
+        // re-raised here, as a failure whose message *is* the hint — short enough
+        // to survive the 600-character error path with the advice intact.
+        const data = await api("/api/panel/db/query", {
+          method: "POST",
+          // Omit the key rather than filling in a default: the server owns it, and
+          // two literals in two languages drift apart silently. `limit` is also
+          // schema-checked to 1..500, so `limit || 100` was answering a question
+          // the validator had already settled.
+          body: limit === undefined ? { sql } : { sql, limit },
+        });
+        return clip(inspectionText(data, "SQL_FAILED", "SQL_ERROR") || "(empty)");
       },
     },
 

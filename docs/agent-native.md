@@ -74,7 +74,7 @@
 2. `panel_*` 要真打后端：`PYTHONPATH=src python -m oacp serve --port 8123 --db <临时库>`，
    再把注入的 `api(path)` 指向它；
 3. 真模型不可控，所以断言分两层：**协议层**（零诊断、turn 有终态、每次 invoke 都有合法结果）
-   与**执行体**（把 20 个能力逐个 `catalog.execute`，不经过模型）。
+   与**执行体**（把 28 个能力逐个 `catalog.execute`，不经过模型）。
 
 ### 1.1 浏览器能不能直连 —— 两个必须说清的点
 
@@ -158,7 +158,7 @@ v1 之所以禁止并发轮次，是因为 function 在服务端执行、UI 指�
 得票 **0.09**；`allow_warn` 0.14；`lock` 0.77。
 
 理由站得住：两个标签页各连一次 aaas，服务端会拿到**两个 `sessionId`、两份
-AgentDefinition**，模型侧看到两套一模一样的 22 个函数，用户会看到「我在这个页面
+AgentDefinition**，模型侧看到两套一模一样的 28 个函数，用户会看到「我在这个页面
 让它删了东西，那个页面还在说没删」。而 stateless 模式下 history 也是各自持有的，
 两个 transcript 会分叉。代价只是约 80 行。
 
@@ -247,7 +247,7 @@ police 的一直是「**会不会动数据**」，不是「会不会动像素」
   （一个在 CSS、一个在 JS）迟早会不一致，而那种不一致的表现是「拖到某个宽度，
   抽屉突然盖住正文」。
 
-### 4.2 经面板 REST（13 个声明）—— 前端 fetch 后端
+### 4.2 经面板 REST（15 个声明）—— 前端 fetch 后端
 
 | function | 后端端点 | 档 |
 |---|---|---|
@@ -257,15 +257,17 @@ police 的一直是「**会不会动数据**」，不是「会不会动像素」
 | `panel_get_agent(id)` | `GET /agents/{id}` | read |
 | `panel_list_sessions(agent_id, limit)` | `GET /sessions` | read |
 | `panel_get_session(id, limit)` | `GET /sessions/{id}` | read |
-| `panel_list_tasks(status, limit)` | `GET /tasks` | read |
+| `panel_list_tasks(state, limit)` | `GET /tasks` | read |
 | `panel_get_task(id)` | `GET /tasks/{id}` | read |
+| `panel_db_schema(table?)` | `GET /db/schema`（**新增**） | read |
+| `panel_db_query(sql, limit)` | `POST /db/query`（**新增**） | read |
 | `panel_rename_session(id, title)` | `PATCH /sessions/{id}` | act |
 | `panel_refresh_agent(id)` | `POST /agents/{id}/refresh` | act |
 | `panel_cancel_session(id)` | `POST /sessions/{id}/cancel` | act |
 | `panel_delete_session(id)` | `DELETE /sessions/{id}` | **destroy · 确认门** |
 | `panel_delete_agent(id)` | `DELETE /agents/{id}` | **destroy · 确认门** |
 
-> 13 行里只有 `search` 需要新增后端端点（三处 `LIKE`，只读，各限 200 行）。
+> 15 行里只有 `search` 与 `db/*` 需要新增后端端点（`search` 是三处 `LIKE`，只读，各限 200 行）。
 > **它的 JEV 分布很弱（yes 0.62 / no 0.38，confidence 0.24）**，我采纳的理由不是概率，
 > 而是需求方把「查找」与「统计」「切换主题」并列点名 —— 而跨 agent 检索前端做不了。
 
@@ -290,8 +292,8 @@ police 的一直是「**会不会动数据**」，不是「会不会动像素」
 | `panel_send_message` | 不是删掉，是**默认不声明**（§4.3） | 0 行，改策略 |
 
 `--agent-policy` 决定**声明期就减面**：`read` 策略下，act 与 destroy 根本不出现在
-declare 里。四档：`read`（11+8=19）/ `act`（+4=23，默认；3 个 `panel_*` + 1 个 `ui_attach`）/
-`all`（+2=25）/ `delegate`（+1=26，首版不默认声明）。
+declare 里。四档：`read`（11+10=21）/ `act`（+4=25，默认；3 个 `panel_*` + 1 个 `ui_attach`）/
+`all`（+2=27）/ `delegate`（+1=28，首版不默认声明）。
 
 ### 4.5 准入判据：一个页面功能该不该也成为一个 function
 
@@ -411,7 +413,7 @@ export function createCatalog({ api, ui }) {
 }
 ```
 
-`ui` 与 `api` 由页面注入。**这套接缝让 22 个能力能在 Node 里被真实测试**（§8）。
+`ui` 与 `api` 由页面注入。**这套接缝让 28 个能力能在 Node 里被真实测试**（§8）。
 
 ### 5.4 `agent/tablock.js` —— 跨标签页单活跃（约 80 行，D5）
 
@@ -530,10 +532,10 @@ declare 后服务端收到的函数名集合 == 目录、收到 invoke 能执行
 
 其余用例：
 
-1. `test_catalog_schema_shapes`（Node）：25 个 `parameters` 都是 `type:object`，
+1. `test_catalog_schema_shapes`（Node）：28 个 `parameters` 都是 `type:object`，
    名字合 `^[a-z][a-z0-9_]{0,63}$`，**无重复**。
-2. `test_policy_hides_write_functions`：`--agent-policy read` 时 declare 里只有 19 个；
-   `act` 23 个；`all` 25 个；`delegate` 26 个。
+2. `test_policy_hides_write_functions`：`--agent-policy read` 时 declare 里只有 21 个；
+   `act` 25 个；`all` 27 个；`delegate` 28 个。
 3. `test_confirm_gate_denies`：人取消 → 服务端看到 `rejected/denied`，会话仍存在。
 4. `test_ws_down_hides_entry`：配置关闭时 `GET /api/panel/agent` 返回 `enabled:false`，
    且页面不实例化连接。
@@ -585,7 +587,7 @@ declare 后服务端收到的函数名集合 == 目录、收到 invoke 能执行
 | 面板 https + `ws://` 混合内容 | 连不上 | 同源代理，或 aaas 侧上 `wss://` |
 | 确认门挂起 120s | 该轮被占住 | 声明 `timeoutMs:120000`；超时回 `rejected/busy`，模型知道未执行 |
 | JS 侧 schema 校验比 Python 弱 | 非法参数进到能力体 | 实现 `type/enum/required/minimum/maxLength` 子集 + 能力体自身防御性校验 |
-| `maxFrameBytes` 1 MB | declare 超限 | 22 个 schema ≈ 8 KB，余量充足；`get_session` 等结果先截断到 4000 字符 |
+| `maxFrameBytes` 1 MB | declare 超限 | 28 个 schema ≈ 8.7 KB（实测），余量充足；`get_session` 等结果先截断到 4000 字符 |
 | localStorage 存对话 | 与面板无关的内容留在浏览器 | 只留 50 轮；抽屉里有「清空对话」；不存附件内容 |
 
 ---

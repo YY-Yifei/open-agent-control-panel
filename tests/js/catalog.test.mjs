@@ -63,7 +63,7 @@ function fakeHost(overrides = {}) {
 test("every declaration is a legal name with an object schema, and none repeat", () => {
   const { api, ui } = fakeHost();
   const catalog = createCatalog({ api, ui, policy: "delegate" });
-  assert.equal(catalog.declarations.length, 26);
+  assert.equal(catalog.declarations.length, 28);
   const names = catalog.declarations.map((item) => item.name);
   assert.equal(new Set(names).size, names.length, "duplicate function name");
   for (const declaration of catalog.declarations) {
@@ -80,7 +80,12 @@ test("the policy decides what is even declared", () => {
   for (const policy of ["read", "act", "all", "delegate"]) {
     sizes[policy] = createCatalog({ api, ui, policy }).declarations.length;
   }
-  assert.deepEqual(sizes, { read: 19, act: 23, all: 25, delegate: 26 });
+  assert.deepEqual(sizes, { read: 21, act: 25, all: 27, delegate: 28 });
+  // Inspection is `read` by construction, not by policy: the server opens the
+  // file with mode=ro + query_only, so a write fails inside SQLite.
+  const read = createCatalog({ api, ui, policy: "read" }).names;
+  assert.ok(read.includes("panel_db_schema"));
+  assert.ok(read.includes("panel_db_query"));
   // The delegate capability is the one that can make one agent drive another.
   const all = createCatalog({ api, ui, policy: "all" }).names;
   assert.ok(!all.includes("panel_send_message"));
@@ -420,6 +425,130 @@ test("a failing API call is an error the model can act on, not a crash", async (
   const result = await catalog.execute({ name: "panel_overview", arguments: {} });
   assert.equal(result.status, "error");
   assert.equal(result.parts[0].text, "boom");
+});
+
+test("panel_db_schema asks for the map, and scopes it to one table when asked", async () => {
+  const { api, ui, calls } = fakeHost({ api: async () => ({ text: "agents (1 rows): id*" }) });
+  const catalog = createCatalog({ api, ui });
+
+  await catalog.execute({ name: "panel_db_schema", arguments: {}, deadlineMs: 5000 });
+  await catalog.execute({ name: "panel_db_schema", arguments: { table: "tasks" }, deadlineMs: 5000 });
+
+  assert.equal(calls[0].path, "/api/panel/db/schema");
+  // A table name reaches the server verbatim, so it has to be encoded: the
+  // schema allows any string up to 60 characters, not a known-safe alphabet.
+  assert.equal(calls[1].path, "/api/panel/db/schema?table=tasks");
+
+  // "tasks" survives encodeURIComponent unchanged, so asserting on it proves
+  // nothing. This one would break out of the query string without the call.
+  await catalog.execute({ name: "panel_db_schema", arguments: { table: "a b&c=d?" }, deadlineMs: 5000 });
+  assert.equal(calls[2].path, "/api/panel/db/schema?table=a%20b%26c%3Dd%3F");
+});
+
+test("panel_db_query POSTs the statement and keeps the server's text intact", async () => {
+  const { api, ui, calls } = fakeHost({
+    api: async () => ({ text: "sql ok  2 rows  3ms\nstate  n\ncompleted  2", ok: true }),
+  });
+  const catalog = createCatalog({ api, ui });
+
+  const result = await catalog.execute({
+    name: "panel_db_query",
+    arguments: { sql: "SELECT state, count(*) n FROM tasks GROUP BY 1" },
+    deadlineMs: 5000,
+  });
+
+  assert.equal(calls[0].path, "/api/panel/db/query");
+  assert.equal(calls[0].init.method, "POST");
+  // No limit supplied -> no limit sent. The server owns the default (100); a
+  // literal here as well would be a second source of truth that drifts silently.
+  assert.deepEqual(calls[0].init.body, { sql: "SELECT state, count(*) n FROM tasks GROUP BY 1" });
+  assert.equal(result.status, "ok");
+  assert.match(result.parts[0].text, /^sql ok/);
+
+  await catalog.execute({
+    name: "panel_db_query",
+    arguments: { sql: "SELECT 1", limit: 5 },
+    deadlineMs: 5000,
+  });
+  assert.deepEqual(calls[1].init.body, { sql: "SELECT 1", limit: 5 });
+});
+
+test("an empty table name is refused instead of meaning 'every table'", async () => {
+  // `""` is falsy, so without minLength it reached the body as "no table given" and
+  // the caller got a bigger answer than it asked for — and no way to tell.
+  const { api, ui } = fakeHost();
+  const catalog = createCatalog({ api, ui });
+  const result = await catalog.execute({
+    name: "panel_db_schema",
+    arguments: { table: "" },
+    deadlineMs: 5000,
+  });
+  assert.equal(result.status, "error");
+  assert.equal(result.reason, "ARGUMENTS_INVALID");
+});
+
+test("a schema that could not be produced fails, like a bad statement does", async () => {
+  // The server reports `no such table: task` with ok:false. Surfacing it as a
+  // success would let the model read a non-answer as a map.
+  const { api, ui } = fakeHost({
+    api: async () => ({ text: "no such table: task; did you mean tasks?", ok: false }),
+  });
+  const catalog = createCatalog({ api, ui });
+  const result = await catalog.execute({
+    name: "panel_db_schema",
+    arguments: { table: "task" },
+    deadlineMs: 5000,
+  });
+  // ARGUMENTS_INVALID is impossible here (the name is a legal string), so what
+  // matters is that it is not reported as ok.
+  assert.equal(result.status, "error");
+  assert.equal(result.reason, "SCHEMA_FAILED");
+  assert.match(result.parts[0].text, /did you mean tasks/);
+});
+
+test("a timeout is a timeout, not a syntax mistake", async () => {
+  // Telling the model "SQL_FAILED" for a statement that only ran too long sends it
+  // off rewriting correct SQL; the reason has to say which it was.
+  const { api, ui } = fakeHost({
+    api: async () => ({ text: "SQL_TIMEOUT: over 3000ms — narrow the window with WHERE", ok: false }),
+  });
+  const catalog = createCatalog({ api, ui });
+  const result = await catalog.execute({
+    name: "panel_db_query",
+    arguments: { sql: "SELECT * FROM tasks" },
+    deadlineMs: 5000,
+  });
+  assert.equal(result.status, "error");
+  assert.equal(result.reason, "SQL_TIMEOUT");
+});
+
+test("a wrong statement fails, and its hint survives the error path", async () => {
+  // The server answers 200 with ok:false so the hint is not mangled on the way
+  // out; the catalog then re-raises it. Two things have to hold at once: the model
+  // sees a failure (not a result it might report as an answer), and it still gets
+  // the "did you mean" that lets it recover in the same turn.
+  const { api, ui } = fakeHost({
+    api: async () => ({
+      text: "SQL_ERROR: no such column: agentname\nhint: did you mean agent_name (tasks)?",
+      ok: false,
+    }),
+  });
+  const catalog = createCatalog({ api, ui });
+
+  const result = await catalog.execute({
+    name: "panel_db_query",
+    arguments: { sql: "SELECT agentname FROM tasks" },
+    deadlineMs: 5000,
+  });
+
+  // A statement that failed is a failure: a flat `ok` would leave the operator
+  // reading `· ok` in the log for a query that never ran, and the model without a
+  // reason to retry.
+  assert.equal(result.status, "error");
+  assert.equal(result.reason, "SQL_FAILED");
+  // The hint survives, because it is the whole point of the round trip.
+  assert.match(result.parts[0].text, /no such column/);
+  assert.match(result.parts[0].text, /did you mean agent_name/);
 });
 
 test("an unknown argument is refused instead of being silently ignored", async () => {

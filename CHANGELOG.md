@@ -6,6 +6,63 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-11-21
+
+### Added
+
+- **The assistant can read the panel's own database** — `panel_db_schema` and `panel_db_query`,
+  two `read`-tier capabilities that answer the questions the eight `panel_get_*` ones cannot
+  express, because their shape is not known in advance: which agent fails most, how the failure
+  rate moved this week, which host registered and never ran a task. `panel_db_schema` is the map
+  (tables, columns, types, indexes, row counts, the values actually present in enumeration
+  columns, which columns hold credentials); `panel_db_query` runs one `SELECT` / `WITH` /
+  `PRAGMA` and renders the result as a table.
+  The arithmetic is deliberately **not** in the code. A capability per question only ever covers
+  the questions someone already asked; a map plus a key covers the next one. `docs/db-cookbook.md`
+  holds the queries that used to be reports — failure rates, turn-time percentiles, stuck turns,
+  orphan rows — as SQL to steal from rather than endpoints to call.
+  Results are text, not JSON: the same 4000-character budget holds about three times as many
+  rows, and a table can be quoted back at a person unchanged. Every answer states `matched` vs
+  `showing` (a page must not look like the whole ledger), distinguishes an empty result from a
+  failure, and carries its own elapsed time.
+  A wrong column name comes back with a hint — `no such column: agentname` followed by
+  `did you mean agent_name (tasks)?` — because that is the failure this capability will actually
+  hit. Without it a model retries `agentName`, `agent_name`, `name`, spends its step budget, and
+  reports that the data was never there.
+
+### Security
+
+- **`read` is proved by the connection, not by a promise.** The inspection layer opens the file
+  with `mode=ro` and `PRAGMA query_only`, so a write fails *inside SQLite* — the test suite
+  asserts that against a raw `connection.execute`, not only against the wrapper. On top of that:
+  a statement-head allow-list (`select` / `with` / `values` / `explain` / `pragma`), credential
+  columns (`agents.manage_token`, `tasks.push_token`) masked on the way out by column name so
+  `SELECT *` leaks no more than an explicit list, BLOBs rendered as `<blob 12.3 KB>` so one
+  `SELECT *` cannot spend the whole result budget on bytes, and a progress-handler deadline that
+  stops a recursive CTE instead of leaving the page waiting forever.
+  A WAL database that cannot map its `-shm` file fails loudly — there is deliberately **no**
+  fallback to `immutable=1`, because that would ignore the `-wal` and report the last checkpoint
+  as if it were the present.
+  Masking cannot follow a renamed column (`SELECT manage_token AS tok`), and the test suite says
+  so out loud rather than leaving the limit to be discovered.
+
+### Fixed
+
+- The README's capability table was wrong before this release: `ui_*` said 9 and there are 12,
+  the policy counts said 17 / 20 / 22 / 23 and were 19 / 23 / 25 / 26, and both README and
+  `docs/agent-native.md` documented `panel_list_tasks(status, …)` when the parameter is `state` —
+  a name the schema rejects, so a model following the docs got `ARGUMENTS_INVALID`.
+
+### Changed
+
+- **Python 3.10 is no longer supported; the floor is now 3.11.** The masking
+  guarantee asks SQLite which columns a statement references
+  (`Connection.set_authorizer`), and that API arrived in 3.11. The alternative was
+  a fallback path that no caller would exercise and that would leave the guarantee
+  weaker on exactly the interpreter nobody tests — so the honest fix is to declare
+  the real floor. 3.10 reached end of life on 2026-10-31, a few weeks before this
+  release.
+
 ## [0.10.0] — 2026-11-20
 
 ### Added

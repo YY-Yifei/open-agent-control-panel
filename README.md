@@ -5,7 +5,7 @@ see everyone who is online, submit tasks over A2A JSON-RPC, and follow those tas
 from one small FastAPI service with a dependency-free web UI.
 
 [![PyPI](https://img.shields.io/pypi/v/open-agent-control-panel.svg)](https://pypi.org/project/open-agent-control-panel/)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-lightgrey)](LICENSE)
 [![Protocol](https://img.shields.io/badge/protocol-ADP%20Core%201.0.0-informational)](https://github.com/YY-Yifei/a2a-discover/blob/main/spec/adp-core.md)
 
@@ -195,17 +195,25 @@ process, and never appears in a response body.
 
 | Tier | Count | Examples |
 | --- | --- | --- |
-| `ui_*` | 9 | `ui_theme`, `ui_notify`, `ui_open`, `ui_draft`, `ui_download`, `ui_modal` |
-| `panel_*` read | 8 | `panel_overview`, `panel_search`, `panel_list_agents`, `panel_get_session` |
+| `ui_*` | 12 | `ui_theme`, `ui_notify`, `ui_open`, `ui_draft`, `ui_download`, `ui_modal` |
+| `panel_*` read | 10 | `panel_overview`, `panel_search`, `panel_get_agent`, `panel_db_query` |
 | `panel_*` act | 3 | `panel_rename_session`, `panel_refresh_agent`, `panel_cancel_session` |
 | `panel_*` destroy | 2 | `panel_delete_session`, `panel_delete_agent` |
 
-`--agent-policy` decides which tiers are *declared*: `read` (17), `act` (20, the default),
-`all` (22), `delegate` (23). A capability outside the policy does not exist for the model —
+`--agent-policy` decides which tiers are *declared*: `read` (21), `act` (25, the default),
+`all` (27), `delegate` (28). A capability outside the policy does not exist for the model —
 it is not declared, so it cannot be called and cannot be dialectically talked around.
 
 `panel_send_message` — speaking to another agent in your name — is only declared under
 `delegate`. It is off by default because that is how two agents end up in a loop.
+
+`panel_db_schema` / `panel_db_query` are the two exceptions to "a capability answers by id":
+they answer questions whose shape is not known in advance (which agent fails most, how the
+failure rate moved this week, which host registered and never ran a task). One says what is in
+the database, the other runs a single read-only statement. Both are `read` because the server
+opens the file with `mode=ro` + `PRAGMA query_only` — a write fails inside SQLite, not by
+convention — and credential columns are masked on the way out. See
+[docs/db-cookbook.md](docs/db-cookbook.md) for the queries worth stealing.
 
 ### Two things the model may not do
 

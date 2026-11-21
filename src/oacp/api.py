@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from . import __version__
 from .adp import card as cardmod
 from .adp.service import RegistryError
-from . import media
+from . import db_inspect, media
 from .errors import PanelError
 from .sessions import SessionService
 from .tasks import TaskService
@@ -787,6 +787,61 @@ def search(
         "sessions": session_items[:limit],
         "tasks": task_items[:limit],
     }
+
+
+# ------------------------------------------------------------------- inspection
+#
+# Two primitives, and the panel's own file as the subject: ``describe`` says what
+# is in it, ``query`` runs one read-only statement. Everything a summarizer would
+# want (failure rates, turn-time percentiles, orphans) is a composition of these
+# two, left to the caller — a prebuilt report can only answer what its author
+# thought of.
+#
+# Why the query endpoint answers 200 even when the statement was wrong: the
+# caller is a model, and the useful part of a failure is the hint next to it
+# ("no such column: agentname — did you mean agent_name?"). ``app.js`` clips an
+# error response to 600 characters and the catalog reports it as a failed call;
+# a 200 carrying `ok:false` keeps the text intact and lets the model retry in the
+# same turn instead of burning its budget guessing. A genuine deployment problem
+# (the file will not open) is still a real error with a real status.
+
+
+class DbQuery(BaseModel):
+    """One read-only statement, plus how many rows to render."""
+
+    sql: str = Field(min_length=1, max_length=4000)
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+def _inspect_connection(request: Request):
+    """A read-only connection to the panel's own database, or a 503."""
+    path = request.app.state.settings.db_path
+    try:
+        return db_inspect.open_readonly(path)
+    except db_inspect.ReadOnlyError as exc:
+        raise PanelError("db_unavailable", status=503, reason=str(exc)) from exc
+
+
+@router.get("/db/schema")
+def db_schema(request: Request, table: str | None = Query(default=None, max_length=60)) -> dict[str, Any]:
+    """The shape of the panel's database: tables, columns, types, indexes, values."""
+    connection = _inspect_connection(request)
+    try:
+        answer = db_inspect.describe_answer(connection, table)
+    finally:
+        connection.close()
+    return {"text": answer.text, "ok": answer.ok, "elapsedMs": answer.elapsed_ms}
+
+
+@router.post("/db/query")
+def db_query(request: Request, payload: DbQuery) -> dict[str, Any]:
+    """Run one read-only statement; the result is a table, mistakes included."""
+    connection = _inspect_connection(request)
+    try:
+        answer = db_inspect.query(connection, payload.sql, limit=payload.limit)
+    finally:
+        connection.close()
+    return {"text": answer.text, "ok": answer.ok, "elapsedMs": answer.elapsed_ms}
 
 
 # ---------------------------------------------------------------- agent: socket

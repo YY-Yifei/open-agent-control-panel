@@ -132,6 +132,13 @@ TEXTS: dict[str, dict[str, str]] = {
         "zh": "请求体太大：一个请求最多 {max} MB",
         "en": "the request body is too large: at most {max} MB per request",
     },
+    # Inspection. The panel's own file could not be opened for reading — a
+    # deployment detail (permissions, a moved file), never a SQL mistake, which
+    # is reported in the result body instead so the model can correct it.
+    "db_unavailable": {
+        "zh": "无法以只读方式打开面板数据库：{reason}",
+        "en": "the panel database could not be opened read-only: {reason}",
+    },
 }
 
 
