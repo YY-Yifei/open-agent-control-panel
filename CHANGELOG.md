@@ -6,6 +6,29 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-11-24
+
+### Fixed
+
+- **A turn no longer hangs when the agent has forgotten its task.** A2A keeps the task on the
+  agent, and an agent that keeps that table in memory answers `-32001` (`TaskNotFoundError`)
+  for every id it handed out after a restart. The panel recorded that as an ordinary error and
+  kept the state it had — `working` — which is exactly what the UI reads to disable the
+  composer, keep polling and say "the agent is working…": the conversation was stuck for good,
+  the progress line frozen at its last sentence, and stop failed with the same `-32001`, so
+  the only way out was reloading the page. A lost task is now **terminal**
+  (`interrupted`, with the agent's own words kept as the reason and the progress line
+  dropped), `CancelTask` degrades to a local cancel that always unlocks, and both are explained
+  in the transcript in the reader's language — the panel's own sentences travel as codes on
+  `session_messages` (schema 10) and are translated when they are read, while the agent's words
+  are quoted as sent. Timeouts and 5xx stay transient on purpose: a blip must not end a turn
+  that is still running on the agent.
+- **A poll that stops working says so.** Three failed syncs in a row now slow the polling to
+  one attempt every 15 s, announce it once, and keep the reason in the pending bubble instead of
+  leaving "the agent is working…" on screen behind a state that will never resolve. A wrong panel
+  token ends the poll instead of re-opening the token dialog every 15 s, and a stale in-flight
+  tick can no longer clear a newer conversation's timer.
+
 ## [0.11.0] — 2026-11-21
 
 ### Added
