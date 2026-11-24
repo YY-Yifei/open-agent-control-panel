@@ -55,7 +55,20 @@ _PUSH_PARAM_KEY: dict[str, str] = {"v03": "pushNotificationConfig", "v1": "confi
 _PUSH_INLINE_KEY: dict[str, str] = {"v03": "pushNotificationConfig", "v1": "taskPushNotificationConfig"}
 
 _RETRYABLE_CODES = {-32601, -32602, -32700}
+#: The same codes as text, for the servers that send them as strings.
+_RETRYABLE_CODE_TEXTS = frozenset(str(code) for code in _RETRYABLE_CODES)
 _RETRYABLE_STATUSES = {400, 404, 405, 415}
+
+#: The actions whose parameters are a *task id*. Only for these does a bare HTTP 404
+#: mean "the agent has no such task" — on `send` the same status is a method or path
+#: mismatch, and the 0.3 -> 1.x fallback must stay alive for it.
+_TASK_SCOPED = frozenset({"get", "cancel"})
+
+#: The JSON-RPC code a conformant A2A agent answers with when the task id it was
+#: asked about is not in its table (``TaskNotFoundError``). It is the one A2A
+#: error that is *permanent by definition*: not busy, not refusing, not broken —
+#: the id simply is not there any more, and no retry with it can ever succeed.
+TASK_NOT_FOUND = -32001
 
 
 class A2AError(Exception):
@@ -69,6 +82,7 @@ class A2AError(Exception):
         status: int | None = None,
         payload: Any = None,
         retryable: bool = False,
+        gone: bool | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -76,6 +90,57 @@ class A2AError(Exception):
         self.status = status
         self.payload = payload
         self.retryable = retryable
+        #: "The agent has no such task", decided where the *action* was still known
+        #: (see :meth:`A2AClient._rpc`). ``None`` means nobody decided — a transport
+        #: failure, an unusable endpoint — and :func:`is_task_gone` falls back to
+        #: reading the two raw fields.
+        self.gone = gone
+
+
+def _gone(code: Any, status: int | None) -> bool:
+    """The classification behind :func:`is_task_gone`, on the two raw fields.
+
+    Split out because :meth:`A2AClient._rpc` has to make the same call *before* an
+    ``A2AError`` exists: retrying a missing task under the other dialect's method
+    name would answer "method not found" and throw the verdict away.
+    """
+    if isinstance(code, bool):  # bool is an int subclass; never a real code
+        return False
+    if isinstance(code, int):
+        return code == TASK_NOT_FOUND
+    if isinstance(code, str):
+        return code.strip() in {str(TASK_NOT_FOUND), "TaskNotFoundError", "TASK_NOT_FOUND"}
+    return status == 404
+
+
+def is_task_gone(exc: A2AError) -> bool:
+    """True when the agent has no record of the task, and never will again.
+
+    Two shapes count, for one reason each:
+
+    * ``-32001`` — the protocol's own ``TaskNotFoundError``. This is what an agent
+      answers after it restarted with an empty task table, which is a *normal*
+      deployment event rather than an exotic one.
+    * a bare HTTP 404 — a task-scoped call that never reached a JSON-RPC handler:
+      a router in front of a half-started agent, a stale path. The panel cannot
+      tell that apart from a lost task, and both demand the same decision: stop
+      waiting for a snapshot that cannot come.
+
+    Everything else — a timeout, a refused connection, a 5xx — is *transient* and
+    stays retryable. A network blip is not a reason to declare a turn over that
+    is still running on the agent.
+    """
+    if exc.gone is not None:
+        # The caller that built it knew which action it was making; a bare 404 on
+        # ``get``/``cancel`` means "no such task", the same status on a first ``send``
+        # means "wrong method or path". Re-deriving that here without the action is
+        # how the two used to disagree.
+        return exc.gone
+    # Everything left was built outside ``_rpc`` (a transport failure, an unusable
+    # endpoint) and never saw the action, so only the code can be trusted: a status
+    # alone means "gone" only for a task-scoped call, and that decision belongs where
+    # the action is still known.
+    return _gone(exc.code, None)
 
 
 @dataclass(frozen=True)
@@ -233,10 +298,17 @@ class A2AClient:
         build: Callable[[str], dict[str, Any]],
     ) -> CallResult:
         styles = [primary, "v1" if primary == "v03" else "v03"]
+        task_scoped = action in _TASK_SCOPED
         last_error: A2AError | None = None
         for index, style in enumerate(styles):
             try:
-                return self._rpc(endpoint, METHODS[style][action], build(style), style)
+                return self._rpc(
+                    endpoint,
+                    METHODS[style][action],
+                    build(style),
+                    style,
+                    task_scoped=task_scoped,
+                )
             except A2AError as exc:
                 last_error = exc
                 if not exc.retryable or index == len(styles) - 1:
@@ -245,7 +317,15 @@ class A2AClient:
         assert last_error is not None
         raise last_error
 
-    def _rpc(self, endpoint: str, method: str, params: dict[str, Any], style: str) -> CallResult:
+    def _rpc(
+        self,
+        endpoint: str,
+        method: str,
+        params: dict[str, Any],
+        style: str,
+        *,
+        task_scoped: bool = False,
+    ) -> CallResult:
         request_id = str(uuid.uuid4())
         body = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -261,17 +341,45 @@ class A2AClient:
                 "the agent returned a non-JSON response",
                 status=status,
                 payload=raw[:500].decode("utf-8", "replace"),
+                # An HTML error page is the classic wrong-path answer, so the action
+                # decides: on ``get``/``cancel`` it is indistinguishable from a lost
+                # task; on a first ``send`` it is a deployment mistake to retry.
+                gone=task_scoped and status == 404,
             ) from exc
 
         if not isinstance(envelope, dict):
-            raise A2AError("the agent returned a JSON value that is not an object", status=status)
+            raise A2AError(
+                "the agent returned a JSON value that is not an object",
+                status=status,
+                gone=task_scoped and status == 404,
+            )
 
         error = envelope.get("error")
         if isinstance(error, dict):
             code = error.get("code")
             message = str(error.get("message") or "JSON-RPC error")
-            retryable = (isinstance(code, int) and code in _RETRYABLE_CODES) or (
-                status in _RETRYABLE_STATUSES
+            # A missing task is the same answer in both dialects: retrying it
+            # under the other method name only turns the verdict into "method not
+            # found". The status half of the rule is checked too, because 404 is in
+            # the retryable set for a *dialect* reason (a wrong path on a live
+            # endpoint) and a task-scoped call has no reason to be retried either
+            # way.
+            # A dialect code is the agent saying "I understood you and I do not
+            # have that method", which is news about the *method*, not about the
+            # task id: it has to keep the fallback alive. ``-32001`` still ends the
+            # turn, and a 404 with no code at all is still indistinguishable from a
+            # lost task.
+            # One normalisation for both readings: JSON-RPC codes arrive as numbers
+            # from most servers and as strings from a few, and ``_gone`` above already
+            # accepts both. Reading them differently here is how a string ``-32601``
+            # used to become "the task is gone".
+            code_text = None if code is None else str(code).strip()
+            dialect_error = code_text in _RETRYABLE_CODE_TEXTS
+            missing = _gone(code, None) or (
+                task_scoped and status == 404 and not dialect_error
+            )
+            retryable = not missing and (
+                dialect_error or status in _RETRYABLE_STATUSES
             )
             raise A2AError(
                 f"{message} (code {code})" if code is not None else message,
@@ -279,14 +387,22 @@ class A2AClient:
                 status=status,
                 payload=error.get("data"),
                 retryable=retryable,
+                gone=missing,
             )
 
         if status >= 400:
+            # The same rule as above, at the second place a failure can leave: an
+            # agent that answers 404 with a JSON object and no ``error`` member is
+            # saying the same thing as one that answers ``-32001``, and retrying it
+            # under the other method name would replace the verdict with "method not
+            # found" — which is the hang this whole classification exists to end.
+            missing = task_scoped and status == 404
             raise A2AError(
                 f"the agent returned HTTP {status}",
                 status=status,
                 payload=envelope,
-                retryable=status in _RETRYABLE_STATUSES,
+                retryable=status in _RETRYABLE_STATUSES and not missing,
+                gone=missing,
             )
 
         if "result" not in envelope:

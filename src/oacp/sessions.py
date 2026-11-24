@@ -64,7 +64,25 @@ _STATE: dict[str, str] = {
     "failed": FAILED,
     "rejected": FAILED,
     "error": FAILED,  # a transport failure recorded by the ledger
+    # The ledger stopped tracking a task the agent no longer has (see
+    # ``tasks.INTERRUPTED``). It is a *finished* turn on our side: no future
+    # snapshot can arrive, so the composer must unlock and the poll must stop.
+    "interrupted": FAILED,
     "unknown": IDLE,
+}
+
+#: A settled task whose reason the panel wrote itself becomes this code in the
+#: transcript, and the UI turns it into words in the language it is showing.
+#: Only our own verdicts are translated: what the agent said is quoted as sent.
+#:
+#: Keyed on state, which is exact only because of an invariant on the writing side:
+#: ``canceled`` carries an ``error`` **only** when :meth:`tasks.TaskService._settle`
+#: put it there (a local stop). A refresh or cancel that merely *failed* on a finished
+#: turn records an event and leaves the verdict alone — see ``_record_error`` — so it
+#: can never reach this map with an unrelated reason.
+_NOTE_CODES: dict[str, str] = {
+    "interrupted": "msg.task_gone",
+    "canceled": "msg.cancelled_locally",
 }
 
 #: States in which the agent still owns the turn. Only these take a follow-up
@@ -484,7 +502,17 @@ class SessionService:
             changed = False
             if error:
                 changed = self._append_unique(
-                    connection, session_id, "error", error, task_id, FAILED, []
+                    connection,
+                    session_id,
+                    "error",
+                    error,
+                    task_id,
+                    FAILED,
+                    [],
+                    # ``canceled`` only carries an error when *we* stopped the task
+                    # because the agent had forgotten it; an agent's own cancel
+                    # arrives as a result, with nothing to explain.
+                    code=_NOTE_CODES.get(str(task.get("state") or "")),
                 )
             else:
                 spoken = _spoken(text, status_text, state)
@@ -542,6 +570,7 @@ class SessionService:
         task_id: str | None,
         state: str | None,
         files: list[media.Intake],
+        code: str | None = None,
     ) -> bool:
         """Append unless it repeats this turn's last message of that role.
 
@@ -589,7 +618,7 @@ class SessionService:
             if not files:
                 return False
 
-        message_id = self._insert(connection, session_id, role, text, task_id, state)
+        message_id = self._insert(connection, session_id, role, text, task_id, state, code)
         self._store_media(connection, session_id, message_id, files)
         connection.execute(
             "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
@@ -804,14 +833,20 @@ class SessionService:
         text: str,
         task_id: str | None,
         state: str | None,
+        code: str | None = None,
     ) -> int:
-        """Insert one message and return its row id (attachments hang off it)."""
+        """Insert one message and return its row id (attachments hang off it).
+
+        ``code`` marks a sentence the panel wrote (see ``_NOTE_CODES``): the row
+        then stores both the code and the agent's raw words, and the UI picks the
+        language at render time.
+        """
         cursor = connection.execute(
             """
-            INSERT INTO session_messages (session_id, at, role, text, state, task_id)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO session_messages (session_id, at, role, text, state, task_id, code)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (session_id, iso(), role, text, state, task_id),
+            (session_id, iso(), role, text, state, task_id, code),
         )
         return int(cursor.lastrowid or 0)
 
@@ -881,6 +916,9 @@ class SessionService:
                     "text": message["text"],
                     "at": message["at"],
                     "state": message["state"],
+                    # A reason the panel wrote, as a code: the UI localizes it, so a
+                    # reader never sees the panel's prose in the wrong language.
+                    "code": message["code"],
                     "attachments": by_message.get(int(message["id"]), []),
                 }
                 for message in messages

@@ -568,7 +568,10 @@ def test_a_conversation_payload_speaks_about_messages_only(client, app, fetcher)
     for message in session["messages"]:
         # ``attachments`` is the panel's own word for the pictures a message
         # carries; it is still not protocol vocabulary, which is what this guards.
-        assert set(message) == {"id", "role", "text", "at", "state", "attachments"}
+        # ``code`` is the panel's own word for "this sentence is ours, in the
+        # reader's language" (a lost remote task, a local cancel). It is the
+        # panel's vocabulary, not the protocol's — which is what this guards.
+        assert set(message) == {"id", "role", "text", "at", "state", "attachments", "code"}
 
 
 def test_unknown_ids_are_404(client) -> None:

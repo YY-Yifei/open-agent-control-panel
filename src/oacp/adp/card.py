@@ -19,6 +19,11 @@ from typing import Any, Iterable
 STRICT = "strict"
 RELAXED = "relaxed"
 
+#: The protocol states a task never leaves — and only those. The ledger has finished
+#: verdicts of its own (``oacp.tasks.INTERRUPTED``, ``LOCAL_REPLY_STATE``), but they
+#: must not live here: this set is also what a push callback is matched against, and an
+#: agent reporting one of our own words would then be able to overwrite a verdict.
+#: ``oacp.tasks`` keeps them as terminal on the *current* side of its own guard.
 TERMINAL_STATES = frozenset({"completed", "failed", "canceled", "rejected"})
 ACTIVE_STATES = frozenset({"submitted", "working", "input-required", "auth-required"})
 

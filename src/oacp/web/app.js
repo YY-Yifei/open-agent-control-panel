@@ -196,6 +196,13 @@ const DICT = {
     "agent.failed": "这一轮失败了",
     "agent.empty": "这一轮没有文字输出",
     "agent.confirm.ok": "确认",
+    // 面板**自己**写的两句话：远端把任务弄丢了、本地替它收尾。库里存的是码，
+    // 这里按当前语言读出来 —— 与附件的 skip 原因同一套做法（写入是码，读出是字）。
+    "msg.task_gone": "远端已经查不到这个任务了（对方服务可能重启过，或清理了任务表），本地这一轮到此为止",
+    "msg.cancelled_locally": "远端已无此任务，已本地终止",
+    // 动作放在最前：待定气泡是一行 nowrap + 省略号，窄窗口吃掉的是尾巴。
+    "sync.stalled": "这一轮取不到进度：点「停止」可立刻收尾，自动重试 {n} 秒一次",
+    "sync.auth": "这一轮取不到进度：面板口令不对。点「停止」或刷新页面会重新弹出口令框",
     "error.generic": "出错了",
   },
   en: {
@@ -344,6 +351,14 @@ const DICT = {
     "agent.failed": "The turn failed",
     "agent.empty": "The turn produced no text",
     "agent.confirm.ok": "Confirm",
+    "msg.task_gone":
+      "The agent no longer has this task (its service may have restarted, or its task table was cleared), so this turn ends here",
+    "msg.cancelled_locally": "The agent no longer has this task, so it was stopped locally",
+    // Action first: the pending line is one nowrap line with an ellipsis, so whatever
+    // is at the end is what a narrow window loses.
+    "sync.stalled": "No progress from this turn — press Stop to end it; retrying every {n} s",
+    "sync.auth":
+      "No progress from this turn — the panel token is wrong; press Stop or reload the page to be asked for it",
     "error.generic": "Something went wrong",
   },
 };
@@ -429,7 +444,9 @@ async function api(path, options = {}) {
     const payload = await response.json().catch(() => null);
     if (payload && payload.code === "panel_token_required") {
       openTokenDialog();
-      throw new Error(t("token.required"));
+      const denied = new Error(t("token.required"));
+      denied.code = "panel_token_required";
+      throw denied;
     }
   }
   if (!response.ok) {
@@ -439,6 +456,9 @@ async function api(path, options = {}) {
     // The card validator answers with a problem list under detail.problems; keep
     // the whole payload so the dialog can show it rather than one flat sentence.
     error.payload = payload;
+    // The stable code rides along so a caller can branch on it without matching
+    // prose — the poll needs to tell "wrong token" from "panel is down".
+    error.code = payload && payload.code;
     throw error;
   }
   if (response.status === 204) return null;
@@ -464,9 +484,20 @@ const state = {
   // 还没发出去的图片：{ name, mime, size, data(base64), preview(data URL) }
   pending: [],
   limits: { ...IMAGE_LIMITS },
+  // 「这一拍没拿到进度」——不是这一轮的状态，而是**我们**和面板之间断了。
+  // 值就是**原因**（`"stalled"` 会重试，`"auth"` 不会：口令不对重试一万次也一样），
+  // 待定气泡按它选句子。它只影响那句提示，不影响 session.state。
+  syncStalled: null,
 };
 
 let pollTimer = null;
+/** 轮询节奏。提示语里的秒数由这些常量推出来 —— 改一个数就该改一处。 */
+const POLL_FIRST_MS = 1200;
+const POLL_MS = 1500;
+const POLL_STALLED_MS = 15000;
+// 每一次轮询都有一个「代」。只看会话 id 不够：重新打开同一个会话时 id 没变，
+// 上一轮那个还在 await 的 tick 会带着同一个 id 回来。
+let pollGen = 0;
 
 /* ------------------------------------------------------------------ 渲染 */
 
@@ -702,7 +733,8 @@ function renderChat() {
     // 只有 agent 的回答走 Markdown。用户自己的输入与错误提示留在纯文本 ——
     // 否则人打一句「# 标题」会莫名其妙变成大标题，而错误文案本来就是服务端
     // 拼好的整句。
-    const html = role === "agent" ? renderMarkdown(message.text) : esc(message.text);
+    const body = messageText(message);
+    const html = role === "agent" ? renderMarkdown(body) : esc(body);
     const cls = role === "agent" ? "bubble md" : "bubble";
     // 图与文分开渲染：文字要保留换行与转义，图要有自己的尺寸规则。src 先留空，
     // 由 hydrateAttachments 用带口令的请求填上 —— <img src> 带不了请求头。
@@ -717,7 +749,8 @@ function renderChat() {
   if (session && session.state === "working") {
     // `progress.text` 是 agent 这一拍正在做什么；没有就退回「正在处理…」。
     // 它是状态而不是回答 —— 所以留在这一个气泡里替换，绝不进上面的消息列表。
-    rows.push(pendingNode(session.progress, t("pending")));
+    const line = pendingLine(session);
+    rows.push(pendingNode(line.progress, line.fallback));
   }
   const nearBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 120;
   chat.innerHTML = rows.join("");
@@ -738,12 +771,31 @@ function renderChat() {
 function renderPending() {
   const chat = $("#chat");
   if (!chat || !state.session) return;
-  const line = chat.querySelector(".msg.pending > .pending");
+  const node = chat.querySelector(".msg.pending > .pending");
   // 没有可更新的气泡：整段重画也建不出它 —— 没有消息时 renderChat 会提前返回
   // 去显示空状态。真正「刚进入 working」的那一拍走的是 advanced 分支，那时已经
   // 整段重画过了，所以这里安静地不动就是对的。
-  if (!line) return;
-  fillPending(line, state.session.progress, t("pending"));
+  if (!node) return;
+  const line = pendingLine(state.session);
+  fillPending(node, line.progress, line.fallback);
+}
+
+/**
+ * 待定气泡此刻该说哪句话。
+ *
+ * 三档：一句进度、`正在处理…`、以及**拿不到进度**时的那一句。第三档不是装饰 ——
+ * 提示 toast 只活 5 秒，而「对方正在处理」会一直挂在那儿：一条永远不动、又说不出
+ * 为什么的进度，正是这个 bug 的样子，只不过这次原因换成了我们自己的网络。
+ */
+function pendingLine(session) {
+  if (state.syncStalled) return { progress: null, fallback: stalledText() };
+  return { progress: session.progress, fallback: t("pending") };
+}
+
+/** 「取不到进度」那一句：原因选句子，秒数只有一处来源，句子只拼一次。 */
+function stalledText() {
+  if (state.syncStalled === "auth") return t("sync.auth");
+  return t("sync.stalled", { n: POLL_STALLED_MS / 1000 });
 }
 
 // 一条附件要么是张图（src 由 hydrateAttachments 后填），要么是一枚说明为什么
@@ -773,6 +825,23 @@ function attachmentNode(file) {
     <span class="attachment-file-name">${esc(file.name)}</span>
     <span class="attachment-file-meta">${esc(meta)}</span>
   </button>`;
+}
+
+/**
+ * 一条消息的正文。
+ *
+ * `code` 存在时，这句话是**面板**写的（远端丢了任务、本地终止）——句子在读取时
+ * 按当前语言翻出来，`text` 只留 agent 自己的原话。没有 `code` 就是 agent 的话，
+ * 一个字都不动。
+ */
+function messageText(message) {
+  if (!message.code) return message.text || "";
+  const said = t(message.code);
+  const detail = (message.text || "").trim();
+  // `t()` 对不认识的键原样返回键名。把 `msg.task_gone` 印进对话等于把人当内部人 ——
+  // 认不出这个码就退回技术细节，那至少还是 agent 说的话。
+  if (said === message.code) return detail;
+  return detail ? `${said}\n\n${detail}` : said;
 }
 
 function renderComposer() {
@@ -1813,6 +1882,15 @@ async function stopTurn() {
 /* ------------------------------------------------------------------ 轮询 */
 
 function stopPolling() {
+  // 换代：所有还在飞的 tick 下一句就会认出自己已经过期。
+  pollGen += 1;
+  // 停下来就不再说「拿不到进度」：那是轮询状态，不是会话状态。改了就重画一次 ——
+  // 有的调用方（口令失配那一支）停下来之后不会再有别的渲染，气泡里那句
+  // 「正在 15 秒重试」就会留在屏幕上，替一件已经不做的事继续撒谎。
+  if (state.syncStalled) {
+    state.syncStalled = null;
+    renderPending();
+  }
   if (pollTimer) {
     clearTimeout(pollTimer);
     pollTimer = null;
@@ -1823,19 +1901,31 @@ function startPolling() {
   stopPolling();
   const id = state.session && state.session.id;
   if (!id) return;
+  const gen = pollGen;
+  // 「这一拍已经过期」只有一处判据：换代了，或者人已经离开这个会话。
+  const stale = () => gen !== pollGen || !state.session || state.session.id !== id;
   let misses = 0;
+  let warned = false;
 
   const tick = async () => {
     pollTimer = null;
-    if (!state.session || state.session.id !== id) return;
+    if (stale()) return;
     if (state.session.state !== "working") return;
 
     try {
       const data = await api(`${API}/sessions/${encodeURIComponent(id)}/sync`, {
         method: "POST",
       });
+      // 判据放在改状态**之前**：这一拍可能属于上一代轮询，它没有资格清掉
+      // 新那一代的「取不到进度」（新那一代的 warned 已经是 true，不会再播报）。
+      if (stale()) return;
       misses = 0;
-      if (!state.session || state.session.id !== id) return;
+      if (warned) {
+        warned = false;
+        state.syncStalled = null;
+        // 缓过来了就把气泡换回真正的进度：进度没变时下面的分支不会重画。
+        renderPending();
+      }
       const previous = state.session;
       const advanced =
         data.session.messages.length !== previous.messages.length ||
@@ -1853,18 +1943,52 @@ function startPolling() {
         renderPending();
       }
     } catch (error) {
-      if (++misses >= 3) return; // 连续失败就停下，用户可以手动刷新页面
+      // 这一拍可能属于一个**已经离开**（或已经重开）的会话：它的失败不该记到新
+      // 一轮头上，更不能用 stopPolling() 清掉新一轮刚排上的定时器 —— 那会静默
+      // 掐掉新会话的自动刷新，正是这一处要消灭的那种「悄悄停住」。
+      if (stale()) return;
+      // 口令不对重试一万次也不会对，而且每次重试都会把「要口令」那个框重新弹一遍
+      // （关掉之后 15 秒又弹）。这一代轮询就到这里，改口令是人的事。
+      //
+      // 不走 stopPolling()：它会把「取不到进度」擦掉，好让人以为这一轮还在被
+      // 观察着 —— 而此刻恰恰没有人在观察。换代停住，原因留在气泡上。
+      if (error.code === "panel_token_required") {
+        // 这一支**不会**重试，所以句子也必须换一句：说「15 秒重试一次」是撒谎。
+        pollGen += 1;
+        state.syncStalled = "auth";
+        renderPending();
+        return;
+      }
+      // 连不上就慢下来，并且**说一声**。静默返回会让输入框永远灰着、提示语一直
+      // 是「对方正在处理，请稍候…」，而此刻根本没有人在处理。
+      //
+      // 但不解锁：这一轮是死是活此刻**不知道**，贸然放开输入框会把新消息打进一个
+      // 可能还在跑的回合里（一个问题两个答案）。能做的是不再假装一切正常 ——
+      // 退到 15 秒一次的慢速重试，让面板自己缓过来；「停止」也一直可点，而它在
+      // 服务端有本地降级（远端不认这个任务时本地也能收尾），所以出路一直在。
+      if (++misses >= 3) {
+        if (!warned) {
+          warned = true;
+          // 一次 toast 只是一闪；待定气泡改成这句话才是让人**看得见**的降级。
+          state.syncStalled = "stalled";
+          toast(stalledText(), "warn");
+          renderPending();
+        }
+        pollTimer = setTimeout(tick, POLL_STALLED_MS);
+        return;
+      }
     }
 
+    if (stale()) return;
     if (state.session && state.session.state === "working") {
-      pollTimer = setTimeout(tick, 1500);
+      pollTimer = setTimeout(tick, POLL_MS);
     } else {
       renderAll();
       await refreshSessions();
     }
   };
 
-  pollTimer = setTimeout(tick, 1200);
+  pollTimer = setTimeout(tick, POLL_FIRST_MS);
 }
 
 /* ------------------------------------------------------------------ 动作 */

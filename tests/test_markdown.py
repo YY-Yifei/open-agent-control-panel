@@ -212,10 +212,14 @@ def test_only_agent_replies_and_markdown_files_are_rendered() -> None:
     """
     app = (WEB / "app.js").read_text(encoding="utf-8")
     assert 'import { renderMarkdown } from "./md.js";' in app
-    assert 'role === "agent" ? renderMarkdown(message.text) : esc(message.text)' in app
+    # 正文先过 `messageText()`：agent 的原话原样透传，面板自己写的「码」（远端丢了
+    # 任务、本地终止）在那里按当前语言变成句子。渲染分支的判据没有变 —— 仍然只有
+    # agent 的回复走 Markdown，错误文案与用户输入都留在纯文本。
+    assert 'role === "agent" ? renderMarkdown(body) : esc(body)' in app
+    assert "const body = messageText(message);" in app
     assert app.count("renderMarkdown(") == 2
     # 第一处：只有 agent 的角色分支；第二处：只有判定为 Markdown 文档时。
-    assert app.count("renderMarkdown(message.text)") == 1
+    assert app.count("renderMarkdown(body)") == 1
     # 判据算一次、两个决定（是否渲染 / 用哪种视图）都从它出发，不许各算一遍。
     assert "const view = previewView(file);" in app
     assert 'view === "rendered" ? renderMarkdown(part.text) : ""' in app

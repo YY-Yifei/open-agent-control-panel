@@ -15,7 +15,7 @@ from typing import Any
 
 from .adp import card as cardmod
 from .adp.service import RegistryService
-from .a2a.client import A2AClient, A2AError
+from .a2a.client import A2AClient, A2AError, is_task_gone
 from .config import Settings
 from .db import Database
 from .errors import PanelError
@@ -23,6 +23,12 @@ from .util import iso, json_dumps, json_loads, new_id, new_token, title_from, tr
 
 LOCAL_ERROR_STATE = "error"
 LOCAL_REPLY_STATE = "replied"
+#: The ledger's own verdict for a task the agent no longer has (see
+#: :meth:`TaskService._settle`). Terminal, and deliberately *not* ``error``:
+#: nothing failed on either side — the remote simply lost its copy (a restart
+#: clears an in-memory task table) — and an operator reading the ledger should be
+#: able to tell "this turn broke" apart from "this turn's remote half is gone".
+INTERRUPTED = "interrupted"
 PAGE_LIMIT = 50
 
 #: A status line is a sentence, not an essay. Clipping here keeps the
@@ -34,6 +40,12 @@ MAX_PROGRESS = 200
 #: other state ends the turn, and a finished task must not keep a "generating…"
 #: line next to it.
 PROGRESS_STATES = frozenset({"submitted", "working"})
+
+#: Finished verdicts the panel invented (the agent has no such word): terminal for
+#: the ledger, but *not* for :data:`oacp.adp.card.TERMINAL_STATES`, because a callback
+#: is not allowed to produce one. Kept together so ``_settle``/``_record_error`` and the
+#: push guard read the same set.
+_OUR_ENDINGS = frozenset({INTERRUPTED, LOCAL_REPLY_STATE})
 
 #: Where each non-terminal state sits on the one-way ladder a task climbs. Used
 #: only by the push guard: a callback that arrives late must not drag the ledger
@@ -219,6 +231,13 @@ class TaskService:
                 metadata=metadata,
             )
         except A2AError as exc:
+            if is_task_gone(exc):
+                # The message never landed: the task id it was addressed to is not
+                # in the agent's table any more. Same verdict as a lost snapshot —
+                # the turn is over, and it is over for a reason we can print.
+                return self._settle(
+                    task_id, INTERRUPTED, exc, kind="interrupted", carried_message=True
+                )
             return self._record_error(task_id, exc, increment_messages=True)
 
         return self._apply_result(task_id, call, kind="message", increment_messages=True)
@@ -235,6 +254,11 @@ class TaskService:
         try:
             call = self.client.get_task(agent["card"], task["remote_task_id"], history_length=50)
         except A2AError as exc:
+            if is_task_gone(exc):
+                # The one failure that must not keep the old state: "working" here
+                # is what the UI reads to disable the composer and to keep polling,
+                # and there is no snapshot left to wait for.
+                return self._settle(task_id, INTERRUPTED, exc, kind="interrupted")
             return self._record_error(task_id, exc, state=task["state"])
 
         return self._apply_result(task_id, call, kind="refresh")
@@ -251,6 +275,13 @@ class TaskService:
         try:
             call = self.client.cancel_task(agent["card"], task["remote_task_id"])
         except A2AError as exc:
+            if is_task_gone(exc):
+                # Cancel is the operator's exit, so it cannot depend on the remote
+                # agreeing. A task the agent has already forgotten cannot be
+                # cancelled there, and refusing here would leave the UI with no way
+                # out at all — the report that produced this branch had exactly one
+                # escape left: reload the page.
+                return self._settle(task_id, "canceled", exc, kind="cancel-local")
             return self._record_error(task_id, exc, state=task["state"])
 
         return self._apply_result(task_id, call, kind="cancel")
@@ -638,6 +669,75 @@ class TaskService:
             )
         return self.get(task_id)
 
+    def _settle(
+        self,
+        task_id: str,
+        state: str,
+        exc: A2AError,
+        *,
+        kind: str,
+        carried_message: bool = False,
+    ) -> dict[str, Any]:
+        """End a task locally because the agent says it is not there any more.
+
+        The old advice for this case was to record the failure and keep the state
+        we had, so a transient blip could not throw away a running turn. That is
+        right for a timeout and wrong for ``-32001``: keeping ``working`` freezes
+        the progress line at its last sentence, keeps the composer disabled and
+        keeps the poll running against an id nobody holds. There is no future
+        snapshot to wait for, so the honest entry is a *finished* one — with the
+        agent's own words kept as the reason.
+        """
+        now = iso()
+        row = self._row(task_id)
+        # ``replied`` is the ledger's own "the agent answered with a bare
+        # Message": ``cardmod.is_terminal`` knows only protocol states, and a turn
+        # that already produced an answer must not be rewritten either.
+        ended = cardmod.is_terminal(row["state"]) or row["state"] in _OUR_ENDINGS
+        if ended and not carried_message:
+            # A turn that already ended keeps its verdict. The agent forgetting the
+            # task *afterwards* cannot make "completed" untrue, and rewriting it as
+            # ``interrupted`` would both erase the fact that the answer arrived and
+            # print "this task is gone" under a complete answer in the conversation.
+            # Refreshing such a task still leaves a line: the id is dead at the
+            # agent, which is worth knowing and changes nothing else.
+            with self.db.connect() as connection:
+                self._event(
+                    connection,
+                    task_id,
+                    now,
+                    "gone-after-end",
+                    {"kept": row["state"], "error": exc.message, "code": exc.code},
+                )
+            return self.get(task_id)
+        if ended:
+            # A follow-up *carried a message* into a task that had already finished:
+            # the send failed, and that has to be reported. It does not rewrite the
+            # verdict either — the finished turn stays finished.
+            state = row["state"]
+        message_count = int(row["message_count"]) + (1 if carried_message else 0)
+        reason = exc.message
+        with self.db.connect() as connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                   SET state = ?, error = ?, updated_at = ?, message_count = ?
+                 WHERE id = ?
+                """,
+                (state, reason, now, message_count, task_id),
+            )
+            # ``state`` is terminal here, so this drops the progress line: a turn
+            # that will never report again must not keep saying what it was doing.
+            self._record_progress(connection, task_id, state, "", now)
+            self._event(
+                connection,
+                task_id,
+                now,
+                kind,
+                {"state": state, "error": reason, "code": exc.code, "status": exc.status},
+            )
+        return self.get(task_id)
+
     def _record_error(
         self,
         task_id: str,
@@ -649,6 +749,25 @@ class TaskService:
         now = iso()
         message = exc.message
         row = self._row(task_id)
+        if not increment_messages and (
+            cardmod.is_terminal(row["state"]) or row["state"] in _OUR_ENDINGS
+        ):
+            # A finished turn keeps its verdict *and* its empty error field. Writing a
+            # transport failure onto a task that already ended buys nothing — there is
+            # no state to correct — and it costs something: the conversation turns
+            # ``error`` + a settled state into a note, so a 500 during a refresh of a
+            # canceled task would print "it was stopped locally" under the wrong
+            # reason. A carried message is the one case that must be reported, because
+            # then something really did fail to arrive.
+            with self.db.connect() as connection:
+                self._event(
+                    connection,
+                    task_id,
+                    now,
+                    "failed-after-end",
+                    {"kept": row["state"], "error": message},
+                )
+            return self.get(task_id)
         message_count = int(row["message_count"]) + (1 if increment_messages else 0)
         with self.db.connect() as connection:
             connection.execute(
@@ -786,9 +905,14 @@ def _outranks(incoming: str, current: str) -> bool:
     nothing a non-terminal update could legitimately tell us, and out-of-order
     deliveries are the normal case for webhooks.
     """
+    if incoming in _OUR_ENDINGS:
+        # The agent picked up a word only the ledger produces. It is not news about the
+        # task, and accepting it would let a callback rewrite a ``completed`` verdict —
+        # the rewrite every other route refuses.
+        return False
     if cardmod.is_terminal(incoming):
         return True
-    if cardmod.is_terminal(current):
+    if cardmod.is_terminal(current) or current in _OUR_ENDINGS:
         return False
     return _PROGRESS.get(incoming, 1) >= _PROGRESS.get(current, 1)
 

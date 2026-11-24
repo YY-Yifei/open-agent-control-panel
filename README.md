@@ -429,6 +429,55 @@ turns a demo into a deployment; the startup banner prints the callback base and 
 it is a loopback address on a non-loopback bind. `--no-push` (`OACP_PUSH_ENABLED=0`) turns the
 flow off, and `tasks/get` remains the only way a task is updated.
 
+### When push is not working at all
+
+Push is best-effort by design, and the panel never depends on it. The **contract** is
+`tasks/get`: a conversation that is `working` polls `POST /api/panel/sessions/{id}/sync`
+while it is on screen, and that call — not the callback — is what decides anything. Push
+saves the round trip; it is not what makes a turn finish.
+
+`pushState` on the task says which of five situations you are in, and it is the first thing to
+read when `pushCount` stays at 0:
+
+| `pushState` | what it means | what to look at |
+|---|---|---|
+| `unsupported` | the card does not advertise `capabilities.pushNotifications` | the agent's card, not the panel |
+| `offered` | a URL was minted, the `set` call has not answered yet | a turn stuck here is a hung RPC |
+| `inline` | the `set` call failed; the reason is in the task's `push-register` event | the agent's push endpoint |
+| `registered` | the agent accepted the URL and has not called it | the agent's outbound reach to the callback base |
+| `settled` | the turn finished inside the `SendMessage` call; nothing was left to follow | nothing |
+
+A `registered` task whose `pushCount` stays 0 while the turn keeps making progress is the one
+case the panel cannot fix: the address was handed over and the agent chose not to use it.
+Polling covers it, which is why the UI looks the same either way — it just costs one request
+every 1.5 s instead of a callback.
+
+### When the agent has forgotten the task
+
+A2A keeps the authoritative task on the agent, and plenty of agents keep that table in
+memory: restart the process and every id it handed out answers `-32001`
+(`TaskNotFoundError`). The panel treats that answer as **terminal** rather than as a transient
+failure — there is no snapshot left to wait for — so the turn ends locally, the composer
+unlocks, and the reason is printed in the conversation:
+
+* a `GetTask` that comes back `-32001` marks the task `interrupted` (session sync and
+  `POST /api/panel/tasks/{id}/refresh` both do this), keeps the agent's own words in
+  `tasks.error`, and drops the progress line that could never move again;
+* `CancelTask` returning `-32001` settles the task as `canceled` **locally** and says so —
+  stop is the operator's exit and must never depend on the remote agreeing;
+* a follow-up addressed to a forgotten task ends the turn the same way instead of silently
+  starting a second one, so one question never gets two answers.
+
+Everything else stays transient: a timeout, a refused connection, a 5xx. A blip must not end a
+turn that is still running on the agent, so those keep the state they had.
+
+`interrupted` is a state the panel adds to the protocol's set (beside `error` and `replied`),
+and it is terminal for the same reason `completed` is: a late `working` callback must not be
+able to drag a finished turn back and re-hang the UI. The panel's own sentences — "the agent
+no longer has this task", "stopped locally" — are stored as **codes** on the message and
+turned into words when they are read, so the transcript follows the language switch while the
+agent's words are quoted exactly as sent.
+
 ## Configuration
 
 Every setting has an environment variable (`OACP_*`) and most have a flag. Precedence is

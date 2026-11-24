@@ -19,7 +19,7 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class MigrationError(RuntimeError):
@@ -122,7 +122,8 @@ CREATE TABLE IF NOT EXISTS session_messages (
     role        TEXT NOT NULL,
     text        TEXT NOT NULL,
     state       TEXT,
-    task_id     TEXT
+    task_id     TEXT,
+    code        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS session_messages_session ON session_messages (session_id, id);
@@ -224,6 +225,16 @@ def _widen(connection: sqlite3.Connection) -> None:
     for name, declaration in (("skipped", "TEXT"), ("source", "TEXT")):
         if existing and name not in existing:
             connection.execute(f"ALTER TABLE session_attachments ADD COLUMN {name} {declaration}")
+
+    # Schema 10 added ``code``: a sentence the *panel* wrote — "the agent no longer
+    # has this task", "stopped locally" — is stored as a code and turned into words
+    # when it is read, exactly like ``session_attachments.skipped``. Storing prose
+    # would pin the transcript to whatever language the panel happened to run in,
+    # and the UI has a language switch. ``text`` keeps the agent's own words beside
+    # it, because those nobody should translate.
+    existing = {row["name"] for row in connection.execute("PRAGMA table_info(session_messages)")}
+    if existing and "code" not in existing:
+        connection.execute("ALTER TABLE session_messages ADD COLUMN code TEXT")
 
 
 def _rekey_agents(connection: sqlite3.Connection, previous: int) -> None:
