@@ -14,10 +14,16 @@ registry resolves that by treating a re-registration under a new url as the same
 entry moving.
 
 These tests pin what that buys and what it costs: the port change that no longer
-creates an agent, the rename that deliberately does *not* move the id (§4.1 calls an
-id a handle, stable within an entry — not a function of the current content), the
-round trip a repeat registration now costs, and the migration's refusal to merge rows
-that happen to derive the same id (§10).
+creates an agent, the round trip a repeat registration now costs, and the migration's
+refusal to merge rows that happen to derive the same id (§10).
+
+They also pin the rule that took a release to get right. An id is a handle, stable
+within an entry — but *which* entry is decided by the card, not by the address. A
+different name at an address is a different agent, so the entry that used to be
+there **retires**: it keeps its id, its ``first_seen_at``, its manage token and its
+conversations, and gives up only the address. The previous release kept the entry
+and swapped the card instead, which is how a brand-new agent inherited somebody
+else's history while the panel showed only its new name.
 """
 
 from __future__ import annotations
@@ -154,29 +160,40 @@ def test_a_restart_on_another_port_is_the_same_agent(client, fetcher) -> None:
     assert len(client.get("/v1/agents").json()["items"]) == 1
 
 
-def test_a_rename_at_a_stable_address_keeps_the_id(client, fetcher) -> None:
-    """An id is a handle, stable within an entry (§4.1) — not a function of the card.
+def test_a_new_name_at_a_stable_address_is_a_new_agent(client, fetcher) -> None:
+    """Identity is the card, so a rename at one address is a *different* agent.
 
-    The address belongs to this entry, so the agent did not move; only its name did.
-    Re-keying would re-point every conversation for a cosmetic edit, which is the
-    fragility this whole change removes. The price is asserted too: the id still
-    spells the old name's digest.
+    This is the rule the previous release had backwards: it kept the entry and
+    swapped the card, so a brand-new agent inherited the conversations of the one it
+    replaced and the panel showed only the new name. The old entry now retires — same
+    row, same id, same token, history intact — and stops claiming the url.
     """
     first = register(client, fetcher).json()
     _conversation(client, first["id"])
     fetcher.cards[CARD_URL] = make_card(name="Renamed Agent")
 
     again = client.post("/v1/agents", json={"url": CARD_URL})
-    assert again.status_code == 200
+    assert again.status_code == 201, again.text
     body = again.json()
-    assert body["id"] == first["id"]
+    assert body["id"] == net.derive_id("agent.example.com", CARD_PATH, "Renamed Agent")
+    assert body["id"] != first["id"], "a different name is a different agent"
     assert body["card"]["name"] == "Renamed Agent"
     assert body["url"] == net.normalize_url(CARD_URL)
-    assert body["changedAt"] is not None and body["prevHash"] == first["cardHash"]
+    assert "manageToken" in body, "a new entry gets its own token"
+    # A fresh entry, not the old one seen again: its first sighting is now, and it
+    # has no card history because nothing changed on it yet.
+    assert body["firstSeenAt"] == body["checkedAt"]
+    assert body["changedAt"] is None and body["prevHash"] is None
+    # The conversation did not follow the address; it stayed with the agent.
     assert _owners(client) == [first["id"]]
-    assert body["id"] == net.derive_id("agent.example.com", CARD_PATH, "Geo Agent"), (
-        "the id is the handle it was born with, not the current name's digest"
-    )
+    # The registry publishes one agent here — the one serving the address.
+    assert [item["id"] for item in client.get("/v1/agents").json()["items"]] == [body["id"]]
+    # The panel still shows the retired row, so "where did my history go" is answerable.
+    panel = client.get("/api/panel/agents").json()["items"]
+    assert {item["id"]: item["status"] for item in panel} == {
+        first["id"]: "retired",
+        body["id"]: "ok",
+    }
 
 
 def test_a_repeat_registration_is_still_idempotent(client, fetcher) -> None:
@@ -191,17 +208,34 @@ def test_a_repeat_registration_is_still_idempotent(client, fetcher) -> None:
     assert fetcher.calls.count(CARD_URL) == 2
 
 
-def test_a_rename_at_the_same_url_is_followed_by_probing(client, fetcher) -> None:
+def test_a_probe_that_finds_another_name_retires_instead_of_re_badging(
+    client, fetcher
+) -> None:
+    """The probe loop must not undo the rule a registration enforces.
+
+    Probing used to read the new card into the old row. That is the same bug as the
+    old adoption, discovered by the timer instead of a POST: the name in the panel
+    changes, the id — and every conversation hanging off it — stays. So the entry
+    steps back, and the agent actually serving the address gets its own entry when it
+    registers itself.
+    """
     first = register(client, fetcher).json()
+    _conversation(client, first["id"])
     fetcher.cards[CARD_URL] = make_card(name="Renamed Agent")
 
     refreshed = client.post(f"/api/panel/agents/{first['id']}/refresh")
-    assert refreshed.status_code == 200
-    record = refreshed.json()["agent"]
-    assert record["id"] == first["id"]           # the entry did not move
-    assert record["card"]["name"] == "Renamed Agent"  # the card did
-    assert record["changedAt"] == record["lastOkAt"]
-    assert record["prevHash"] == first["cardHash"]
+    assert refreshed.status_code == 409, refreshed.text
+    assert refreshed.json()["code"] == "agent_retired"
+
+    record = client.get(f"/api/panel/agents/{first['id']}").json()["agent"]
+    assert record["status"] == "retired"
+    assert record["card"]["name"] == "Geo Agent", "the stored card was not overwritten"
+    assert client.get("/v1/agents").json()["items"] == [], "nobody serves this address"
+
+    again = client.post("/v1/agents", json={"url": CARD_URL})
+    assert again.status_code == 201, again.text
+    assert again.json()["id"] != first["id"]
+    assert _owners(client) == [first["id"]], "the history stayed with the retired agent"
 
 
 # ---------------------------------------------------------------- summaries
@@ -250,17 +284,17 @@ def test_a_pure_port_change_does_not_report_a_card_change(client, fetcher) -> No
     assert moved["prevHash"] is None
 
 
-def test_a_repeat_after_a_rename_moves_no_timestamp(client, fetcher) -> None:
-    """A renamed entry derives a new id forever, so every repeat re-enters that path."""
-    first = register(client, fetcher).json()
+def test_a_repeat_after_a_replacement_moves_no_timestamp(client, fetcher) -> None:
+    """The new entry is idempotent from its first repeat on, like any other."""
+    register(client, fetcher)
     fetcher.cards[CARD_URL] = make_card(name="Renamed Agent")
 
-    renamed = client.post("/v1/agents", json={"url": CARD_URL}).json()
+    replaced = client.post("/v1/agents", json={"url": CARD_URL}).json()
     again = client.post("/v1/agents", json={"url": CARD_URL}).json()
 
-    assert again["id"] == first["id"]
-    assert again["changedAt"] == renamed["changedAt"], "a repeat must not invent a change"
-    assert again["checkedAt"] == renamed["checkedAt"], "a repeat must not move any timestamp"
+    assert again["id"] == replaced["id"]
+    assert again["changedAt"] == replaced["changedAt"], "a repeat must not invent a change"
+    assert again["checkedAt"] == replaced["checkedAt"], "a repeat must not move any timestamp"
 
 
 def test_a_card_renamed_onto_a_neighbours_name_is_refused_not_a_crash(client, fetcher) -> None:
@@ -304,30 +338,33 @@ def test_an_entry_still_serving_at_its_old_url_cannot_be_moved(client, fetcher) 
     assert len(client.get("/v1/agents").json()["items"]) == 1
 
 
-def test_a_renamed_agent_that_changes_address_stays_one_entry(client, fetcher) -> None:
-    """The id stops being derivable after a rename, so the stored name has to find it.
+def test_a_replacement_then_a_port_change_keeps_the_new_agent(
+    client, fetcher
+) -> None:
+    """A -> B at U1, then B restarts on U2: B moves, A stays retired.
 
-    Register at U1 as "Geo Agent" -> rename to "Renamed Agent" at U1 -> restart on U2
-    still called "Renamed Agent". Without the by-name lookup the agent splits in two,
-    with the history stranded on the dead half.
+    The by-name lookup that used to stitch a renamed entry back together is gone on
+    purpose — it existed only to repair the split that adoption created. Under the
+    new rule there is nothing to repair: B is one identity with one entry, and A is a
+    retired row with its own history.
     """
     first = register(client, fetcher).json()
-    _conversation(client, first["id"])
+    _conversation(client, first["id"], session="s_a")
 
     fetcher.cards[CARD_URL] = make_card(name="Renamed Agent")
-    renamed = client.post("/v1/agents", json={"url": CARD_URL}).json()
-    assert renamed["id"] == first["id"]
+    second = client.post("/v1/agents", json={"url": CARD_URL}).json()
+    assert second["id"] != first["id"]
+    _conversation(client, second["id"], session="s_b")
 
     fetcher.cards[OTHER_PORT] = make_card(name="Renamed Agent")
     del fetcher.cards[CARD_URL]
     moved = client.post("/v1/agents", json={"url": OTHER_PORT})
 
     assert moved.status_code == 200, moved.text
-    body = moved.json()
-    assert body["id"] == first["id"]
-    assert body["url"] == net.normalize_url(OTHER_PORT)
-    assert len(client.get("/v1/agents").json()["items"]) == 1, "one agent, one entry"
-    assert _owners(client) == [first["id"]]
+    assert moved.json()["id"] == second["id"], "the port change belongs to B"
+    assert moved.json()["url"] == net.normalize_url(OTHER_PORT)
+    assert sorted(_owners(client)) == sorted([first["id"], second["id"]])
+    assert [item["id"] for item in client.get("/v1/agents").json()["items"]] == [second["id"]]
 
 
 def test_two_agents_on_one_host_at_different_paths_stay_two_entries(client, fetcher) -> None:
@@ -459,6 +496,102 @@ def test_two_hosts_serving_one_card_stay_two_entries(tmp_path) -> None:
         assert set(survivors) <= expected
 
 
+def test_opening_a_schema_10_database_keeps_every_row_and_allows_retired(
+    tmp_path,
+) -> None:
+    """Schema 11 changes constraints, not identity.
+
+    The rebuild is the only place a row could be lost, so it is asserted on the
+    fields that make a row an agent: id, url, card, hash, status, timestamps and the
+    manage token all survive byte for byte, and the two new rules hold afterwards —
+    ``retired`` is a legal status, and a url may be shared by retired rows while
+    still being unique among live ones.
+    """
+    path = tmp_path / "v10.db"
+    connection = sqlite3.connect(str(path))
+    connection.executescript(
+        """
+        CREATE TABLE agents (
+            id              TEXT PRIMARY KEY,
+            url             TEXT NOT NULL UNIQUE,
+            host            TEXT NOT NULL,
+            card            TEXT NOT NULL,
+            card_hash       TEXT NOT NULL,
+            status          TEXT NOT NULL CHECK (status IN ('ok', 'down')),
+            first_seen_at   TEXT NOT NULL,
+            checked_at      TEXT NOT NULL,
+            last_ok_at      TEXT NOT NULL,
+            failures        INTEGER NOT NULL DEFAULT 0,
+            changed_at      TEXT,
+            prev_hash       TEXT,
+            manage_token    TEXT NOT NULL
+        );
+        """
+    )
+    rows = [
+        ("a_0000000000000001", CARD_URL, "ok", "2026-01-01T00:00:00Z", "token-1"),
+        ("a_0000000000000002", ELSEWHERE, "down", "2026-01-02T00:00:00Z", "token-2"),
+    ]
+    for agent_id, url, status, stamp, token in rows:
+        connection.execute(
+            "INSERT INTO agents (id, url, host, card, card_hash, status, first_seen_at,"
+            " checked_at, last_ok_at, failures, manage_token)"
+            " VALUES (?, ?, ?, ?, 'sha256:x', ?, ?, ?, ?, 2, ?)",
+            (
+                agent_id,
+                url,
+                net.host_of(net.normalize_url(url)),
+                json.dumps(make_card()),
+                status,
+                stamp,
+                stamp,
+                stamp,
+                token,
+            ),
+        )
+    connection.execute("PRAGMA user_version = 10")
+    connection.commit()
+    connection.close()
+
+    Database(str(path)).init()
+
+    with sqlite3.connect(str(path)) as connection:
+        connection.row_factory = sqlite3.Row
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        kept = {
+            row["id"]: (row["url"], row["status"], row["first_seen_at"], row["manage_token"])
+            for row in connection.execute("SELECT * FROM agents")
+        }
+        assert kept == {
+            agent_id: (url, status, stamp, token)
+            for agent_id, url, status, stamp, token in rows
+        }, "the rebuild must not move a single field"
+
+        # ``retired`` is a legal status now…
+        connection.execute(
+            "UPDATE agents SET status = 'retired' WHERE id = 'a_0000000000000001'"
+        )
+        # …and a retired row may share its url with the live one that took it over.
+        connection.execute(
+            "INSERT INTO agents (id, url, host, card, card_hash, status, first_seen_at,"
+            " checked_at, last_ok_at, failures, manage_token)"
+            " VALUES ('a_0000000000000003', ?, 'agent.example.com', '{}', 'sha256:y',"
+            " 'ok', '2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z',"
+            " '2026-01-03T00:00:00Z', 0, 'token-3')",
+            (CARD_URL,),
+        )
+        # …while two *live* rows still may not.
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO agents (id, url, host, card, card_hash, status, first_seen_at,"
+                " checked_at, last_ok_at, failures, manage_token)"
+                " VALUES ('a_0000000000000004', ?, 'agent.example.com', '{}', 'sha256:z',"
+                " 'ok', '2026-01-04T00:00:00Z', '2026-01-04T00:00:00Z',"
+                " '2026-01-04T00:00:00Z', 0, 'token-4')",
+                (CARD_URL,),
+            )
+
+
 def test_a_derived_id_collision_aborts_instead_of_merging(tmp_path, monkeypatch) -> None:
     """ADP §10: the merge judgement is the row, never the id — so stop on a collision.
 
@@ -487,28 +620,122 @@ def test_a_derived_id_collision_aborts_instead_of_merging(tmp_path, monkeypatch)
         assert urls == {CARD_URL, ELSEWHERE}, "a collision must not merge or drop an entry"
 
 
-def test_a_rename_back_to_the_old_name_follows_the_card(client, fetcher) -> None:
-    """A -> B -> A must end holding the "A" card, not the stale "B" one.
+def test_an_agent_that_comes_back_takes_its_address_and_its_history_back(
+    client, fetcher
+) -> None:
+    """A -> B -> A: the first agent returns, so the second one retires.
 
-    The id is the digest of the name the entry was *born* with, so renaming back
-    derives that same id again while the address never moved: id and url both match,
-    and reading that as "nothing changed" would answer 200 with the card stored for
-    "B" — a document the caller fetched over, validated, and then never saw stored.
+    A retired row is not a tombstone — its id is a pure function of (host, path,
+    name), so the same agent can only ever come back as that same row. That is what
+    makes this reversible at all: A returns with its own id, ``first_seen_at`` and
+    manage token, its conversations become sendable again, and B's history stays with
+    B instead of being handed over.
     """
     first = register(client, fetcher).json()
+    token = first["manageToken"]
+    _conversation(client, first["id"], session="s_a")
 
     fetcher.cards[CARD_URL] = make_card(name="Renamed Agent")
-    renamed = client.post("/v1/agents", json={"url": CARD_URL}).json()
-    assert renamed["id"] == first["id"]
+    second = client.post("/v1/agents", json={"url": CARD_URL}).json()
+    assert second["id"] != first["id"]
+    _conversation(client, second["id"], session="s_b")
 
     fetcher.cards[CARD_URL] = make_card(name="Geo Agent")
-    back = client.post("/v1/agents", json={"url": CARD_URL}).json()
+    back = client.post("/v1/agents", json={"url": CARD_URL})
 
-    assert back["id"] == first["id"], "an id is a handle, not a function of the card"
-    assert back["card"]["name"] == "Geo Agent", "the fetched card must be what is stored"
-    stored = client.get(f"/v1/agents/{first['id']}").json()
-    assert stored["card"]["name"] == "Geo Agent"
-    assert len(client.get("/v1/agents").json()["items"]) == 1, "one agent, one entry"
+    assert back.status_code == 200, back.text
+    body = back.json()
+    assert body["id"] == first["id"], "the identity came back as its own row"
+    assert body["firstSeenAt"] == first["firstSeenAt"], "a revival is not a birth"
+    assert "manageToken" not in body, "the token belongs to the entry, which did not change"
+    assert body["card"]["name"] == "Geo Agent", "the fetched card must be what is stored"
+    assert sorted(_owners(client)) == sorted([first["id"], second["id"]]), (
+        "no history changed hands"
+    )
+    statuses = {
+        item["id"]: item["status"]
+        for item in client.get("/api/panel/agents").json()["items"]
+    }
+    assert statuses == {first["id"]: "ok", second["id"]: "retired"}
+    # The token it was given before the replacement still manages it.
+    removed = client.delete(
+        f"/v1/agents/{first['id']}", headers={"X-ADP-Token": token}
+    )
+    assert removed.status_code == 204, removed.text
+
+
+def test_a_retired_agents_conversation_cannot_be_sent_to(client, fetcher) -> None:
+    """The refusal that matters: a message must not reach the new agent at that url.
+
+    Handing the retired record to a send would post this conversation's message to
+    whoever serves the address now while filing it under the old id — silent, and
+    impossible to notice afterwards.
+    """
+    first = register(client, fetcher).json()
+    session = client.post(
+        f"/api/panel/agents/{first['id']}/sessions", json={"title": "hello"}
+    ).json()["session"]
+    fetcher.cards[CARD_URL] = make_card(name="Renamed Agent")
+    client.post("/v1/agents", json={"url": CARD_URL})
+
+    refused = client.post(
+        f"/api/panel/sessions/{session['id']}/messages", json={"text": "still there?"}
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["code"] == "agent_retired"
+    # …and the conversation is still readable, which is the whole point of retiring
+    # the row instead of deleting it.
+    assert client.get(f"/api/panel/sessions/{session['id']}").status_code == 200
+
+
+def test_a_turn_whose_agent_retires_ends_instead_of_hanging(client, fetcher) -> None:
+    """The composer must not stay locked behind an agent that moved on.
+
+    A turn is polled until it ends, and ``working`` is what disables the composer in
+    the UI. If the address changes hands mid-turn, the old id answers nothing there
+    any more — so the turn is ended locally, with a code the panel translates, instead
+    of a 404 on every poll and on stop (which leaves no way out but a page reload).
+    """
+    first = register(client, fetcher).json()
+    path = client.app.state.settings.db_path
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO tasks (id, agent_id, agent_name, agent_url, endpoint, state,"
+            " title, input_text, created_at, updated_at, message_count, remote_task_id)"
+            " VALUES ('t_1', ?, 'Geo Agent', ?, '', 'working', 'hello', 'hello',"
+            " '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 1, 'remote-1')",
+            (first["id"], CARD_URL),
+        )
+        connection.execute(
+            "INSERT INTO sessions (id, agent_id, agent_name, agent_url, title, state,"
+            " task_id, created_at, updated_at) VALUES ('s_1', ?, 'Geo Agent', ?, 'hello',"
+            " 'working', 't_1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            (first["id"], CARD_URL),
+        )
+
+    fetcher.cards[CARD_URL] = make_card(name="Renamed Agent")
+    client.post("/v1/agents", json={"url": CARD_URL})
+
+    synced = client.post("/api/panel/sessions/s_1/sync")
+    assert synced.status_code == 200, synced.text
+    # The panel folds the ledger's states onto its own six words; what matters is that
+    # the turn is no longer ``working`` — that is the flag the composer reads.
+    assert synced.json()["session"]["state"] != "working"
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT state FROM tasks WHERE id = 't_1'").fetchone()[0] == (
+            "interrupted"
+        )
+        # The panel's own sentence is stored as a code, so the transcript follows the
+        # reader's language instead of pinning it to the one the panel ran in.
+        codes = [
+            row[0]
+            for row in connection.execute(
+                "SELECT code FROM session_messages WHERE session_id = 's_1' AND code IS NOT NULL"
+            )
+        ]
+    assert codes == ["msg.agent_retired"]
 
 
 def test_an_id_collision_is_refused_rather_than_used_to_repoint(

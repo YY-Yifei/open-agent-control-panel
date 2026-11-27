@@ -60,6 +60,12 @@ class RegistryError(Exception):
         return payload
 
 
+#: The status of an entry that no longer claims its address. Not a ``down``:
+#: ``down`` means "unreachable, keep retrying", and the probe loop would flip it
+#: back to ``ok`` the first time the *other* agent's card answered.
+RETIRED = "retired"
+
+
 @dataclass(frozen=True)
 class Registration:
     """Outcome of ``POST /v1/agents``."""
@@ -98,18 +104,28 @@ class RegistryService:
         port. An agent that is offline can therefore no longer confirm a repeat
         registration; it fails the fetch like any other unreachable URL.
 
-        Four outcomes, and the difference between the last three is the whole point:
+        One rule decides every outcome below: **whoever serves the card just fetched
+        owns the address.** Identity is the card — ADP reads it from the card, not
+        from the address — so a different name at an address is a different agent,
+        and the entry that used to be there has to let go of the address while
+        keeping everything that is its own (id, ``first_seen_at``, manage token,
+        conversations).
 
-        * ``(host, name)`` is new -> 201, a fresh entry with a manage token;
-        * it exists under the **same** url -> 200, storage untouched (a repeat
-          registration must not rotate the token or move any timestamp);
+        Five outcomes:
+
+        * ``(host, name)`` is new, and nobody live holds the url -> 201, a fresh
+          entry with a manage token;
+        * it exists under the **same** url -> 200, its card is refreshed and no
+          timestamp moves if the bytes did not;
         * it exists under a **different** url -> 200, the entry **moves**: url, card
           and hashes are replaced while the id, ``first_seen_at`` and the manage
           token stay. This is what makes a port change cost nothing;
-        * the url is already held by a **different** id -> 200, the entry
-          **adopts** the new card: the card is replaced while the id,
-          ``first_seen_at`` and the manage token stay. The id keeps spelling the
-          old name's digest, because a handle is stable within an entry.
+        * this id exists but is **retired** -> 200, it is **revived**: the identity
+          came back and takes the address again (see :meth:`_revive`);
+        * a **different** live entry holds the url -> 201, that entry **retires** and
+          a new one is created (see :meth:`_replace`). This is the case that used to
+          adopt the new card into the old entry, which is exactly how a brand-new
+          agent inherited somebody else's conversations.
         """
         try:
             normalized = net.normalize_url(url, allow_http=self.settings.allow_insecure_cards)
@@ -127,34 +143,24 @@ class RegistryService:
 
         existing = self._load(agent_id)
         if existing is not None:
+            if existing["status"] == RETIRED:
+                # The identity is back. Its id is a pure function of (host, path,
+                # name), so it can only ever come back as this row — and whatever
+                # took the address meanwhile has to let go.
+                return self._revive(existing, normalized, document, ip)
             if existing["url"] == normalized:
-                # The id matches and so does the address — but that proves the key is
-                # the same, not that the *stored card is current*. A card renamed
-                # A -> B -> A derives this entry's original id again, and treating the
-                # match as proof would answer 200 with the stale "B" card while the
-                # caller holds the "A" document it just fetched and validated.
+                # Same key and same address, but that proves the key, not that the
+                # *stored card is current*: a repeat registration can carry an edited
+                # card, and the caller holds a document it fetched and validated.
                 # ``_adopt_name`` follows it: an unchanged digest records "existing"
                 # and moves no timestamp, a changed one replaces the card.
                 return self._adopt_name(existing, document, ip)
             return self._move(existing, normalized, document, ip)
 
-        # A renamed card at a stable address: the url has always belonged to this
-        # entry, and the id it now derives is consequently new. Looking the url up
-        # here keeps the ordinary case off the IntegrityError path below — a renamed
-        # entry would otherwise re-enter it on every single repeat registration.
-        renamed = self._load_by_url(normalized)
-        if renamed is not None:
-            return self._adopt_name(renamed, document, ip)
-
-        # An entry that was renamed keeps the id it was born with, so neither lookup
-        # above finds it once it also changes address. Searching by the name it stored
-        # last is the only thing that does — and without it the agent splits in two: a
-        # dead entry under the old id and a live one under the new, with the history
-        # stranded on the first. That is the exact failure this change exists to
-        # remove, arriving by another door.
-        adopted = self._load_by_name(host, net.path_of(normalized), name)
-        if adopted is not None:
-            return self._move(adopted, normalized, document, ip)
+        holder = self._load_by_url(normalized)
+        if holder is not None:
+            # A *different* identity is serving this address now. See ``_replace``.
+            return self._replace(holder, agent_id, normalized, document, ip)
 
         now = iso()
         token = new_token()
@@ -185,20 +191,22 @@ class RegistryService:
                     "SELECT * FROM agents WHERE id = ?", (agent_id,)
                 ).fetchone()
         except sqlite3.IntegrityError:
-            # Either a concurrent request inserted this (host, name) first, or the
-            # url belongs to an existing entry whose card has since been renamed.
-            # ``agents.url`` is UNIQUE, so the second case surfaces here and not one
-            # line earlier — and it must be resolved, not raised: the address is the
-            # same agent, only its name (and therefore its id) changed.
+            # A concurrent request took this id or this url between the lookups above
+            # and the INSERT. Those are the only two constraints this statement can
+            # violate (``agents_url_live`` is the url one), so re-resolving is exact
+            # — and it has to be the *same* resolution the lookups above would have
+            # made, or two concurrent callers would answer differently.
             row = self._load(agent_id)
             if row is not None:
+                if row["status"] == RETIRED:
+                    return self._revive(row, normalized, document, ip)
                 if row["url"] != normalized:
                     return self._move(row, normalized, document, ip)
                 return self._adopt_name(row, document, ip)
-            renamed = self._load_by_url(normalized)
-            if renamed is None:
+            holder = self._load_by_url(normalized)
+            if holder is None:
                 raise
-            return self._adopt_name(renamed, document, ip)
+            return self._replace(holder, agent_id, normalized, document, ip)
 
         return Registration(record=self._record(row), manage_token=token, created=True)
 
@@ -249,10 +257,10 @@ class RegistryService:
 
         holder = self._load_by_url(normalized)
         if holder is not None and holder["id"] != row["id"]:
-            # Two entries on one host now claim the same name and the same address.
-            # Refusing is the only honest answer: silently repointing would drop the
-            # row that already owns the url (``agents.url`` is UNIQUE), and merging
-            # would destroy a real entry (§10).
+            # Two live entries on one host now claim the same name and the same
+            # address. Refusing is the only honest answer: silently repointing would
+            # drop the row that already owns the url (``agents_url_live`` allows one
+            # live holder), and merging would destroy a real entry (§10).
             raise RegistryError(
                 409,
                 "URL_TAKEN",
@@ -308,9 +316,10 @@ class RegistryService:
                     )
             except sqlite3.IntegrityError as exc:
                 # The lookups above and this UPDATE run on different connections, so a
-                # concurrent registration can take the url in between. ``agents.url`` is
-                # UNIQUE and is the only constraint this statement can violate, so the
-                # race means precisely what the explicit check above says.
+                # concurrent registration can take the url in between. Among live rows
+                # the url is unique (``agents_url_live``) and that is the only
+                # constraint this statement can violate, so the race means precisely
+                # what the explicit check above says.
                 raise RegistryError(
                     409, "URL_TAKEN", f"{normalized!r} is already taken"
                 ) from exc
@@ -329,6 +338,221 @@ class RegistryService:
                 raise RegistryError(409, "URL_TAKEN", f"{normalized!r} is already taken")
             self._record_registration(connection, ip, host, now, "moved")
         return Registration(record=self._record(fresh), manage_token=None, created=False)
+
+    def _replace(
+        self,
+        row: sqlite3.Row,
+        agent_id: str,
+        normalized: str,
+        document: Any,
+        ip: str,
+    ) -> Registration:
+        """Hand an address to a different agent and retire the entry that had it.
+
+        This used to be an adoption: keep the entry, swap the card. It is how a
+        brand-new agent — a different name, a different identity — inherited another
+        agent's conversations while the panel showed only the new name. The card is
+        the identity (ADP is explicit about that), so the honest answer is a new
+        entry.
+
+        Retiring rather than deleting is what lets this be a 201 instead of a 409:
+        the previous entry keeps its id, its ``first_seen_at``, its manage token and
+        every conversation held with it, and gives up only the address claim
+        (``agents_url_live`` is partial). Those conversations stay readable and stay
+        unsendable — they point at an agent that is not at that address any more, and
+        handing them to the new one is the bug being fixed here, not a courtesy.
+
+        The retire and the insert are **one transaction**. On their own, a failing
+        insert — the domain budget, a concurrent registration — would commit the
+        retirement and leave the address with no live entry at all: the panel would
+        show the old agent as retired and nothing serving the url.
+        """
+        now = iso()
+        token = new_token()
+        host = net.host_of(normalized)
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                # Re-read the holder *inside* the write transaction. The row this call
+                # was handed was read on another connection, and a concurrent
+                # registration in between could have retired it and taken the address
+                # with an entry of its own. Retiring by id would then be a no-op and
+                # the INSERT below would hit ``agents_url_live`` as a raw
+                # IntegrityError — a 500 from a path whose whole job is to resolve
+                # exactly this. Under ``BEGIN IMMEDIATE`` no other writer can be in
+                # the middle of it, so this read is authoritative.
+                holder = connection.execute(
+                    "SELECT id FROM agents WHERE url = ? AND status <> ?",
+                    (normalized, RETIRED),
+                ).fetchone()
+                if holder is not None:
+                    connection.execute(
+                        "UPDATE agents SET status = ? WHERE id = ?",
+                        (RETIRED, holder["id"]),
+                    )
+                self._assert_domain_budget(connection, host, agent_id)
+                connection.execute(
+                    """
+                    INSERT INTO agents (
+                        id, url, host, card, card_hash, status, first_seen_at,
+                        checked_at, last_ok_at, failures, changed_at, prev_hash, manage_token
+                    ) VALUES (?, ?, ?, ?, ?, 'ok', ?, ?, ?, 0, NULL, NULL, ?)
+                    """,
+                    (
+                        agent_id,
+                        normalized,
+                        host,
+                        json_dumps(document.payload),
+                        card_hash(document.payload),
+                        now,
+                        now,
+                        now,
+                        sha256_hex(token),
+                    ),
+                )
+                self._record_registration(connection, ip, host, now, "replaced")
+                fresh = connection.execute(
+                    "SELECT * FROM agents WHERE id = ?", (agent_id,)
+                ).fetchone()
+                connection.execute("COMMIT")
+            except sqlite3.IntegrityError:
+                # What is left that can collide is the id itself: a concurrent
+                # registration of the *same* agent created that entry after this
+                # call looked it up. Nothing was written — the transaction rolled
+                # back — so answer with what is there now, which is exactly what
+                # ``register`` does when it races itself.
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                again = self._load(agent_id)
+                if again is None:
+                    raise
+                if again["status"] == RETIRED:
+                    return self._revive(again, normalized, document, ip)
+                if again["url"] != normalized:
+                    return self._move(again, normalized, document, ip)
+                return self._adopt_name(again, document, ip)
+            except Exception:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            if fresh is None:
+                raise RegistryError(404, "NOT_FOUND", f"no agent with id {agent_id}")
+        return Registration(record=self._record(fresh), manage_token=token, created=True)
+
+    def _revive(
+        self,
+        row: sqlite3.Row,
+        normalized: str,
+        document: Any,
+        ip: str,
+    ) -> Registration:
+        """Put an identity that came back in charge of an address again.
+
+        A retired entry is not a tombstone: its id is a pure function of
+        ``(host, path, name)``, so the same agent can only ever return as the same
+        row. ``retired`` therefore means "not serving an address right now", not
+        "this identity is gone" — and the reverse of :meth:`_replace` has to exist,
+        or an agent that lost an address to another agent could never take it back.
+
+        Two cases, and they are not the same claim:
+
+        * back at its **own** url — the entry that replaced it there lets go, because
+          the card served there now is this identity's. This is A -> B -> A;
+        * back at **another** url (another port on the same host and path) — that is
+          a move, so a live entry already holding that address wins and this gets the
+          same 409 ``URL_TAKEN`` a move would.
+
+        Kept: the id, ``first_seen_at`` and the manage token. ``first_seen_at`` is
+        when this identity was first seen, not when it last came back; a revival is
+        not a birth. ``changed_at`` moves only if the card differs from the one stored
+        before retirement, for the reason a repeat registration moves nothing.
+        """
+        now = iso()
+        digest = card_hash(document.payload)
+        host = net.host_of(normalized)
+        with self.db.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                holder = connection.execute(
+                    "SELECT id FROM agents WHERE url = ? AND status <> ?",
+                    (normalized, RETIRED),
+                ).fetchone()
+                if holder is not None and holder["id"] != row["id"]:
+                    if normalized != row["url"]:
+                        raise RegistryError(
+                            409,
+                            "URL_TAKEN",
+                            f"{normalized!r} already belongs to another entry "
+                            f"({holder['id']})",
+                        )
+                    connection.execute(
+                        "UPDATE agents SET status = ? WHERE id = ?",
+                        (RETIRED, holder["id"]),
+                    )
+                # A revival turns a retired row into a live one, so the host cap has
+                # to be checked here like on every other path that can add a live
+                # entry — otherwise churning one address and reviving the losers on
+                # other ports grows a host past ``max_agents_per_domain``. It runs
+                # *after* the holder is retired: counting the row this call is about
+                # to displace would refuse the ordinary A -> B -> A.
+                self._assert_domain_budget(connection, host, row["id"])
+                if digest == row["card_hash"]:
+                    connection.execute(
+                        """
+                        UPDATE agents
+                           SET url = ?, host = ?, checked_at = ?, last_ok_at = ?,
+                               failures = 0, status = 'ok'
+                         WHERE id = ?
+                        """,
+                        (normalized, host, now, now, row["id"]),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE agents
+                           SET url = ?, host = ?, card = ?, card_hash = ?, prev_hash = ?,
+                               changed_at = ?, checked_at = ?, last_ok_at = ?,
+                               failures = 0, status = 'ok'
+                         WHERE id = ?
+                        """,
+                        (
+                            normalized,
+                            host,
+                            json_dumps(document.payload),
+                            digest,
+                            row["card_hash"],
+                            now,
+                            now,
+                            now,
+                            row["id"],
+                        ),
+                    )
+                self._record_registration(connection, ip, host, now, "revived")
+                fresh = connection.execute(
+                    "SELECT * FROM agents WHERE id = ?", (row["id"],)
+                ).fetchone()
+                connection.execute("COMMIT")
+            except Exception:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            if fresh is None:
+                raise RegistryError(404, "NOT_FOUND", f"no agent with id {row['id']}")
+        return Registration(record=self._record(fresh), manage_token=None, created=False)
+
+    def _retire(self, row: sqlite3.Row, at: str, *, outcome: str, ip: str) -> None:
+        """Stop one entry claiming its address, keeping the row (see ``_replace``)."""
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE agents SET status = ? WHERE id = ?", (RETIRED, row["id"])
+            )
+            self._record_registration(connection, ip, row["host"], at, outcome)
 
     def _still_serving(self, row: sqlite3.Row) -> bool:
         """Whether *this entry's own agent* still answers at its current url.
@@ -361,30 +585,21 @@ class RegistryService:
         document: Any,
         ip: str,
     ) -> Registration:
-        """A stable address whose card was renamed: keep the entry, take the new card.
+        """The same identity, re-registered: refresh the card in place.
 
-        The url already belongs to this entry, so the agent did not move — it only
-        changed what it calls itself. The derived id for the new name is a *different*
-        id, and it is deliberately not adopted here: an id is a handle that stays
-        stable within an entry (§4.1), not a function of the current content.
-        Re-keying would re-point every conversation for a cosmetic edit, which is
-        exactly the fragility this whole change exists to remove.
+        Reached only when the derived id *and* the url both match, so the name is
+        unchanged (up to folding) and the agent is not a different one. What can
+        still differ is the rest of the card — a description, a skill, an endpoint —
+        and a repeat registration must not answer with a card the caller has since
+        fetched over and seen replaced.
 
-        Two consequences, both visible and intended: after a rename the id still
-        spells the old name's digest, and a *second* entry for the new name cannot
-        appear at this address, because ``agents.url`` is UNIQUE.
+        A *different* name never arrives here any more: it derives another id, so the
+        url lookup in ``register`` finds this entry and hands the address to the new
+        agent through ``_replace``. Identity is the card, not the address — that is
+        the whole difference between this release and the last one.
         """
         now = iso()
         digest = card_hash(document.payload)
-        served = cardmod.card_summary(document.payload)["name"]
-        try:
-            previous = cardmod.card_summary(json.loads(row["card"]))["name"]
-        except (TypeError, ValueError, KeyError):
-            previous = served
-        # This method now serves the same-url path too, where a changed digest
-        # usually means the card was edited rather than renamed. The audit log is
-        # the one place the difference is visible, so record it honestly.
-        changed = "renamed" if net.name_key(served) != net.name_key(previous) else "changed"
         with self.db.connect() as connection:
             if digest == row["card_hash"]:
                 # Every repeat registration of a renamed agent arrives here (the
@@ -412,7 +627,7 @@ class RegistryService:
                         row["id"],
                     ),
                 )
-                outcome = changed
+                outcome = "changed"
             fresh = connection.execute(
                 "SELECT * FROM agents WHERE id = ?", (row["id"],)
             ).fetchone()
@@ -475,6 +690,11 @@ class RegistryService:
 
     def _probe_row(self, row: sqlite3.Row) -> dict[str, Any] | None:
         agent_id = row["id"]
+        if row["status"] == RETIRED:
+            # A retired entry has no address left to check: the url it still spells
+            # belongs to the agent that took it over, and reading that card in would
+            # undo the retirement with a fresh timestamp.
+            return None
         checked = iso()
         try:
             document = self._fetch_card(row["url"])
@@ -482,6 +702,21 @@ class RegistryService:
         except (FetchError, RegistryError):
             self._mark_failure(agent_id, checked)
             return self.get(agent_id)
+
+        served = cardmod.card_summary(document.payload)["name"]
+        if (
+            net.derive_id(net.host_of(row["url"]), net.path_of(row["url"]), served)
+            != agent_id
+        ):
+            # The address now answers with somebody else's card. Adopting it here
+            # would be the bug this release removes, arriving through the probe loop
+            # instead of a registration: the name in the panel would change while the
+            # id — and every conversation hanging off it — stayed. So this entry steps
+            # back, and the agent actually serving the address becomes an entry of its
+            # own when it registers. Until then the panel shows this one as retired,
+            # which is the truth: nobody holds the address on its behalf.
+            self._retire(row, checked, outcome="replaced", ip="probe")
+            return None
 
         digest = card_hash(document.payload)
         with self.db.connect() as connection:
@@ -530,11 +765,26 @@ class RegistryService:
 
     # ------------------------------------------------------------------ reading
 
-    def get(self, agent_id: str) -> dict[str, Any] | None:
-        """One full AgentRecord, or None."""
+    def get(
+        self, agent_id: str, *, include_retired: bool = False
+    ) -> dict[str, Any] | None:
+        """One full AgentRecord, or None.
+
+        A retired entry is deliberately **not** an agent: everything that means "send
+        something to this agent" reads through here, and a row whose url now serves
+        somebody else must not come back from it. Returning it would put a message
+        addressed to agent A into agent B's task while filing it under A's id — the
+        failure this status exists to prevent, and a silent one.
+
+        The operator's own read paths (the panel's list and detail views) pass
+        ``include_retired=True``: they show the row's history, and the send paths
+        they lead to still go through the default.
+        """
         with self.db.connect() as connection:
             row = connection.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
-        return self._record(row) if row is not None else None
+        if row is None or (row["status"] == RETIRED and not include_retired):
+            return None
+        return self._record(row)
 
     def list_agents(
         self,
@@ -547,8 +797,16 @@ class RegistryService:
         full: bool = False,
         limit: int = DEFAULT_PAGE_SIZE,
         cursor: str | None = None,
+        include_retired: bool = False,
     ) -> dict[str, Any]:
-        """Search agents; results are ordered by ``firstSeenAt`` desc, ``id`` asc."""
+        """Search agents; results are ordered by ``firstSeenAt`` desc, ``id`` asc.
+
+        Retired entries are left out by default, because the contract publishes two
+        statuses and a retired row is not an agent any more — its address belongs to
+        somebody else. The panel asks for them explicitly: an operator who has just
+        lost an agent to another one at the same address should be able to see that
+        this is what happened, and where the conversations went.
+        """
         if status is not None and status not in {"ok", "down"}:
             raise RegistryError(400, "BAD_REQUEST", "status must be 'ok' or 'down'")
         if limit < 1 or limit > MAX_PAGE_SIZE:
@@ -569,6 +827,9 @@ class RegistryService:
         if status:
             clauses.append("status = ?")
             params.append(status)
+        elif not include_retired:
+            clauses.append("status <> ?")
+            params.append(RETIRED)
         if since:
             clauses.append("changed_at IS NOT NULL AND changed_at >= ?")
             params.append(since)
@@ -658,41 +919,17 @@ class RegistryService:
                 "SELECT * FROM agents WHERE id = ?", (agent_id,)
             ).fetchone()
 
-    def _load_by_name(self, host: str, path: str, name: str) -> sqlite3.Row | None:
-        """The entry at this ``(host, path)`` whose *stored* card carries this name.
-
-        The id cannot answer this: an entry keeps the id it was born with, so after a
-        rename ``derive_id(host, path, name)`` points at nothing. The path is part of
-        the match for exactly the reason it is part of the key — an agent served from
-        another path on the same host is a *different* agent, and matching it here would
-        hand one agent's entry, token and conversations to another.
-        """
-        wanted = net.name_key(name)
-        with self.db.connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM agents WHERE host = ? ORDER BY last_ok_at DESC", (host,)
-            ).fetchall()
-        for row in rows:
-            if net.path_of(row["url"]) != path:
-                continue
-            try:
-                payload = json.loads(row["card"])
-            except (TypeError, ValueError):
-                continue
-            if isinstance(payload, dict) and net.name_key(payload.get("name") or "") == wanted:
-                return row
-        return None
-
     def _load_by_url(self, normalized: str) -> sqlite3.Row | None:
-        """Find the entry holding this url, whatever id it currently has.
+        """Find the **live** entry holding this url, whatever id it has.
 
-        ``agents.url`` is UNIQUE, so this identifies at most one row. It is how a
-        renamed card is recognised: the address is unchanged, the derived id is new,
-        and only the row that already owns the address can explain the difference.
+        ``agents_url_live`` makes that unique among live rows. Retired rows are
+        excluded on purpose: retiring one is precisely what frees its address for the
+        agent that serves it now, so a retired row must never be mistaken for the
+        current holder — it would answer 200 for an address it no longer serves.
         """
         with self.db.connect() as connection:
             return connection.execute(
-                "SELECT * FROM agents WHERE url = ?", (normalized,)
+                "SELECT * FROM agents WHERE url = ? AND status <> ?", (normalized, RETIRED)
             ).fetchone()
 
     def _fetch_card(self, url: str) -> Any:
@@ -734,9 +971,12 @@ class RegistryService:
         host: str,
         agent_id: str,
     ) -> None:
+        # Live entries only: a retired row has given up its address, and counting it
+        # would let one address that has changed hands a few times exhaust the host's
+        # budget against agents that are not there any more.
         count = connection.execute(
-            "SELECT COUNT(*) AS n FROM agents WHERE host = ? AND id != ?",
-            (host, agent_id),
+            "SELECT COUNT(*) AS n FROM agents WHERE host = ? AND id != ? AND status <> ?",
+            (host, agent_id, RETIRED),
         ).fetchone()["n"]
         if count >= self.settings.max_agents_per_domain:
             raise RegistryError(

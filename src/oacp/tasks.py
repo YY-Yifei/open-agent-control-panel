@@ -11,7 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import sqlite3
-from typing import Any
+from typing import Any, NoReturn
 
 from .adp import card as cardmod
 from .adp.service import RegistryService
@@ -131,7 +131,7 @@ class TaskService:
         """
         agent = self.registry.get(agent_id)
         if agent is None:
-            raise PanelError("agent_not_found", status=404, agent_id=agent_id)
+            self._raise_missing(agent_id, "agent_not_found", 404)
 
         card = agent["card"]
         endpoint = cardmod.pick_endpoint(card) or {}
@@ -217,7 +217,9 @@ class TaskService:
         task = self._row(task_id)
         agent = self.registry.get(task["agent_id"])
         if agent is None:
-            raise PanelError("agent_gone", status=404, task_id=task_id)
+            # A retired entry is refused *by name*: "no agent with that id" would send
+            # the reader looking for a registration that was never lost.
+            self._raise_missing(task["agent_id"], "agent_gone", 404, task_id=task_id)
 
         context_id = task["context_id"] or None
         remote_id = task["remote_task_id"] or None
@@ -249,7 +251,12 @@ class TaskService:
             raise PanelError("task_not_refreshable", status=409)
         agent = self.registry.get(task["agent_id"])
         if agent is None:
-            raise PanelError("agent_gone", status=404, task_id=task_id)
+            # No agent at that id: retired (another agent serves the address now) or
+            # removed outright. Either way there is no snapshot left to wait for, and
+            # leaving the turn ``working`` freezes the progress line, keeps the composer
+            # disabled and keeps asking an address nobody holds — the same dead end the
+            # lost-task path exists to remove, so it gets the same verdict.
+            return self.abandon(task_id, self._missing_code(task["agent_id"]))
 
         try:
             call = self.client.get_task(agent["card"], task["remote_task_id"], history_length=50)
@@ -270,7 +277,10 @@ class TaskService:
             raise PanelError("task_not_cancelable", status=409)
         agent = self.registry.get(task["agent_id"])
         if agent is None:
-            raise PanelError("agent_gone", status=404, task_id=task_id)
+            # Cancel is the operator's exit, so it cannot depend on the agent still
+            # being reachable — not retired, not removed: ending it locally is the only
+            # honest answer, and the only one that unlocks the composer.
+            return self.abandon(task_id, self._missing_code(task["agent_id"]))
 
         try:
             call = self.client.cancel_task(agent["card"], task["remote_task_id"])
@@ -285,6 +295,74 @@ class TaskService:
             return self._record_error(task_id, exc, state=task["state"])
 
         return self._apply_result(task_id, call, kind="cancel")
+
+    def abandon(self, task_id: str, code: str) -> dict[str, Any]:
+        """End a turn locally because the agent that owns it is not there any more.
+
+        Retiring an entry is the one thing that can happen to a conversation *while a
+        turn is running*: the agent re-registered under another name at the same
+        address, so nothing is listening for that task id there any more. Before this,
+        the panel answered "no agent with that id" on every poll and on stop and left
+        the state at ``working`` — which is what the UI reads to disable the composer,
+        so the conversation was stuck with the only way out being a page reload. That
+        is the dead end the lost-task path already removed once; this is the same
+        verdict reached from the other side.
+
+        ``code`` is the panel's own sentence — the *only* thing stored. It travels as a
+        code (``session_messages.code``) and is translated when it is read, unlike
+        ``_settle``, which has the agent's words to quote beside it. There are none
+        here (there was nobody to ask), and writing an English rendering into
+        ``tasks.error`` would print the same sentence twice in every language: once
+        from the code and once from its fallback.
+        """
+        now = iso()
+        row = self._row(task_id)
+        if cardmod.is_terminal(row["state"]) or row["state"] in _OUR_ENDINGS:
+            # A finished turn keeps its verdict: the agent disappearing afterwards
+            # cannot make "completed" untrue.
+            return self.get(task_id)
+        with self.db.connect() as connection:
+            connection.execute(
+                "UPDATE tasks SET state = ?, error = '', updated_at = ? WHERE id = ?",
+                (INTERRUPTED, now, task_id),
+            )
+            self._record_progress(connection, task_id, INTERRUPTED, "", now)
+            self._event(
+                connection,
+                task_id,
+                now,
+                "interrupted",
+                {"state": INTERRUPTED, "code": code},
+            )
+        # ``noteCode`` travels with this one snapshot so the transcript stores the code
+        # and not the English fallback (see ``sessions._absorb``). Notes are UI keys
+        # (``msg.*``, like ``_NOTE_CODES``) while ``code`` is the bare panel error code:
+        # one is read by ``t()``, the other branched on by a client.
+        return {**self.get(task_id), "noteCode": f"msg.{code}"}
+
+    def _missing_code(self, agent_id: str) -> str:
+        """Which kind of "no agent there" this is, as a transcript note code."""
+        return "agent_retired" if self._retired(agent_id) else "agent_gone"
+
+    def _retired(self, agent_id: str) -> bool:
+        """Whether this id belongs to an entry that gave up its address.
+
+        ``include_retired=True`` also returns *live* entries — it stops filtering the
+        retired ones out, it does not select them — so the status is checked
+        explicitly. A helper named ``_retired`` that answers "is it registered at
+        all?" is a trap for the next caller, and today it would only be right by
+        accident of the call sites.
+        """
+        record = self.registry.get(agent_id, include_retired=True)
+        return record is not None and record["status"] == "retired"
+
+    def _raise_missing(
+        self, agent_id: str, code: str, status: int, **params: object
+    ) -> NoReturn:
+        """Refuse `code`, unless the entry is retired — then say *that* instead."""
+        if self._retired(agent_id):
+            raise PanelError("agent_retired", status=409, agent_id=agent_id)
+        raise PanelError(code, status=status, agent_id=agent_id, **params)
 
     def apply_push(self, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Fold one agent callback into the ledger.

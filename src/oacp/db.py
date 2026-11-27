@@ -19,20 +19,24 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class MigrationError(RuntimeError):
     """An on-open schema upgrade refused to continue rather than lose a row."""
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS agents (
+#: The ``agents`` table, as a template — ``{table}`` is the name it is created under.
+#: Schema 11 keeps a row that lost its address (see :func:`_retire_status`), so this
+#: declaration is shared between the fresh-file path and that rebuild rather than
+#: written out twice: a column list copied into a migration drifts the first time
+#: somebody adds a column.
+_AGENTS_TABLE = """CREATE TABLE {table} (
     id              TEXT PRIMARY KEY,
-    url             TEXT NOT NULL UNIQUE,
+    url             TEXT NOT NULL,
     host            TEXT NOT NULL,
     card            TEXT NOT NULL,
     card_hash       TEXT NOT NULL,
-    status          TEXT NOT NULL CHECK (status IN ('ok', 'down')),
+    status          TEXT NOT NULL CHECK (status IN ('ok', 'down', 'retired')),
     first_seen_at   TEXT NOT NULL,
     checked_at      TEXT NOT NULL,
     last_ok_at      TEXT NOT NULL,
@@ -41,10 +45,21 @@ CREATE TABLE IF NOT EXISTS agents (
     prev_hash       TEXT,
     manage_token    TEXT NOT NULL
 );
+"""
 
+#: Indexes over ``agents``. The url index is **partial** on purpose: an address is
+#: claimed by exactly one *live* entry, while any number of retired rows may still
+#: spell it out. That is what lets a conversation keep the agent it was held with
+#: after another agent takes over the address — the row stays, the claim does not.
+_AGENTS_INDEXES = """
 CREATE INDEX IF NOT EXISTS agents_first_seen ON agents (first_seen_at DESC, id ASC);
 CREATE INDEX IF NOT EXISTS agents_host ON agents (host);
 CREATE INDEX IF NOT EXISTS agents_status ON agents (status);
+CREATE UNIQUE INDEX IF NOT EXISTS agents_url_live ON agents (url) WHERE status <> 'retired';
+"""
+
+_SCHEMA = (
+    _AGENTS_TABLE.format(table="IF NOT EXISTS agents") + _AGENTS_INDEXES + """
 
 CREATE TABLE IF NOT EXISTS registrations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,6 +160,7 @@ CREATE TABLE IF NOT EXISTS session_attachments (
 CREATE INDEX IF NOT EXISTS session_attachments_session ON session_attachments (session_id, id);
 CREATE INDEX IF NOT EXISTS session_attachments_message ON session_attachments (message_id, id);
 """
+)
 
 #: Task columns added after schema v1 (push notifications) and v2 (sessions).
 #: ``CREATE TABLE IF NOT EXISTS`` never touches a table that already exists, so a
@@ -188,6 +204,7 @@ class Database:
             previous = connection.execute("PRAGMA user_version").fetchone()[0]
             connection.executescript(_SCHEMA)
             _widen(connection)
+            _retire_status(connection)
             _rekey_agents(connection, previous)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -235,6 +252,71 @@ def _widen(connection: sqlite3.Connection) -> None:
     existing = {row["name"] for row in connection.execute("PRAGMA table_info(session_messages)")}
     if existing and "code" not in existing:
         connection.execute("ALTER TABLE session_messages ADD COLUMN code TEXT")
+
+
+def _retire_status(connection: sqlite3.Connection) -> None:
+    """Widen ``status`` to ``retired`` and make the url unique only among live rows.
+
+    Schema 11 changes what "one address, one entry" means. Until now an address
+    belonged to whichever entry reached it first, and a *different* agent appearing
+    there had its card adopted into that entry: the name in the panel changed, the
+    id did not, and every conversation of the previous agent silently carried over to
+    the new one. Identity is the card (ADP reads identity from it, not from the
+    address), so that is the wrong way round — a different name at an address is a
+    different agent, and the entry that used to be there has to let go.
+
+    Letting go means the row stays: ``retired`` is an entry that no longer claims its
+    address but still owns its conversations, its ``first_seen_at`` and its manage
+    token. They are simply no longer what a registration resolves to, and no longer
+    something the panel will send a message to. Hence two constraint changes, and
+    only those:
+
+    * ``status`` gains a third value — ``down`` is "unreachable, will retry", which
+      must not be reused, because a probe would cheerfully flip it back to ``ok``;
+    * ``url`` stops being unique outright and becomes unique **among live rows**. A
+      retired row keeps spelling the address it lost, and several of them may share
+      it with the one live row that serves it now.
+
+    SQLite can alter neither a CHECK constraint nor an inline UNIQUE in place, so the
+    table is rebuilt the documented way. The copy is a plain ``INSERT ... SELECT``
+    over the same thirteen columns: nothing is added, moved, merged or dropped —
+    this pass changes constraints, not identity.
+
+    The guard is the table's own DDL rather than ``user_version``, so the pass is
+    idempotent by inspection: a file already carrying ``retired`` in its CHECK (a
+    fresh one included) is left alone, and a half-finished rebuild cannot be read as
+    done.
+    """
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agents'"
+    ).fetchone()
+    if row is None or "retired" in (row["sql"] or ""):
+        return
+
+    columns = (
+        "id, url, host, card, card_hash, status, first_seen_at, checked_at,"
+        " last_ok_at, failures, changed_at, prev_hash, manage_token"
+    )
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(_AGENTS_TABLE.format(table="agents_schema11"))
+        connection.execute(
+            f"INSERT INTO agents_schema11 ({columns}) SELECT {columns} FROM agents"
+        )
+        connection.execute("DROP TABLE agents")
+        connection.execute("ALTER TABLE agents_schema11 RENAME TO agents")
+        # The old table took its indexes with it, so every one of them is created
+        # here — the partial url index included, which is the point of the rebuild.
+        for statement in _AGENTS_INDEXES.split(";"):
+            if statement.strip():
+                connection.execute(statement)
+        connection.execute("COMMIT")
+    except Exception:
+        try:
+            connection.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
 
 
 def _rekey_agents(connection: sqlite3.Connection, previous: int) -> None:

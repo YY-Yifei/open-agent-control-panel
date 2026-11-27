@@ -117,6 +117,10 @@ const DICT = {
     "state.canceled": "已停止",
     "state.ok": "在线",
     "state.down": "离线",
+    // 不是「离线」：离线的意思是连不上、还在重试。retired 是「这个地址上已经
+    // 换成别的智能体了」—— 不会自己回来，得靠重新注册。两者混用会让操作员
+    // 一直等一个永远不会恢复的条目。
+    "state.retired": "已被接替",
 
     "agents.empty": "没有匹配的智能体",
     "agents.none": "面板里还没有智能体",
@@ -200,6 +204,9 @@ const DICT = {
     // 这里按当前语言读出来 —— 与附件的 skip 原因同一套做法（写入是码，读出是字）。
     "msg.task_gone": "远端已经查不到这个任务了（对方服务可能重启过，或清理了任务表），本地这一轮到此为止",
     "msg.cancelled_locally": "远端已无此任务，已本地终止",
+    "msg.agent_retired":
+      "这个地址上已经换成别的智能体了，所以这一轮到此为止；这段历史还留着，但不能再往下发",
+    "msg.agent_gone": "这个智能体已经从面板移除了，所以这一轮到此为止；这段历史还留着",
     // 动作放在最前：待定气泡是一行 nowrap + 省略号，窄窗口吃掉的是尾巴。
     "sync.stalled": "这一轮取不到进度：点「停止」可立刻收尾，自动重试 {n} 秒一次",
     "sync.auth": "这一轮取不到进度：面板口令不对。点「停止」或刷新页面会重新弹出口令框",
@@ -272,6 +279,7 @@ const DICT = {
     "state.canceled": "Stopped",
     "state.ok": "Online",
     "state.down": "Offline",
+    "state.retired": "Replaced",
 
     "agents.empty": "No matching agents",
     "agents.none": "No agents yet",
@@ -354,6 +362,10 @@ const DICT = {
     "msg.task_gone":
       "The agent no longer has this task (its service may have restarted, or its task table was cleared), so this turn ends here",
     "msg.cancelled_locally": "The agent no longer has this task, so it was stopped locally",
+    "msg.agent_retired":
+      "Another agent serves that address now, so this turn ends here; the history stays, but nothing more can be sent",
+    "msg.agent_gone":
+      "The agent was removed from the panel, so this turn ends here; the history stays",
     // Action first: the pending line is one nowrap line with an ellipsis, so whatever
     // is at the end is what a narrow window loses.
     "sync.stalled": "No progress from this turn — press Stop to end it; retrying every {n} s",
@@ -583,10 +595,12 @@ function renderAgents() {
   box.innerHTML = items
     .map((agent) => {
       const sub = t("agents.count", { n: agent.sessionCount || 0 });
-      const offline = agent.status === "down" ? ` · ${stateLabel("down")}` : "";
+      const offline = ["down", "retired"].includes(agent.status)
+        ? ` · ${stateLabel(agent.status)}`
+        : "";
       return `<button class="item ${agent.id === state.agentId ? "active" : ""}"
                       data-agent="${esc(agent.id)}" type="button">
-        <span class="dot ${agent.status === "down" ? "down" : "ok"}"></span>
+        <span class="dot ${agent.status === "ok" ? "ok" : agent.status === "retired" ? "retired" : "down"}"></span>
         <span class="item-main">
           <span class="item-title">${esc(agent.name || agent.url)}</span>
           <span class="item-sub">${esc(sub)}${esc(offline)}</span>
@@ -664,7 +678,7 @@ function renderTop() {
   top.innerHTML = `
     <div class="agent-head">
       <div class="agent-line">
-        <span class="dot ${agent.status === "down" ? "down" : "ok"}"></span>
+        <span class="dot ${agent.status === "ok" ? "ok" : agent.status === "retired" ? "retired" : "down"}"></span>
         <h1>${esc(agent.name || agent.url)}</h1>
       </div>
       <p class="agent-desc">${esc(agent.description || "")}</p>

@@ -221,10 +221,15 @@ def _agent_totals(request: Request) -> dict[str, int]:
             "SELECT status, COUNT(*) AS n FROM agents GROUP BY status"
         ).fetchall()
     by_status = {row["status"]: int(row["n"]) for row in rows}
+    # ``total`` is what the panel can talk to, so it excludes retired entries: those
+    # are rows kept for their history, and counting them would make the panel claim
+    # agents it will refuse to send to. They are reported separately instead.
+    retired = by_status.pop("retired", 0)
     return {
         "total": sum(by_status.values()),
         "ok": by_status.get("ok", 0),
         "down": by_status.get("down", 0),
+        "retired": retired,
     }
 
 
@@ -304,9 +309,16 @@ def list_agents(
     limit: int = Query(default=100, ge=1, le=100),
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    """Registered agents, enriched with local task counts."""
+    """Registered agents, enriched with local task counts.
+
+    Retired entries are included on purpose: this is the operator's surface, and
+    "my agent is gone and my history went with it" has to be answerable from here —
+    the row is shown with ``status: "retired"`` and its conversations stay where they
+    were. The ADP surface (``/v1/agents``) never lists them: the published record has
+    two statuses, and a retired row is not an agent any more.
+    """
     result = _registry(request).list_agents(
-        q=q, status=status, full=False, limit=limit, cursor=cursor
+        q=q, status=status, full=False, limit=limit, cursor=cursor, include_retired=True
     )
     result["items"] = _with_counts(request, result["items"])
     return result
@@ -314,8 +326,12 @@ def list_agents(
 
 @router.get("/agents/{agent_id}")
 def get_agent(request: Request, agent_id: str) -> dict[str, Any]:
-    """One agent: full record, derived interfaces and its recent tasks."""
-    record = _registry(request).get(agent_id)
+    """One agent: full record, derived interfaces and its recent tasks.
+
+    A retired entry is served here (``include_retired``) and nowhere that can act on
+    an agent — its page is the one place its history can still be read.
+    """
+    record = _registry(request).get(agent_id, include_retired=True)
     if record is None:
         raise PanelError("agent_not_found", status=404, agent_id=agent_id)
 
@@ -343,6 +359,10 @@ def refresh_agent(request: Request, agent_id: str) -> dict[str, Any]:
     """Re-fetch the card right now instead of waiting for the probe loop."""
     record = _registry(request).probe(agent_id)
     if record is None:
+        if _registry(request).get(agent_id, include_retired=True) is not None:
+            # Probing a retired entry would read the *other* agent's card into its
+            # row and quietly un-retire it, so the service refuses; say why.
+            raise PanelError("agent_retired", status=409, agent_id=agent_id)
         raise PanelError("agent_not_found", status=404, agent_id=agent_id)
     return {"agent": record}
 

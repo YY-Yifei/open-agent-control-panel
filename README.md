@@ -268,10 +268,11 @@ the path always does. Folding paths together would let one agent's registration 
 entry — and, with it, another's conversations — onto a different agent.
 
 All four §4.1 properties still hold: one url normalises to exactly one `(host, path, name)`, so
-`url -> id` is still a function and "at most one entry per url" is untouched. What changed is the
-converse, which the contract never required: one id may now cover several urls — one agent seen
-on successive ports — and the registry resolves that by treating a re-registration under a new
-url as the same entry moving.
+`url -> id` is still a function, and at most one entry *claims* any url — a retired row keeps the
+address it lost, but it is not an entry the registry publishes or resolves against. What changed
+is the converse, which the contract never required: one id may now cover several urls — one agent
+seen on successive ports — and the registry resolves that by treating a re-registration under a
+new url as the same entry moving.
 
 Normalisation of the URL is unchanged and still minimal — lower-case scheme and host, drop a
 default `:443`, upper-case percent escapes — so `HTTPS://Geo.Example.com:443/Card.json` and
@@ -284,7 +285,8 @@ two. Nothing else is rewritten: no trailing slash, no `..` collapsing, no query 
 | Same URL, same spelling | `200`, the stored record, token never rotated |
 | Same card on two **hosts**, or at two **paths** | `201`, **two** entries |
 | Same host, path and name, new **port** | `200`, the entry **moves**: id, `firstSeenAt` and token stay |
-| Renamed card at a stable URL | `200`, `changedAt`/`prevHash` move; the id does **not** |
+| A **different** name at the same URL | `201`, a new entry; the previous one is **retired** (id, history and token stay, the address does not) |
+| That retired name comes back at that URL | `200`, it is **revived**: same id, `firstSeenAt` and token; whoever replaced it retires in turn |
 
 Three costs, stated rather than hidden:
 
@@ -298,13 +300,33 @@ Three costs, stated rather than hidden:
   the case this exists for. While the old address still serves that card, the answer is
   `409 AGENT_STILL_AT_OLD_URL`: that is a second agent with the same name, not a move.
 
-An id is a handle that stays put: it is derived once, when the entry is born, and never
-recomputed. A rename updates the card and leaves the id — and the conversations — alone, which
-is why a renamed agent's id still spells its first name's digest. The id says nothing about
-*who* an agent is, and nothing may be read out of it — no url, no host, no timestamp, no
-ordering. ADP is explicit that identity comes from the A2A card's signature, and a registry that
-cannot prove ownership has no business minting it. The same url gets a different id at another
-registry, so ids are not a cross-registry correlation key.
+An id is a handle that stays put *within an entry*: it is derived once, from the card the entry
+was born with, and never recomputed. What decides whether you are looking at the same entry is
+the **card**, not the address — ADP is explicit that identity comes from the A2A card — so a
+different name at an address is a **different agent**, and the entry that used to be there
+*retires* rather than adopting the new card. A retired row keeps everything that is its own (id,
+`firstSeenAt`, manage token, conversations) and gives up only the address claim:
+`agents_url_live` is a partial unique index, so one url has exactly one *live* entry and any
+number of retired rows.
+
+That is what makes a replacement reversible. `derive_id` is a pure function of
+`(host, path, name)`, so the same agent can only ever come back as the same row: when it
+registers at that address again it is **revived** with its own id and token, its conversations
+become sendable again, and whoever took the address retires in turn. The id still says nothing
+about *who* an agent is and nothing may be read out of it — no url, no host, no timestamp, no
+ordering; the same url gets a different id at another registry, so ids are not a cross-registry
+correlation key.
+
+Retired entries are the panel's business, never the contract's: `/v1/agents` does not publish
+them (its record defines two statuses), while `/api/panel/agents` lists them with
+`status: "retired"` so that "my agent disappeared and my history went with it" is answerable
+from the UI. Nothing can be *sent* to one: every send path resolves its agent through a lookup
+that refuses a retired row, because that row's url now serves somebody else — posting there
+would deliver agent A's message to agent B while filing it under A's id.
+
+Opening a file from before 0.12 (schema 10 → 11) rebuilds the `agents` table once — SQLite
+cannot alter a CHECK constraint or an inline UNIQUE in place — and copies every row over
+unchanged: it is a constraint change, not an identity one.
 
 A database written by any release before 0.9 is re-keyed once, on open (schema 7 → 8): ids are
 recomputed from each entry's stored host and card name, and `sessions.agent_id` /

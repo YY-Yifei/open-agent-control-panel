@@ -232,6 +232,8 @@ a { color: inherit; text-decoration: none; }
 .dot.ok { background: var(--ok); }
 .dot.down { background: var(--down); }
 .dot.working { background: var(--accent); }
+/* 空心的：这一格里的行还在（历史还挂在上面），只是它不再占着这个地址。 */
+.dot.retired { background: transparent; box-shadow: inset 0 0 0 1px var(--down); }
 
 .side-foot {
   display: flex;

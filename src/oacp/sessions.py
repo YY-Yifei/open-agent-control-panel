@@ -153,9 +153,9 @@ class SessionService:
         Creating and sending in one call is the normal path: the UI never has to
         show an empty conversation that a user abandoned half a second later.
         """
-        agent = self.registry.get(agent_id)
-        if agent is None:
-            raise PanelError("agent_not_found", status=404, agent_id=agent_id)
+        agent = self._require_agent(
+            agent_id, missing_code="agent_not_found", missing_status=404
+        )
 
         session_id = new_id("s")
         now = iso()
@@ -189,6 +189,29 @@ class SessionService:
                 raise
         return self.get(session_id)
 
+    def _require_agent(
+        self, agent_id: str, *, missing_code: str, missing_status: int
+    ) -> dict[str, Any]:
+        """The agent that owns a conversation, or the right refusal.
+
+        Two things can be wrong, and they are not the same thing:
+
+        * the entry is **retired** — it is still there, still readable, still named,
+          but another agent serves its address now. Handing its record to a send
+          would post this conversation's message to that agent while filing it under
+          this id: undetectable afterwards, and worse than refusing;
+        * there is **no entry at all** — removed, or never registered here.
+
+        Both refuse; only the words differ, because one is fixed by registering the
+        agent again and the other by finding out who removed it.
+        """
+        agent = self.registry.get(agent_id)
+        if agent is not None:
+            return agent
+        if self.registry.get(agent_id, include_retired=True) is not None:
+            raise PanelError("agent_retired", status=409, agent_id=agent_id)
+        raise PanelError(missing_code, status=missing_status, agent_id=agent_id)
+
     def send(
         self,
         session_id: str,
@@ -216,9 +239,9 @@ class SessionService:
             raise PanelError("empty_message", status=400)
 
         row = self._row(session_id)
-        agent = self.registry.get(row["agent_id"])
-        if agent is None:
-            raise PanelError("session_agent_gone", status=409, agent_id=row["agent_id"])
+        agent = self._require_agent(
+            row["agent_id"], missing_code="session_agent_gone", missing_status=409
+        )
         if prepared and cardmod.accepts_images(agent["card"]) is False:
             # The card declares its inputs and none of them is an image. Sending
             # one anyway would spend a full round trip to be refused, and the
@@ -476,6 +499,15 @@ class SessionService:
         text = str(task.get("artifactText", task.get("text")) or "").strip()
         status_text = str(task.get("statusText") or "").strip()
         error = str(task.get("error") or "").strip()
+        # ``noteCode`` is the local verdict's own code (see ``tasks.abandon``) and it is
+        # enough on its own: that path has no agent words to quote, so the note *is* the
+        # message. The state-derived codes keep their documented rule — ``canceled`` only
+        # carries an error when *we* stopped the task because the agent had forgotten it,
+        # while an agent's own cancel arrives as a result with nothing to explain, so
+        # those apply only to an ``error``.
+        note_code = task.get("noteCode") or (
+            _NOTE_CODES.get(str(task.get("state") or "")) if error else None
+        )
         task_id = task.get("id")
         if "response" not in task and task_id:
             # Files live in the raw response, and only a detail view carries it.
@@ -489,9 +521,13 @@ class SessionService:
                 # The whole point of this re-read is not losing files silently;
                 # failing to re-read must not be silent either.
                 log.warning("task %s could not be re-read for its files: %s", task_id, exc)
-        # An error snapshot discards its files below, so do not decode them (or
-        # re-attempt unreachable URLs) just to throw the result away.
-        files = [] if error else self._inbound(session_id, task_id, task.get("response"))
+        # An error snapshot — or a local verdict — discards its files below, so do not
+        # decode them (or re-attempt unreachable URLs) just to throw the result away.
+        files = (
+            []
+            if error or note_code
+            else self._inbound(session_id, task_id, task.get("response"))
+        )
 
         with self.db.connect() as connection:
             row = connection.execute(
@@ -500,7 +536,7 @@ class SessionService:
             if row is None:
                 return
             changed = False
-            if error:
+            if error or note_code:
                 changed = self._append_unique(
                     connection,
                     session_id,
@@ -509,10 +545,7 @@ class SessionService:
                     task_id,
                     FAILED,
                     [],
-                    # ``canceled`` only carries an error when *we* stopped the task
-                    # because the agent had forgotten it; an agent's own cancel
-                    # arrives as a result, with nothing to explain.
-                    code=_NOTE_CODES.get(str(task.get("state") or "")),
+                    code=note_code,
                 )
             else:
                 spoken = _spoken(text, status_text, state)

@@ -86,6 +86,22 @@ TEXTS: dict[str, dict[str, str]] = {
         "zh": "这段会话的智能体 {agent_id} 已不在面板中，无法继续发送",
         "en": "the agent {agent_id} for this conversation is no longer registered",
     },
+    # A retired entry is not "gone": the row, its history and its name are all still
+    # there, and saying otherwise would send the operator looking for a registration
+    # that was never lost. What is gone is the *address* — another agent serves it
+    # now — so a message written here would reach that agent while being filed under
+    # this one. Distinct code, because the two need different fixes.
+    # Wording is operation-neutral on purpose: the same row is refused by *sending*
+    # to its conversations and by *refreshing* its card, and "cannot be messaged"
+    # would describe an action the reader did not take on the second one.
+    "agent_retired": {
+        "zh": "智能体 {agent_id} 已不再持有它原来的地址 —— 同一地址上现在是另一个智能体，"
+        "所以不能再对它做这个操作；它的历史保留，用同一个名字（同一 host 与 path）"
+        "重新注册即可恢复",
+        "en": "agent {agent_id} no longer owns its address — a different agent serves it now, "
+        "so this cannot be done with it; its history is kept, and registering the same "
+        "name at the same host and path restores it",
+    },
     "empty_message": {
         "zh": "消息不能为空",
         "en": "a message cannot be empty",
