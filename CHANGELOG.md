@@ -6,6 +6,45 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-11-27
+
+### Fixed
+
+- **A new agent at a known address no longer inherits the previous agent's conversations.**
+  Identity is the A2A card, not the address, so a card whose name changed at the same URL is a
+  **different agent** — and until now the registry answered that with an adoption: the entry
+  kept its id, its `firstSeenAt` and its manage token and only swapped the card, so the panel
+  showed the new agent's name while every conversation of the old one silently carried over, and
+  a message sent to the old agent would have been posted to the new one at that address. The
+  previous entry now **retires** instead: the row, its id, its token and its history stay, and
+  only the claim on the address is given up (`agents_url_live`, a partial unique index — schema
+  11). The new agent gets a `201` and an entry of its own, with its own token and no history.
+  This is reversible by construction, because `derive_id` is a pure function of
+  `(host, path, name)`: the same agent registering at that address again **revives** its own row
+  (`200`, same id, same `firstSeenAt`, same token, its conversations sendable again) and whoever
+  replaced it retires in turn. A probe that finds another name at an entry's address now retires
+  that entry too, instead of quietly re-badging it — otherwise the same bug would come back
+  through the probe loop.
+- **A retired agent cannot be messaged.** `RegistryService.get()` refuses a retired row unless
+  the caller asks for it explicitly, so every send path stops with a panel error
+  (`agent_retired`) instead of delivering the message to whoever serves that address now. The
+  panel lists retired entries with `status: "retired"` (its own surface; `/v1/agents` never
+  publishes them, because the contract's record defines two statuses), shows them with a hollow
+  dot and 「已被接替」/“Replaced”, and still opens their history.
+- **The `agents` table is rebuilt once on open (schema 10 → 11)** to allow the third status and
+  to make the URL unique only among live rows. Every column is copied unchanged; the pass is
+  guarded by the table's own DDL rather than `user_version`, so a fresh file skips it and a
+  half-finished rebuild cannot be mistaken for a finished one.
+- **A retired row no longer counts against the per-domain budget**, and `_load_by_url` /
+  `list_agents` / `due_agents` ignore retired rows — otherwise one address that changed hands a
+  few times would exhaust the host's allowance and be re-probed as if it were still serving.
+
+### Removed
+
+- **`_load_by_name`.** It existed only to find an entry whose id had stopped matching its card
+  name — a split that adoption created. Under the new rule there is nothing to re-stitch, so 24
+  lines and their failure mode are gone.
+
 ## [0.11.1] — 2026-11-24
 
 ### Fixed
